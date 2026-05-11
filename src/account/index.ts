@@ -2,7 +2,7 @@
  * Account service — manages dedicated bundler EOAs, balances, and status.
  *
  * No database. All state is derived on-the-fly from:
- * - Deterministic key derivation (chainId + entryPoint + safeAddress + keyVersion)
+ * - Deterministic key derivation (chainId + entryPoint + safeAddress + operatorSecret)
  * - On-chain balance queries (eth_getBalance)
  * - In-memory reservations (lost on restart)
  */
@@ -15,6 +15,7 @@ import {
   type Chain,
 } from "viem";
 import type { KeyManager, KeyDerivationParams, DerivedEOA } from "../keys/types.ts";
+import { deriveEOAAddress } from "../keys/derive.ts";
 import { EOALockManager, type EOAStatus, type EOAState } from "./eoa-lock.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
@@ -26,8 +27,8 @@ export interface AccountInfo {
   entryPoint: `0x${string}`;
   safeAddress: `0x${string}`;
   activeDepositAddress: `0x${string}`;
-  oldDrainingAddresses: `0x${string}`[];
-  keyVersion: string;
+  /** Addresses derived from old operator secrets (draining, sweep only). */
+  oldDepositAddresses: `0x${string}`[];
   onchainBalance: bigint;
   reservedBalance: bigint;
   spendableBalance: bigint;
@@ -60,50 +61,46 @@ export class AccountService {
   }
 
   /**
-   * Derive the dedicated bundler EOA for a given safeAddress.
+   * Derive the dedicated bundler EOA for a given safeAddress (current secret).
    */
-  async deriveEOA(
-    safeAddress: `0x${string}`,
-    keyVersion?: string,
-  ): Promise<DerivedEOA> {
-    const version = keyVersion ?? this.keyManager.getActiveKeyVersion();
+  async deriveEOA(safeAddress: `0x${string}`): Promise<DerivedEOA> {
     return await this.keyManager.deriveEOA({
       chainId: this.config.chainId,
       entryPoint: this.config.entryPointAddress,
       safeAddress,
-      keyVersion: version,
     });
   }
 
   /**
    * Get full account info for a safeAddress.
    * @param safeAddress - The ERC-4337 smart account address.
-   * @param rpcUrlOverride - Optional per-request RPC URL (highest priority for balance queries).
+   * @param rpcUrlOverride - Optional per-request RPC URL override.
    */
   async getAccountInfo(
     safeAddress: `0x${string}`,
     rpcUrlOverride?: string,
   ): Promise<AccountInfo> {
     const normalizedSafe = safeAddress.toLowerCase() as `0x${string}`;
-    const activeVersion = this.keyManager.getActiveKeyVersion();
-    const drainingVersions = this.keyManager.getDrainingKeyVersions();
-
-    // Use override client if provided, otherwise default
     const queryClient = rpcUrlOverride
       ? getPublicClient(rpcUrlOverride)
       : this.client;
 
-    // Derive active EOA
-    const activeEOA = await this.deriveEOA(normalizedSafe, activeVersion);
+    // Derive active EOA (current secret)
+    const activeEOA = await this.deriveEOA(normalizedSafe);
 
-    // Derive old draining EOAs
+    // Derive old EOAs (from old secrets, for display/sweep)
     const oldAddresses: `0x${string}`[] = [];
-    for (const oldVersion of drainingVersions) {
-      const oldEOA = await this.deriveEOA(normalizedSafe, oldVersion);
-      oldAddresses.push(oldEOA.address);
+    for (const oldSecret of this.keyManager.getOldSecrets()) {
+      const oldAddr = await deriveEOAAddress(
+        oldSecret,
+        this.config.chainId,
+        this.config.entryPointAddress,
+        normalizedSafe,
+      );
+      oldAddresses.push(oldAddr);
     }
 
-    // Query on-chain balance (uses override client if provided)
+    // Query on-chain balance
     let onchainBalance: bigint;
     try {
       onchainBalance = await queryClient.getBalance({ address: activeEOA.address });
@@ -119,7 +116,7 @@ export class AccountService {
       ? onchainBalance - reservedBalance
       : 0n;
 
-    // Init/refresh EOA state (nonce check — uses override client)
+    // Init/refresh EOA state (nonce check)
     const eoaState = await this.lockManager.initEOA(activeEOA.address, queryClient);
 
     // Determine status
@@ -133,8 +130,7 @@ export class AccountService {
       entryPoint: this.config.entryPointAddress,
       safeAddress: normalizedSafe,
       activeDepositAddress: activeEOA.address,
-      oldDrainingAddresses: oldAddresses,
-      keyVersion: activeVersion,
+      oldDepositAddresses: oldAddresses,
       onchainBalance,
       reservedBalance,
       spendableBalance,
@@ -166,37 +162,18 @@ export class AccountService {
     };
   }
 
-  /**
-   * Reserve balance for a pending bundle.
-   */
   reserveBalance(eoaAddress: `0x${string}`, amount: bigint): void {
     this.lockManager.addReservation(eoaAddress, amount);
   }
 
-  /**
-   * Release balance reservation after bundle completion.
-   */
   releaseBalance(eoaAddress: `0x${string}`, amount: bigint): void {
     this.lockManager.releaseReservation(eoaAddress, amount);
   }
 
-  /**
-   * Check if the key version is the active version (not draining).
-   */
-  isActiveVersion(keyVersion: string): boolean {
-    return keyVersion === this.keyManager.getActiveKeyVersion();
-  }
-
-  /**
-   * Get the key manager (for signing).
-   */
   getKeyManager(): KeyManager {
     return this.keyManager;
   }
 
-  /**
-   * Get on-chain native balance for an address.
-   */
   async getOnchainBalance(address: `0x${string}`): Promise<bigint> {
     try {
       return await this.client.getBalance({ address });
@@ -205,9 +182,6 @@ export class AccountService {
     }
   }
 
-  /**
-   * Get the public client (for external use).
-   */
   getClient(): PublicClient<Transport, Chain> {
     return this.client;
   }

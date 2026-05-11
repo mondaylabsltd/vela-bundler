@@ -5,7 +5,7 @@
  *   HKDF-SHA256(
  *     IKM = operatorSecret,
  *     salt = "vela-bundler-dedicated-eoa-v1",
- *     info = canonicalize(chainId, entryPoint, safeAddress, keyVersion) + counterSuffix,
+ *     info = canonicalize(chainId, entryPoint, safeAddress) + counterSuffix,
  *     L = 32
  *   )
  *
@@ -23,11 +23,10 @@ const DOMAIN_SEPARATOR = "vela-bundler-dedicated-eoa-v1";
 /**
  * Derive a valid secp256k1 private key deterministically.
  *
- * @param operatorSecret - High-entropy master secret (hex string or raw bytes).
+ * @param operatorSecret - High-entropy master secret (hex string).
  * @param chainId - Chain ID (number).
  * @param entryPoint - EntryPoint address (0x-prefixed, will be lowercased).
  * @param safeAddress - Safe/account address (0x-prefixed, will be lowercased).
- * @param keyVersion - Key version string (e.g. "1").
  * @returns 0x-prefixed 32-byte hex private key.
  */
 export async function deriveEOAPrivateKey(
@@ -35,7 +34,6 @@ export async function deriveEOAPrivateKey(
   chainId: number,
   entryPoint: `0x${string}`,
   safeAddress: `0x${string}`,
-  keyVersion: string,
 ): Promise<`0x${string}`> {
   // Normalize inputs
   const normalizedEntryPoint = entryPoint.toLowerCase();
@@ -49,7 +47,7 @@ export async function deriveEOAPrivateKey(
   const salt = new TextEncoder().encode(DOMAIN_SEPARATOR);
 
   // Info: canonical concatenation with explicit field separators
-  const baseInfo = `chainId=${chainIdStr}|entryPoint=${normalizedEntryPoint}|safeAddress=${normalizedSafeAddress}|keyVersion=${keyVersion}`;
+  const baseInfo = `chainId=${chainIdStr}|entryPoint=${normalizedEntryPoint}|safeAddress=${normalizedSafeAddress}`;
 
   // Try with incrementing counter until we get a valid key
   for (let counter = 0; counter < 256; counter++) {
@@ -79,14 +77,12 @@ export async function deriveEOAAddress(
   chainId: number,
   entryPoint: `0x${string}`,
   safeAddress: `0x${string}`,
-  keyVersion: string,
 ): Promise<`0x${string}`> {
   const privateKey = await deriveEOAPrivateKey(
     operatorSecret,
     chainId,
     entryPoint,
     safeAddress,
-    keyVersion,
   );
   const account = privateKeyToAccount(privateKey);
   return account.address.toLowerCase() as `0x${string}`;
@@ -100,7 +96,6 @@ async function hkdfSha256(
   info: Uint8Array,
   length: number,
 ): Promise<Uint8Array> {
-  // Import IKM as raw key material
   const ikmKey = await crypto.subtle.importKey(
     "raw",
     ikm.buffer as ArrayBuffer,
@@ -109,7 +104,6 @@ async function hkdfSha256(
     ["deriveBits"],
   );
 
-  // Derive bits using HKDF
   const derivedBits = await crypto.subtle.deriveBits(
     {
       name: "HKDF",
@@ -118,7 +112,7 @@ async function hkdfSha256(
       info: info.buffer as ArrayBuffer,
     },
     ikmKey,
-    length * 8, // bits
+    length * 8,
   );
 
   return new Uint8Array(derivedBits);

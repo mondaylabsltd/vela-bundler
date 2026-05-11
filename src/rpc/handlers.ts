@@ -131,12 +131,6 @@ async function handleSendUserOperation(
     }
   }
 
-  // Check key version — reject if draining
-  const activeVersion = ctx.accountService.getKeyManager().getActiveKeyVersion();
-  const drainingVersions = ctx.accountService.getKeyManager().getDrainingKeyVersions();
-  // The EOA was derived with active version, so this check is implicit.
-  // But verify no explicit draining version overlap.
-
   // Check balance
   const baseFee = await ctx.simulator.getCurrentBaseFee(rpcOverride);
   const outerGas = calcOuterTxGasPrice({

@@ -52,14 +52,16 @@ export interface BundlerConfig {
 
   /** Operator secret for deterministic key derivation. Never log or expose. */
   readonly operatorSecret: string;
-  /** Active key version for new deposit addresses. */
-  readonly activeKeyVersion: string;
-  /** Old key versions that are draining (no new ops accepted). */
-  readonly drainingKeyVersions: string[];
+  /** Old operator secrets for sweeping draining EOAs. Never log or expose. */
+  readonly oldOperatorSecrets: string[];
   /** Rate limit for API requests per minute per IP. */
   readonly apiRateLimitPerMinute: number;
   /** Balance reserve multiplier (default 2). */
   readonly balanceReserveMultiplier: number;
+  /** Treasury address for sweep. */
+  readonly treasuryAddress: `0x${string}` | null;
+  /** Sweep trigger: every N bundles per EOA (based on nonce). 0 = disabled. */
+  readonly sweepInterval: number;
 }
 
 function getEnv(key: string, defaultValue?: string): string {
@@ -98,8 +100,6 @@ export async function loadConfig(): Promise<BundlerConfig> {
   let chainInfo: ChainInfo | null = null;
   let registryEip1559 = false;
 
-  // Always resolve from registry to validate chain is supported + get metadata,
-  // unless RPC_URL is set AND it's a local dev node (skip registry for local dev).
   const isLocalDev = manualRpcUrl?.startsWith("http://localhost") ||
     manualRpcUrl?.startsWith("http://127.0.0.1");
 
@@ -111,7 +111,6 @@ export async function loadConfig(): Promise<BundlerConfig> {
       chainInfo = resolved.chain;
       registryEip1559 = resolved.supportsEip1559;
     } catch (err) {
-      // If user provided their own RPCs, registry failure is non-fatal
       if (userRpcUrls.length === 0 && !manualRpcUrl) {
         throw err;
       }
@@ -141,11 +140,17 @@ export async function loadConfig(): Promise<BundlerConfig> {
     ? eip1559Env === "true"
     : (chainInfo ? registryEip1559 : true);
 
-  // Parse draining key versions (comma-separated)
-  const drainingRaw = getEnvOptional("DRAINING_KEY_VERSIONS");
-  const drainingKeyVersions = drainingRaw
-    ? drainingRaw.split(",").map((s) => s.trim()).filter(Boolean)
+  // Parse old operator secrets (comma-separated)
+  const oldSecretsRaw = getEnvOptional("OLD_OPERATOR_SECRETS");
+  const oldOperatorSecrets = oldSecretsRaw
+    ? oldSecretsRaw.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
+
+  // Treasury address for sweep
+  const treasuryRaw = getEnvOptional("TREASURY_ADDRESS");
+  const treasuryAddress = treasuryRaw && /^0x[0-9a-fA-F]{40}$/.test(treasuryRaw)
+    ? treasuryRaw as `0x${string}`
+    : null;
 
   return {
     chainId,
@@ -179,9 +184,10 @@ export async function loadConfig(): Promise<BundlerConfig> {
 
     // Private bundler config
     operatorSecret: getEnv("OPERATOR_SECRET"),
-    activeKeyVersion: getEnv("ACTIVE_KEY_VERSION", "1"),
-    drainingKeyVersions,
+    oldOperatorSecrets,
     apiRateLimitPerMinute: parseInt(getEnv("API_RATE_LIMIT_PER_MINUTE", "60")),
     balanceReserveMultiplier: parseInt(getEnv("BALANCE_RESERVE_MULTIPLIER", "2")),
+    treasuryAddress,
+    sweepInterval: parseInt(getEnv("SWEEP_INTERVAL", "30")),
   };
 }

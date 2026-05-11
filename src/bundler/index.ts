@@ -19,6 +19,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
+import { shouldSweep, executeSweep } from "./sweep.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import type { Simulator } from "../simulation/index.ts";
 import { Mempool } from "../mempool/index.ts";
@@ -190,6 +191,28 @@ export class BundlerService {
   ): Promise<BundleResult> {
     // Use user-provided RPC if any entry has one (all ops for same sender share the same RPC)
     const rpcOverride = entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
+    const effectiveRpc = rpcOverride ?? this.config.rpcUrl;
+
+    // --- Sweep check: before bundling, inside lock ---
+    const eoaState = this.accountService.lockManager.getState(eoa.address);
+    const currentNonce = eoaState?.latestNonce ?? 0;
+    if (
+      eoa.privateKey &&
+      shouldSweep(currentNonce, this.config.sweepInterval, this.config.treasuryAddress)
+    ) {
+      await executeSweep({
+        eoaAddress: eoa.address,
+        eoaPrivateKey: eoa.privateKey,
+        treasuryAddress: this.config.treasuryAddress!,
+        rpcUrl: effectiveRpc,
+        config: this.config,
+      });
+      // Re-init EOA state after sweep (nonce changed)
+      await this.accountService.lockManager.initEOA(
+        eoa.address,
+        getPublicClient(effectiveRpc),
+      );
+    }
 
     const baseFee = await this.simulator.getCurrentBaseFee(rpcOverride);
     const outerGas = calcOuterTxGasPrice({

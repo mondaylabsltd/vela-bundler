@@ -186,16 +186,16 @@ Deno.test("pendingNonce == latestNonce means ACTIVE", () => {
   assertEquals(status, "ACTIVE");
 });
 
-// --- Key rotation ---
+// --- Secret rotation ---
 
-Deno.test("draining key version must not accept new UserOperations", () => {
-  const activeVersion = "2";
-  const drainingVersions = ["0", "1"];
-  const incomingVersion = "1"; // User trying to use old version
+Deno.test("old secrets produce different EOAs than current secret", async () => {
+  const { deriveEOAAddress } = await import("../src/keys/derive.ts");
+  const secret1 = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+  const secret2 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const ep = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as const;
+  const safe = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
 
-  const isDraining = drainingVersions.includes(incomingVersion);
-  assert(isDraining, "Version 1 should be draining");
-
-  const isActive = (incomingVersion as string) === (activeVersion as string);
-  assert(!isActive, "Version 1 is not active");
+  const addr1 = await deriveEOAAddress(secret1, 1, ep, safe);
+  const addr2 = await deriveEOAAddress(secret2, 1, ep, safe);
+  assert(addr1 !== addr2, "Different secrets must produce different EOAs");
 });

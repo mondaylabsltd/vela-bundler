@@ -32,11 +32,11 @@ function makeConfig(overrides: Partial<BundlerConfig> = {}): BundlerConfig {
     mode: "production",
     autoBundleIntervalMs: 10000,
     operatorSecret: "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-    activeKeyVersion: "1",
-    drainingKeyVersions: [],
-    apiToken: "test",
+    oldOperatorSecrets: [],
     apiRateLimitPerMinute: 60,
     balanceReserveMultiplier: 2,
+    treasuryAddress: null,
+    sweepInterval: 30,
     ...overrides,
   } as BundlerConfig;
 }

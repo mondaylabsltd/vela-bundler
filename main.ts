@@ -32,9 +32,12 @@ async function main() {
   console.log(`  EIP-1559:       ${config.useEip1559}`);
   console.log(`  Mode:           ${config.mode}`);
   console.log(`  Bundling:       ${config.bundlingMode}`);
-  console.log(`  Key Version:    ${config.activeKeyVersion}`);
-  if (config.drainingKeyVersions.length > 0) {
-    console.log(`  Draining Keys:  ${config.drainingKeyVersions.join(", ")}`);
+  if (config.oldOperatorSecrets.length > 0) {
+    console.log(`  Old secrets:    ${config.oldOperatorSecrets.length} (for sweep)`);
+  }
+  if (config.treasuryAddress) {
+    console.log(`  Treasury:       ${config.treasuryAddress}`);
+    console.log(`  Sweep interval: every ${config.sweepInterval} bundles per EOA`);
   }
   console.log(`  Min Margin:     ${config.minProfitMarginBps} bps`);
   console.log(`  Balance Reserve: ${config.balanceReserveMultiplier}x`);
@@ -46,8 +49,7 @@ async function main() {
   // Create key manager
   const keyManager = new LocalKeyManager({
     operatorSecret: config.operatorSecret,
-    activeKeyVersion: config.activeKeyVersion,
-    drainingKeyVersions: config.drainingKeyVersions,
+    oldOperatorSecrets: config.oldOperatorSecrets,
   });
 
   // Create services

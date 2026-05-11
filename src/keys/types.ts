@@ -6,7 +6,6 @@ export interface KeyDerivationParams {
   chainId: number;
   entryPoint: `0x${string}`;
   safeAddress: `0x${string}`;
-  keyVersion: string;
 }
 
 export interface DerivedEOA {
@@ -27,21 +26,8 @@ export interface KeyManager {
   deriveEOA(params: KeyDerivationParams): Promise<DerivedEOA>;
 
   /**
-   * Sign a transaction hash with the derived EOA's key.
-   * For KMS/HSM backends, this calls the remote signer.
+   * Get all old operator secrets (for sweeping draining EOAs).
+   * Returns secret strings — never log or expose.
    */
-  signTransaction(
-    params: KeyDerivationParams,
-    serializedTx: Uint8Array,
-  ): Promise<`0x${string}`>;
-
-  /**
-   * Get the current active key version.
-   */
-  getActiveKeyVersion(): string;
-
-  /**
-   * Get old key versions that are draining (no new ops, but still queryable).
-   */
-  getDrainingKeyVersions(): string[];
+  getOldSecrets(): string[];
 }
