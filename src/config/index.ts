@@ -1,9 +1,8 @@
 /**
- * Bundler configuration loaded from environment variables.
+ * Bundler configuration.
  *
- * Chain RPC is auto-resolved from https://ethereum-data.awesometools.dev/
- * based on CHAIN_ID. Only networks listed in that registry are supported.
- * RPC_URL can still be set manually to override (e.g. for local dev nodes).
+ * Only OPERATOR_SECRET and TREASURY_ADDRESS are required.
+ * Everything else has sensible defaults.
  */
 
 import { resolveChain, type ChainInfo } from "./chain-registry.ts";
@@ -13,20 +12,10 @@ export { resolveChain, fetchChainInfo, filterPublicRpcUrls } from "./chain-regis
 
 export interface BundlerConfig {
   readonly chainId: number;
-  /**
-   * Active RPC URL — resolved by priority:
-   *   1. USER_RPC_URLS (user-provided, comma-separated)
-   *   2. RPC_URL (operator-configured manual override)
-   *   3. Registry auto-resolved (https://ethereum-data.awesometools.dev/)
-   */
   readonly rpcUrl: string;
-  /** User-provided RPC URLs (highest priority, from USER_RPC_URLS env). */
   readonly userRpcUrls: string[];
-  /** All available public RPCs from registry. */
   readonly publicRpcs: string[];
-  /** Chain metadata from registry (null if local-only dev mode). */
   readonly chainInfo: ChainInfo | null;
-
   readonly entryPointAddress: `0x${string}`;
 
   readonly port: number;
@@ -45,26 +34,17 @@ export interface BundlerConfig {
   readonly baseFeeMultiplier: number;
   readonly bundlerTipGwei: number;
 
-  readonly mode: "production" | "testing";
   readonly autoBundleIntervalMs: number;
 
-  // --- Private prepaid bundler config ---
-
-  /** Operator secret for deterministic key derivation. Never log or expose. */
   readonly operatorSecret: string;
-  /** Old operator secrets for sweeping draining EOAs. Never log or expose. */
   readonly oldOperatorSecrets: string[];
-  /** Rate limit for API requests per minute per IP. */
-  readonly apiRateLimitPerMinute: number;
-  /** Balance reserve multiplier (default 2). */
-  readonly balanceReserveMultiplier: number;
-  /** Treasury address for sweep. */
-  readonly treasuryAddress: `0x${string}` | null;
-  /** Sweep trigger: every N bundles per EOA (based on nonce). 0 = disabled. */
+  readonly treasuryAddress: `0x${string}`;
   readonly sweepInterval: number;
+  readonly apiRateLimitPerMinute: number;
+  readonly balanceReserveMultiplier: number;
 }
 
-function getEnv(key: string, defaultValue?: string): string {
+function env(key: string, defaultValue?: string): string {
   const value = Deno.env.get(key) ?? defaultValue;
   if (value === undefined) {
     throw new Error(`Missing required environment variable: ${key}`);
@@ -72,29 +52,32 @@ function getEnv(key: string, defaultValue?: string): string {
   return value;
 }
 
-function getEnvHex(key: string, defaultValue?: string): `0x${string}` {
-  const v = getEnv(key, defaultValue);
-  if (!v.startsWith("0x")) throw new Error(`${key} must be a hex string starting with 0x`);
+function envHex(key: string, defaultValue?: string): `0x${string}` {
+  const v = env(key, defaultValue);
+  if (!v.startsWith("0x")) throw new Error(`${key} must start with 0x`);
   return v as `0x${string}`;
 }
 
-function getEnvOptional(key: string): string | undefined {
+function envOptional(key: string): string | undefined {
   return Deno.env.get(key);
 }
 
-/**
- * Load bundler configuration.
- */
+function envCsv(key: string): string[] {
+  const raw = envOptional(key);
+  return raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+}
+
 export async function loadConfig(): Promise<BundlerConfig> {
-  const chainId = parseInt(getEnv("CHAIN_ID"));
-  const manualRpcUrl = getEnvOptional("RPC_URL");
+  // --- Only two required env vars ---
+  const operatorSecret = env("OPERATOR_SECRET");
+  const treasuryAddress = envHex("TREASURY_ADDRESS");
 
-  // Parse user-provided RPC URLs (comma-separated, highest priority)
-  const userRpcRaw = getEnvOptional("USER_RPC_URLS");
-  const userRpcUrls = userRpcRaw
-    ? userRpcRaw.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
+  // --- Everything else has defaults ---
+  const chainId = parseInt(env("CHAIN_ID", "1"));
+  const manualRpcUrl = envOptional("RPC_URL");
+  const userRpcUrls = envCsv("USER_RPC_URLS");
 
+  // Resolve RPC from registry
   let registryRpcUrl: string | null = null;
   let publicRpcs: string[] = [];
   let chainInfo: ChainInfo | null = null;
@@ -111,46 +94,26 @@ export async function loadConfig(): Promise<BundlerConfig> {
       chainInfo = resolved.chain;
       registryEip1559 = resolved.supportsEip1559;
     } catch (err) {
-      if (userRpcUrls.length === 0 && !manualRpcUrl) {
-        throw err;
-      }
-      console.warn(`[Config] Registry lookup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+      if (userRpcUrls.length === 0 && !manualRpcUrl) throw err;
+      console.warn(`[Config] Registry lookup failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  // RPC priority: userRpcUrls[0] > RPC_URL > registry
   let rpcUrl: string;
   if (userRpcUrls.length > 0) {
     rpcUrl = userRpcUrls[0]!;
-    console.log(`[Config] Using user-provided RPC (highest priority): ${rpcUrl}`);
-    if (userRpcUrls.length > 1) {
-      console.log(`[Config] ${userRpcUrls.length - 1} additional user RPCs available as fallback`);
-    }
   } else if (manualRpcUrl) {
     rpcUrl = manualRpcUrl;
-    console.log(`[Config] Using operator RPC_URL: ${rpcUrl}`);
   } else if (registryRpcUrl) {
     rpcUrl = registryRpcUrl;
   } else {
     throw new Error("No RPC available: set USER_RPC_URLS, RPC_URL, or use a supported CHAIN_ID");
   }
 
-  const eip1559Env = getEnvOptional("USE_EIP1559");
+  const eip1559Env = envOptional("USE_EIP1559");
   const useEip1559 = eip1559Env !== undefined
     ? eip1559Env === "true"
     : (chainInfo ? registryEip1559 : true);
-
-  // Parse old operator secrets (comma-separated)
-  const oldSecretsRaw = getEnvOptional("OLD_OPERATOR_SECRETS");
-  const oldOperatorSecrets = oldSecretsRaw
-    ? oldSecretsRaw.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
-
-  // Treasury address for sweep
-  const treasuryRaw = getEnvOptional("TREASURY_ADDRESS");
-  const treasuryAddress = treasuryRaw && /^0x[0-9a-fA-F]{40}$/.test(treasuryRaw)
-    ? treasuryRaw as `0x${string}`
-    : null;
 
   return {
     chainId,
@@ -158,36 +121,31 @@ export async function loadConfig(): Promise<BundlerConfig> {
     userRpcUrls,
     publicRpcs,
     chainInfo,
+    entryPointAddress: envHex("ENTRY_POINT_ADDRESS", "0x0000000071727De22E5E9d8BAf0edAc6f37da032"),
 
-    entryPointAddress: getEnvHex(
-      "ENTRY_POINT_ADDRESS",
-      "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-    ),
-    port: parseInt(getEnv("PORT", "3300")),
-    host: getEnv("HOST", "0.0.0.0"),
+    port: parseInt(env("PORT", "3300")),
+    host: env("HOST", "0.0.0.0"),
 
-    bundlingMode: getEnv("BUNDLING_MODE", "auto") as "auto" | "manual",
-    maxBundleSize: parseInt(getEnv("MAX_BUNDLE_SIZE", "10")),
-    maxBundleGas: BigInt(getEnv("MAX_BUNDLE_GAS", "5000000")),
-    minPriorityFeePerGas: BigInt(getEnv("MIN_PRIORITY_FEE_PER_GAS", "1000000000")),
+    bundlingMode: env("BUNDLING_MODE", "auto") as "auto" | "manual",
+    maxBundleSize: parseInt(env("MAX_BUNDLE_SIZE", "10")),
+    maxBundleGas: BigInt(env("MAX_BUNDLE_GAS", "5000000")),
+    minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "1000000000")),
 
-    minProfitMarginBps: parseInt(getEnv("MIN_PROFIT_MARGIN_BPS", "2000")),
-    targetProfitMarginBps: parseInt(getEnv("TARGET_PROFIT_MARGIN_BPS", "3500")),
-    highRiskMarginBps: parseInt(getEnv("HIGH_RISK_MARGIN_BPS", "5000")),
+    minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "2000")),
+    targetProfitMarginBps: parseInt(env("TARGET_PROFIT_MARGIN_BPS", "3500")),
+    highRiskMarginBps: parseInt(env("HIGH_RISK_MARGIN_BPS", "5000")),
 
     useEip1559,
-    baseFeeMultiplier: parseFloat(getEnv("BASE_FEE_MULTIPLIER", "1.25")),
-    bundlerTipGwei: parseFloat(getEnv("BUNDLER_TIP_GWEI", "1.5")),
+    baseFeeMultiplier: parseFloat(env("BASE_FEE_MULTIPLIER", "1.25")),
+    bundlerTipGwei: parseFloat(env("BUNDLER_TIP_GWEI", "1.5")),
 
-    mode: getEnv("MODE", "production") as "production" | "testing",
-    autoBundleIntervalMs: parseInt(getEnv("AUTO_BUNDLE_INTERVAL_MS", "10000")),
+    autoBundleIntervalMs: parseInt(env("AUTO_BUNDLE_INTERVAL_MS", "10000")),
 
-    // Private bundler config
-    operatorSecret: getEnv("OPERATOR_SECRET"),
-    oldOperatorSecrets,
-    apiRateLimitPerMinute: parseInt(getEnv("API_RATE_LIMIT_PER_MINUTE", "60")),
-    balanceReserveMultiplier: parseInt(getEnv("BALANCE_RESERVE_MULTIPLIER", "2")),
+    operatorSecret,
+    oldOperatorSecrets: envCsv("OLD_OPERATOR_SECRETS"),
     treasuryAddress,
-    sweepInterval: parseInt(getEnv("SWEEP_INTERVAL", "30")),
+    sweepInterval: parseInt(env("SWEEP_INTERVAL", "30")),
+    apiRateLimitPerMinute: parseInt(env("API_RATE_LIMIT_PER_MINUTE", "60")),
+    balanceReserveMultiplier: parseInt(env("BALANCE_RESERVE_MULTIPLIER", "2")),
   };
 }

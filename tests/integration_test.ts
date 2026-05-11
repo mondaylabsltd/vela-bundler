@@ -10,21 +10,7 @@
 
 import { assertEquals, assert } from "@std/assert";
 
-const RPC_URL = Deno.env.get("TEST_RPC_URL") ?? "http://localhost:8545";
 const BUNDLER_URL = Deno.env.get("TEST_BUNDLER_URL") ?? "http://localhost:3300";
-
-async function isNodeAvailable(): Promise<boolean> {
-  try {
-    const res = await fetch(RPC_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 async function isBundlerAvailable(): Promise<boolean> {
   try {
@@ -123,32 +109,3 @@ Deno.test({
   },
 });
 
-Deno.test({
-  name: "Integration: debug_bundler_clearState works in testing mode",
-  ignore: !(await isBundlerAvailable()),
-  async fn() {
-    try {
-      const result = await rpcCall(BUNDLER_URL, "debug_bundler_clearState");
-      assertEquals(result, "ok");
-    } catch {
-      // Expected to fail if not in testing mode
-    }
-  },
-});
-
-Deno.test({
-  name: "Integration: debug_bundler_dumpMempool returns array",
-  ignore: !(await isBundlerAvailable()),
-  async fn() {
-    try {
-      const result = await rpcCall(
-        BUNDLER_URL,
-        "debug_bundler_dumpMempool",
-        ["0x0000000071727De22E5E9d8BAf0edAc6f37da032"],
-      );
-      assert(Array.isArray(result));
-    } catch {
-      // Expected to fail if not in testing mode
-    }
-  },
-});

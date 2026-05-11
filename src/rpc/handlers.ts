@@ -19,7 +19,6 @@ import {
   calcUserOpMaxGas,
   calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
-import { resolveRpcUrl } from "../utils/rpc-client.ts";
 
 /**
  * Dispatch an RPC method to its handler.
@@ -37,26 +36,16 @@ export async function handleRpcMethod(
     case "eth_estimateUserOperationGas":
       return await handleEstimateUserOperationGas(params, ctx, reqCtx);
     case "eth_getUserOperationByHash":
-      return await handleGetUserOperationByHash(params, ctx);
+      return handleGetUserOperationByHash(params, ctx);
     case "eth_getUserOperationReceipt":
-      return await handleGetUserOperationReceipt(params, ctx);
+      return handleGetUserOperationReceipt(params, ctx);
     case "eth_supportedEntryPoints":
       return handleSupportedEntryPoints(ctx);
     case "eth_chainId":
       return handleChainId(ctx);
     default:
-      break;
-  }
-
-  // Debug methods (testing mode only)
-  if (method.startsWith("debug_bundler_")) {
-    if (ctx.config.mode !== "testing") {
       throw methodNotFound(method);
-    }
-    return await handleDebugMethod(method, params, ctx);
   }
-
-  throw methodNotFound(method);
 }
 
 // --- Standard ERC-7769 Methods ---
@@ -251,10 +240,10 @@ async function handleEstimateUserOperationGas(
   return result;
 }
 
-async function handleGetUserOperationByHash(
+function handleGetUserOperationByHash(
   params: unknown[],
   ctx: RpcContext,
-): Promise<Record<string, unknown> | null> {
+): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
@@ -290,10 +279,10 @@ async function handleGetUserOperationByHash(
   return null;
 }
 
-async function handleGetUserOperationReceipt(
+function handleGetUserOperationReceipt(
   params: unknown[],
   ctx: RpcContext,
-): Promise<Record<string, unknown> | null> {
+): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
@@ -342,108 +331,3 @@ function handleChainId(ctx: RpcContext): string {
   return "0x" + ctx.config.chainId.toString(16);
 }
 
-// --- Debug Methods (testing mode only) ---
-
-async function handleDebugMethod(
-  method: string,
-  params: unknown[],
-  ctx: RpcContext,
-): Promise<unknown> {
-  switch (method) {
-    case "debug_bundler_clearState":
-      ctx.mempool.clear();
-      return "ok";
-
-    case "debug_bundler_dumpMempool": {
-      const entryPoint = params[0] as string;
-      if (
-        entryPoint &&
-        entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()
-      ) {
-        throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
-      }
-      return ctx.mempool.dump().map((e) => userOpToRpc(e.userOp));
-    }
-
-    case "debug_bundler_sendBundleNow": {
-      const result = await ctx.bundler.tryBundle();
-      return result.transactionHash ?? result.error ?? "no bundle";
-    }
-
-    case "debug_bundler_setBundlingMode": {
-      const mode = params[0] as string;
-      if (mode !== "auto" && mode !== "manual") {
-        throw invalidParams("Expected 'auto' or 'manual'");
-      }
-      ctx.bundler.setBundlingMode(mode);
-      return "ok";
-    }
-
-    case "debug_bundler_setReputation": {
-      const entries = params[0] as Array<{
-        address: string;
-        opsSeen: number | string;
-        opsIncluded: number | string;
-        status?: string;
-      }>;
-      const entryPoint = params[1] as string;
-      if (
-        entryPoint &&
-        entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()
-      ) {
-        throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
-      }
-      if (!Array.isArray(entries)) {
-        throw invalidParams("Expected array of reputation entries");
-      }
-      for (const e of entries) {
-        ctx.mempool.reputation.setReputation(
-          e.address.toLowerCase() as `0x${string}`,
-          "sender",
-          Number(e.opsSeen),
-          Number(e.opsIncluded),
-          e.status as "ok" | "throttled" | "banned" | undefined,
-        );
-      }
-      return "ok";
-    }
-
-    case "debug_bundler_dumpReputation": {
-      const entryPoint = params[0] as string;
-      if (
-        entryPoint &&
-        entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()
-      ) {
-        throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
-      }
-      return ctx.mempool.reputation.dump().map((e) => ({
-        address: e.address,
-        opsSeen: e.opsSeen,
-        opsIncluded: e.opsIncluded,
-        status: e.status,
-      }));
-    }
-
-    case "debug_bundler_addUserOps": {
-      const userOps = params[0] as unknown[];
-      const entryPoint = params[1] as string;
-      if (
-        entryPoint &&
-        entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()
-      ) {
-        throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
-      }
-      if (!Array.isArray(userOps)) {
-        throw invalidParams("Expected array of UserOperations");
-      }
-      for (const raw of userOps) {
-        const userOp = normalizeUserOp(raw);
-        ctx.mempool.add(userOp);
-      }
-      return "ok";
-    }
-
-    default:
-      throw methodNotFound(method);
-  }
-}

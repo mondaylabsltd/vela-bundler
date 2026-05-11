@@ -42,10 +42,6 @@ async function main() {
   console.log(`  Min Margin:     ${config.minProfitMarginBps} bps`);
   console.log(`  Balance Reserve: ${config.balanceReserveMultiplier}x`);
 
-  if (config.mode === "testing") {
-    console.log(`  [!] Debug RPCs enabled (testing mode)`);
-  }
-
   // Create key manager
   const keyManager = new LocalKeyManager({
     operatorSecret: config.operatorSecret,
