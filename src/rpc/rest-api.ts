@@ -2,12 +2,12 @@
  * REST API endpoints for the private prepaid bundler.
  *
  * GET /v1/account/:chainId/:safeAddress
- *   — Returns deposit address, balance, and status for a safeAddress.
- *   — Idempotent: same inputs always return the same activeDepositAddress.
+ *   — Multi-chain: chainId in the URL path.
  *   — Supports X-Rpc-Url header for per-request RPC override.
  */
 
-import type { AccountService } from "../account/index.ts";
+import type { ChainRegistry } from "../chain/index.ts";
+import type { BundlerConfig } from "../config/index.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { resolveRpcUrl } from "../utils/rpc-client.ts";
 
@@ -17,7 +17,8 @@ import { resolveRpcUrl } from "../utils/rpc-client.ts";
 export async function handleRestApi(
   req: Request,
   url: URL,
-  accountService: AccountService,
+  chainRegistry: ChainRegistry,
+  config: BundlerConfig,
   rateLimitConfig: RateLimitConfig,
   requestRpcUrl?: string,
 ): Promise<Response | null> {
@@ -26,14 +27,13 @@ export async function handleRestApi(
   const corsHeaders: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
+    "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url, X-Chain-Id",
   };
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // Rate limit only
   const limited = rateLimitGuard(req, rateLimitConfig);
   if (limited) return limited;
 
@@ -45,7 +45,8 @@ export async function handleRestApi(
     return await handleGetAccount(
       parseInt(accountMatch[1]!),
       accountMatch[2]!.toLowerCase() as `0x${string}`,
-      accountService,
+      chainRegistry,
+      config,
       corsHeaders,
       requestRpcUrl,
     );
@@ -60,25 +61,19 @@ export async function handleRestApi(
 async function handleGetAccount(
   chainId: number,
   safeAddress: `0x${string}`,
-  accountService: AccountService,
+  chainRegistry: ChainRegistry,
+  config: BundlerConfig,
   corsHeaders: Record<string, string>,
   requestRpcUrl?: string,
 ): Promise<Response> {
-  if (chainId !== accountService["config"].chainId) {
-    return jsonResponse(
-      { error: `This bundler serves chainId ${accountService["config"].chainId}, not ${chainId}` },
-      400,
-      corsHeaders,
-    );
-  }
-
   if (!/^0x[0-9a-f]{40}$/.test(safeAddress)) {
     return jsonResponse({ error: "Invalid safeAddress" }, 400, corsHeaders);
   }
 
   try {
-    const effectiveRpc = resolveRpcUrl(accountService["config"], requestRpcUrl);
-    const info = await accountService.getAccountInfo(safeAddress, effectiveRpc);
+    const chain = await chainRegistry.getChain(chainId, requestRpcUrl);
+    const effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
+    const info = await chain.accountService.getAccountInfo(safeAddress, effectiveRpc);
 
     return jsonResponse(
       {
@@ -99,8 +94,9 @@ async function handleGetAccount(
       corsHeaders,
     );
   } catch (err) {
-    console.error(`[REST] Error fetching account info for ${safeAddress}:`, err);
-    return jsonResponse({ error: "Internal error" }, 500, corsHeaders);
+    console.error(`[REST] Error for chain ${chainId} / ${safeAddress}:`, err);
+    const message = err instanceof Error ? err.message : "Internal error";
+    return jsonResponse({ error: message }, 500, corsHeaders);
   }
 }
 

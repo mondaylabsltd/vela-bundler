@@ -167,13 +167,11 @@ async function runDeploy(cfg: DeployConfig) {
       if (!treasuryAddress || !/^0x[0-9a-fA-F]{40}$/.test(treasuryAddress)) {
         throw new Error("TREASURY_ADDRESS must be a valid Ethereum address");
       }
-      const chainId = await prompt("CHAIN_ID", "1");
       const userRpcUrls = await prompt("USER_RPC_URLS (comma-separated, optional)", "");
 
       const envVars: Record<string, string> = {
         OPERATOR_SECRET: operatorSecret,
         TREASURY_ADDRESS: treasuryAddress,
-        CHAIN_ID: chainId,
       };
       if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
 
@@ -193,14 +191,12 @@ async function runDeploy(cfg: DeployConfig) {
 
         const operatorSecret = await prompt("OPERATOR_SECRET", existing.OPERATOR_SECRET ?? "");
         const treasuryAddress = await prompt("TREASURY_ADDRESS", existing.TREASURY_ADDRESS ?? "");
-        const chainId = await prompt("CHAIN_ID", existing.CHAIN_ID ?? "1");
         const userRpcUrls = await prompt("USER_RPC_URLS", existing.USER_RPC_URLS ?? "");
         const oldSecrets = await prompt("OLD_OPERATOR_SECRETS", existing.OLD_OPERATOR_SECRETS ?? "");
 
         const envVars: Record<string, string> = {
           OPERATOR_SECRET: operatorSecret,
           TREASURY_ADDRESS: treasuryAddress,
-          CHAIN_ID: chainId,
         };
         if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
         if (oldSecrets) envVars.OLD_OPERATOR_SECRETS = oldSecrets;
@@ -250,9 +246,9 @@ async function runDeploy(cfg: DeployConfig) {
       await new Promise((r) => setTimeout(r, 2000));
       const check = await ssh.runCapture([
         "bash", "-lc",
-        `curl -sf -X POST http://127.0.0.1:${HTTP_PORT} -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' 2>/dev/null || true`,
+        `curl -sf http://127.0.0.1:${HTTP_PORT}/health 2>/dev/null || true`,
       ]);
-      if (check.stdout.includes('"result"')) {
+      if (check.stdout.includes('"ok"')) {
         healthy = true;
         break;
       }
@@ -293,7 +289,7 @@ async function runStatus(cfg: DeployConfig) {
     console.log("\n-> Recent releases:");
     await ssh.run(["bash", "-lc", `ls -lt ${RELEASES_DIR}/ 2>/dev/null | head -5`]);
     console.log("\n-> Health:");
-    await ssh.run(["bash", "-lc", `curl -sf -X POST http://127.0.0.1:${HTTP_PORT} -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' 2>/dev/null || echo 'Service not responding'`]);
+    await ssh.run(["bash", "-lc", `curl -sf http://127.0.0.1:${HTTP_PORT}/health 2>/dev/null || echo 'Service not responding'`]);
   } finally {
     await ssh.close();
   }

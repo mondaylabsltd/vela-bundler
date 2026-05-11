@@ -8,7 +8,7 @@ import type { BundlerConfig } from "../src/config/index.ts";
 
 function makeConfig(overrides: Partial<BundlerConfig> = {}): BundlerConfig {
   return {
-    chainId: 1,
+    chainId: 0,
     rpcUrl: "https://registry-default.example.com",
     userRpcUrls: [],
     publicRpcs: [

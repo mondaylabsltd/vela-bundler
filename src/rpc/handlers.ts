@@ -1,9 +1,11 @@
 /**
- * RPC method handlers implementing ERC-7769 / ERC-4337 bundler spec
- * with private prepaid bundler binding rules.
+ * RPC method handlers implementing ERC-7769 / ERC-4337 bundler spec.
+ * Multi-chain: chainId resolved from request (X-Chain-Id header or RPC params).
  */
 
-import type { RpcContext, RequestContext } from "./index.ts";
+import type { RequestContext } from "./index.ts";
+import type { BundlerConfig } from "../config/index.ts";
+import type { ChainRegistry, ChainServices } from "../chain/index.ts";
 import {
   methodNotFound,
   invalidParams,
@@ -26,25 +28,54 @@ import {
 export async function handleRpcMethod(
   method: string,
   params: unknown[],
-  ctx: RpcContext,
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
   reqCtx: RequestContext = {},
 ): Promise<unknown> {
-  // Standard ERC-7769 methods
   switch (method) {
     case "eth_sendUserOperation":
-      return await handleSendUserOperation(params, ctx, reqCtx);
+      return await handleSendUserOperation(params, config, chainRegistry, reqCtx);
     case "eth_estimateUserOperationGas":
-      return await handleEstimateUserOperationGas(params, ctx, reqCtx);
+      return await handleEstimateUserOperationGas(params, config, chainRegistry, reqCtx);
     case "eth_getUserOperationByHash":
-      return handleGetUserOperationByHash(params, ctx);
+      return handleGetUserOperationByHash(params, config, chainRegistry, reqCtx);
     case "eth_getUserOperationReceipt":
-      return handleGetUserOperationReceipt(params, ctx);
+      return handleGetUserOperationReceipt(params, config, chainRegistry, reqCtx);
     case "eth_supportedEntryPoints":
-      return handleSupportedEntryPoints(ctx);
-    case "eth_chainId":
-      return handleChainId(ctx);
+      return [config.entryPointAddress];
+    case "eth_chainId": {
+      // Multi-chain: return the chainId from the request context, or 0 if not specified
+      const chainId = reqCtx.chainId;
+      if (!chainId) throw invalidParams("X-Chain-Id header required for multi-chain bundler");
+      return "0x" + chainId.toString(16);
+    }
     default:
       throw methodNotFound(method);
+  }
+}
+
+/**
+ * Resolve chainId from request context. Required for all chain-specific methods.
+ */
+function requireChainId(reqCtx: RequestContext): number {
+  if (!reqCtx.chainId) {
+    throw invalidParams("X-Chain-Id header is required");
+  }
+  return reqCtx.chainId;
+}
+
+async function resolveChain(
+  chainId: number,
+  chainRegistry: ChainRegistry,
+  reqCtx: RequestContext,
+): Promise<ChainServices> {
+  try {
+    return await chainRegistry.getChain(chainId, reqCtx.requestRpcUrl);
+  } catch (err) {
+    throw bundlerError(
+      RPC_ERROR_CODES.INVALID_USEROPERATION,
+      `Unsupported chain ${chainId}: ${err instanceof Error ? err.message : err}`,
+    );
   }
 }
 
@@ -52,16 +83,20 @@ export async function handleRpcMethod(
 
 async function handleSendUserOperation(
   params: unknown[],
-  ctx: RpcContext,
-  reqCtx: RequestContext = {},
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
+  reqCtx: RequestContext,
 ): Promise<`0x${string}`> {
-  const rpcOverride = reqCtx.requestRpcUrl;
   if (!params[0] || !params[1]) {
     throw invalidParams("Expected [userOp, entryPoint]");
   }
 
+  const chainId = requireChainId(reqCtx);
+  const chain = await resolveChain(chainId, chainRegistry, reqCtx);
+  const rpcOverride = reqCtx.requestRpcUrl;
+
   const entryPoint = params[1] as string;
-  if (entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()) {
+  if (entryPoint.toLowerCase() !== config.entryPointAddress.toLowerCase()) {
     throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
   }
 
@@ -75,7 +110,6 @@ async function handleSendUserOperation(
     throw invalidParams("Invalid UserOperation");
   }
 
-  // Validate fields
   try {
     validateUserOpFields(userOp);
   } catch (err) {
@@ -87,17 +121,15 @@ async function handleSendUserOperation(
 
   // --- Private bundler binding checks ---
   const safeAddress = userOp.sender;
-
-  // Derive the dedicated bundler EOA for this safeAddress
-  const eoa = await ctx.accountService.deriveEOA(safeAddress);
+  const eoa = await chain.accountService.deriveEOA(safeAddress);
 
   // Check EOA nonce/lock state
-  const eoaState = ctx.accountService.lockManager.getState(eoa.address);
+  const eoaState = chain.accountService.lockManager.getState(eoa.address);
   if (eoaState) {
     if (eoaState.status === "LOCKED_PENDING_UNKNOWN") {
       throw bundlerError(
         RPC_ERROR_CODES.INVALID_USEROPERATION,
-        "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions. Wait for resolution.",
+        "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions.",
       );
     }
     if (eoaState.status === "LOCKED_IN_MEMORY_PENDING") {
@@ -107,10 +139,9 @@ async function handleSendUserOperation(
       );
     }
   } else {
-    // First time seeing this EOA — initialize it
-    const state = await ctx.accountService.lockManager.initEOA(
+    const state = await chain.accountService.lockManager.initEOA(
       eoa.address,
-      ctx.accountService.getClient(),
+      chain.accountService.getClient(),
     );
     if (state.status === "LOCKED_PENDING_UNKNOWN") {
       throw bundlerError(
@@ -121,16 +152,16 @@ async function handleSendUserOperation(
   }
 
   // Check balance
-  const baseFee = await ctx.simulator.getCurrentBaseFee(rpcOverride);
+  const baseFee = await chain.simulator.getCurrentBaseFee(rpcOverride);
   const outerGas = calcOuterTxGasPrice({
     currentBaseFee: baseFee,
-    baseFeeMultiplier: ctx.config.baseFeeMultiplier,
-    bundlerTipGwei: ctx.config.bundlerTipGwei,
+    baseFeeMultiplier: config.baseFeeMultiplier,
+    bundlerTipGwei: config.bundlerTipGwei,
   });
   const maxGas = calcUserOpMaxGas(userOp);
   const estimatedCost = maxGas * outerGas.effectiveGasPrice;
 
-  const balanceCheck = await ctx.accountService.checkBalance(safeAddress, estimatedCost);
+  const balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost);
   if (!balanceCheck.sufficient) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
@@ -141,10 +172,8 @@ async function handleSendUserOperation(
   }
 
   // --- Standard ERC-4337 checks ---
-
-  // Check preVerificationGas is not too low
   const minPvg = calcPreVerificationGas(userOp, {
-    expectedBundleSize: ctx.config.maxBundleSize,
+    expectedBundleSize: config.maxBundleSize,
   });
   if (userOp.preVerificationGas < minPvg) {
     throw bundlerError(
@@ -153,21 +182,18 @@ async function handleSendUserOperation(
     );
   }
 
-  // Check minimum priority fee
-  if (userOp.maxPriorityFeePerGas < ctx.config.minPriorityFeePerGas) {
+  if (userOp.maxPriorityFeePerGas < config.minPriorityFeePerGas) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `maxPriorityFeePerGas too low: ${userOp.maxPriorityFeePerGas} < minimum ${ctx.config.minPriorityFeePerGas}`,
+      `maxPriorityFeePerGas too low: ${userOp.maxPriorityFeePerGas} < minimum ${config.minPriorityFeePerGas}`,
     );
   }
 
-  // Check profitability at per-op level
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-
   if (!checkUserOpProfitability({
     userOpGasPrice,
     outerTxEffectiveGasPrice: outerGas.effectiveGasPrice,
-    marginBps: ctx.config.minProfitMarginBps,
+    marginBps: config.minProfitMarginBps,
   })) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
@@ -176,7 +202,7 @@ async function handleSendUserOperation(
   }
 
   // Simulate validation
-  const simResult = await ctx.simulator.simulateValidation(userOp, rpcOverride);
+  const simResult = await chain.simulator.simulateValidation(userOp, rpcOverride);
   if (!simResult.valid) {
     throw bundlerError(
       simResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
@@ -186,7 +212,7 @@ async function handleSendUserOperation(
 
   // Add to mempool
   try {
-    const userOpHash = ctx.mempool.add(
+    const userOpHash = chain.mempool.add(
       userOp,
       simResult.validationResult?.prefund ?? 0n,
       rpcOverride,
@@ -202,15 +228,19 @@ async function handleSendUserOperation(
 
 async function handleEstimateUserOperationGas(
   params: unknown[],
-  ctx: RpcContext,
-  reqCtx: RequestContext = {},
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
+  reqCtx: RequestContext,
 ): Promise<Record<string, string>> {
   if (!params[0] || !params[1]) {
     throw invalidParams("Expected [userOp, entryPoint]");
   }
 
+  const chainId = requireChainId(reqCtx);
+  const chain = await resolveChain(chainId, chainRegistry, reqCtx);
+
   const entryPoint = params[1] as string;
-  if (entryPoint.toLowerCase() !== ctx.config.entryPointAddress.toLowerCase()) {
+  if (entryPoint.toLowerCase() !== config.entryPointAddress.toLowerCase()) {
     throw invalidParams(`Unsupported EntryPoint: ${entryPoint}`);
   }
 
@@ -224,7 +254,7 @@ async function handleEstimateUserOperationGas(
     throw invalidParams("Invalid UserOperation");
   }
 
-  const gasEstimate = await ctx.simulator.estimateUserOpGas(userOp, reqCtx.requestRpcUrl);
+  const gasEstimate = await chain.simulator.estimateUserOpGas(userOp, reqCtx.requestRpcUrl);
 
   const result: Record<string, string> = {
     preVerificationGas: "0x" + gasEstimate.preVerificationGas.toString(16),
@@ -242,38 +272,38 @@ async function handleEstimateUserOperationGas(
 
 function handleGetUserOperationByHash(
   params: unknown[],
-  ctx: RpcContext,
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
+  _reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
   }
 
-  // Check mempool first
-  const memEntry = ctx.mempool.get(hash);
-  if (memEntry) {
-    return {
-      userOperation: userOpToRpc(memEntry.userOp),
-      entryPoint: ctx.config.entryPointAddress,
-      blockNumber: null,
-      blockHash: null,
-      transactionHash: null,
-    };
-  }
+  // Search all initialized chains
+  for (const chain of chainRegistry.getAll()) {
+    const memEntry = chain.mempool.get(hash);
+    if (memEntry) {
+      return {
+        userOperation: userOpToRpc(memEntry.userOp),
+        entryPoint: config.entryPointAddress,
+        blockNumber: null,
+        blockHash: null,
+        transactionHash: null,
+      };
+    }
 
-  // Check receipt store
-  const receipt = ctx.bundler.getReceipt(hash);
-  if (receipt) {
-    return {
-      userOperation: {
-        sender: receipt.sender,
-        nonce: "0x" + receipt.nonce.toString(16),
-      },
-      entryPoint: receipt.entryPoint,
-      blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
-      blockHash: receipt.receipt.blockHash,
-      transactionHash: receipt.receipt.transactionHash,
-    };
+    const receipt = chain.bundler.getReceipt(hash);
+    if (receipt) {
+      return {
+        userOperation: { sender: receipt.sender, nonce: "0x" + receipt.nonce.toString(16) },
+        entryPoint: receipt.entryPoint,
+        blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
+        blockHash: receipt.receipt.blockHash,
+        transactionHash: receipt.receipt.transactionHash,
+      };
+    }
   }
 
   return null;
@@ -281,53 +311,50 @@ function handleGetUserOperationByHash(
 
 function handleGetUserOperationReceipt(
   params: unknown[],
-  ctx: RpcContext,
+  _config: BundlerConfig,
+  chainRegistry: ChainRegistry,
+  _reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
   }
 
-  const receipt = ctx.bundler.getReceipt(hash);
-  if (!receipt) return null;
+  for (const chain of chainRegistry.getAll()) {
+    const receipt = chain.bundler.getReceipt(hash);
+    if (!receipt) continue;
 
-  return {
-    userOpHash: receipt.userOpHash,
-    entryPoint: receipt.entryPoint,
-    sender: receipt.sender,
-    nonce: "0x" + receipt.nonce.toString(16),
-    paymaster: receipt.paymaster ?? "0x0000000000000000000000000000000000000000",
-    actualGasCost: "0x" + receipt.actualGasCost.toString(16),
-    actualGasUsed: "0x" + receipt.actualGasUsed.toString(16),
-    success: receipt.success,
-    logs: receipt.logs.map((l) => ({
-      logIndex: "0x" + l.logIndex.toString(16),
-      address: l.address,
-      topics: l.topics,
-      data: l.data,
-      blockNumber: "0x" + l.blockNumber.toString(16),
-      blockHash: l.blockHash,
-      transactionHash: l.transactionHash,
-    })),
-    receipt: {
-      transactionHash: receipt.receipt.transactionHash,
-      transactionIndex: "0x" + receipt.receipt.transactionIndex.toString(16),
-      blockHash: receipt.receipt.blockHash,
-      blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
-      from: receipt.receipt.from,
-      to: receipt.receipt.to,
-      cumulativeGasUsed: "0x" + receipt.receipt.cumulativeGasUsed.toString(16),
-      gasUsed: "0x" + receipt.receipt.gasUsed.toString(16),
-      effectiveGasPrice: "0x" + receipt.receipt.effectiveGasPrice.toString(16),
-    },
-  };
+    return {
+      userOpHash: receipt.userOpHash,
+      entryPoint: receipt.entryPoint,
+      sender: receipt.sender,
+      nonce: "0x" + receipt.nonce.toString(16),
+      paymaster: receipt.paymaster ?? "0x0000000000000000000000000000000000000000",
+      actualGasCost: "0x" + receipt.actualGasCost.toString(16),
+      actualGasUsed: "0x" + receipt.actualGasUsed.toString(16),
+      success: receipt.success,
+      logs: receipt.logs.map((l) => ({
+        logIndex: "0x" + l.logIndex.toString(16),
+        address: l.address,
+        topics: l.topics,
+        data: l.data,
+        blockNumber: "0x" + l.blockNumber.toString(16),
+        blockHash: l.blockHash,
+        transactionHash: l.transactionHash,
+      })),
+      receipt: {
+        transactionHash: receipt.receipt.transactionHash,
+        transactionIndex: "0x" + receipt.receipt.transactionIndex.toString(16),
+        blockHash: receipt.receipt.blockHash,
+        blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
+        from: receipt.receipt.from,
+        to: receipt.receipt.to,
+        cumulativeGasUsed: "0x" + receipt.receipt.cumulativeGasUsed.toString(16),
+        gasUsed: "0x" + receipt.receipt.gasUsed.toString(16),
+        effectiveGasPrice: "0x" + receipt.receipt.effectiveGasPrice.toString(16),
+      },
+    };
+  }
+
+  return null;
 }
-
-function handleSupportedEntryPoints(ctx: RpcContext): string[] {
-  return [ctx.config.entryPointAddress];
-}
-
-function handleChainId(ctx: RpcContext): string {
-  return "0x" + ctx.config.chainId.toString(16);
-}
-

@@ -2,20 +2,30 @@
  * Bundler configuration.
  *
  * Only OPERATOR_SECRET and TREASURY_ADDRESS are required.
- * Everything else has sensible defaults.
+ * Multi-chain: chainId comes per-request, not from config.
+ * Per-chain services (RPC, mempool, simulator) are lazily created.
  */
 
-import { resolveChain, type ChainInfo } from "./chain-registry.ts";
+import type { ChainInfo } from "./chain-registry.ts";
 
 export type { ChainInfo };
 export { resolveChain, fetchChainInfo, filterPublicRpcUrls } from "./chain-registry.ts";
 
+/**
+ * Global config — chain-independent settings.
+ * Per-chain fields (chainId, rpcUrl, etc.) are set by ChainRegistry at runtime.
+ */
 export interface BundlerConfig {
+  /** Set per-chain at runtime by ChainRegistry. */
   readonly chainId: number;
+  /** Set per-chain at runtime by ChainRegistry. */
   readonly rpcUrl: string;
   readonly userRpcUrls: string[];
+  /** Set per-chain at runtime by ChainRegistry. */
   readonly publicRpcs: string[];
+  /** Set per-chain at runtime by ChainRegistry. */
   readonly chainInfo: ChainInfo | null;
+
   readonly entryPointAddress: `0x${string}`;
 
   readonly port: number;
@@ -67,60 +77,25 @@ function envCsv(key: string): string[] {
   return raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
 }
 
-export async function loadConfig(): Promise<BundlerConfig> {
-  // --- Only two required env vars ---
+/**
+ * Load global bundler configuration.
+ * No chain-specific resolution at startup — that happens lazily per-request.
+ */
+export function loadConfig(): BundlerConfig {
   const operatorSecret = env("OPERATOR_SECRET");
   const treasuryAddress = envHex("TREASURY_ADDRESS");
 
-  // --- Everything else has defaults ---
-  const chainId = parseInt(env("CHAIN_ID", "1"));
-  const manualRpcUrl = envOptional("RPC_URL");
-  const userRpcUrls = envCsv("USER_RPC_URLS");
-
-  // Resolve RPC from registry
-  let registryRpcUrl: string | null = null;
-  let publicRpcs: string[] = [];
-  let chainInfo: ChainInfo | null = null;
-  let registryEip1559 = false;
-
-  const isLocalDev = manualRpcUrl?.startsWith("http://localhost") ||
-    manualRpcUrl?.startsWith("http://127.0.0.1");
-
-  if (!isLocalDev) {
-    try {
-      const resolved = await resolveChain(chainId);
-      registryRpcUrl = resolved.rpcUrl;
-      publicRpcs = resolved.publicRpcs;
-      chainInfo = resolved.chain;
-      registryEip1559 = resolved.supportsEip1559;
-    } catch (err) {
-      if (userRpcUrls.length === 0 && !manualRpcUrl) throw err;
-      console.warn(`[Config] Registry lookup failed: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  let rpcUrl: string;
-  if (userRpcUrls.length > 0) {
-    rpcUrl = userRpcUrls[0]!;
-  } else if (manualRpcUrl) {
-    rpcUrl = manualRpcUrl;
-  } else if (registryRpcUrl) {
-    rpcUrl = registryRpcUrl;
-  } else {
-    throw new Error("No RPC available: set USER_RPC_URLS, RPC_URL, or use a supported CHAIN_ID");
-  }
-
   const eip1559Env = envOptional("USE_EIP1559");
-  const useEip1559 = eip1559Env !== undefined
-    ? eip1559Env === "true"
-    : (chainInfo ? registryEip1559 : true);
+  const useEip1559 = eip1559Env !== undefined ? eip1559Env === "true" : true;
 
   return {
-    chainId,
-    rpcUrl,
-    userRpcUrls,
-    publicRpcs,
-    chainInfo,
+    // Per-chain defaults — overridden by ChainRegistry at runtime
+    chainId: 0,
+    rpcUrl: "",
+    userRpcUrls: envCsv("USER_RPC_URLS"),
+    publicRpcs: [],
+    chainInfo: null,
+
     entryPointAddress: envHex("ENTRY_POINT_ADDRESS", "0x0000000071727De22E5E9d8BAf0edAc6f37da032"),
 
     port: parseInt(env("PORT", "3300")),

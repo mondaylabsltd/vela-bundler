@@ -1,15 +1,12 @@
 /**
- * JSON-RPC server implementing ERC-7769 bundler API + private REST API.
+ * JSON-RPC server implementing ERC-7769 bundler API + REST API.
  *
+ * Multi-chain: chainId comes per-request, services resolved lazily.
  * Supports per-request RPC override via X-Rpc-Url header.
- * Priority: X-Rpc-Url > USER_RPC_URLS > RPC_URL > registry.
  */
 
 import type { BundlerConfig } from "../config/index.ts";
-import type { Simulator } from "../simulation/index.ts";
-import { Mempool } from "../mempool/index.ts";
-import { BundlerService } from "../bundler/index.ts";
-import type { AccountService } from "../account/index.ts";
+import type { ChainRegistry, ChainServices } from "../chain/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import { handleRestApi } from "./rest-api.ts";
 import type { RateLimitConfig } from "../auth/index.ts";
@@ -28,13 +25,6 @@ try {
   HOME_HTML = "<html><body><h1>Vela Bundler</h1><p>Run <code>deno task build</code> to generate homepage.</p></body></html>";
 }
 
-export interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id: number | string;
-  method: string;
-  params?: unknown[];
-}
-
 export interface JsonRpcResponse {
   jsonrpc: "2.0";
   id: number | string | null;
@@ -44,25 +34,21 @@ export interface JsonRpcResponse {
 
 export interface RpcContext {
   config: BundlerConfig;
-  mempool: Mempool;
-  simulator: Simulator;
-  bundler: BundlerService;
-  accountService: AccountService;
+  chain: ChainServices;
 }
 
-/**
- * Per-request context carrying the optional RPC override.
- */
 export interface RequestContext {
-  /** Per-request RPC URL override from X-Rpc-Url header (highest priority). */
   requestRpcUrl?: string;
+  chainId?: number;
 }
 
 /**
- * Start the JSON-RPC + REST HTTP server.
+ * Start the multi-chain JSON-RPC + REST HTTP server.
  */
-export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
-  const { config } = ctx;
+export function startRpcServer(
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
+): Deno.HttpServer {
   const rateLimitConfig: RateLimitConfig = {
     rateLimitPerMinute: config.apiRateLimitPerMinute,
   };
@@ -72,7 +58,7 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
     async (req: Request): Promise<Response> => {
       const url = new URL(req.url);
 
-      // Homepage — README as HTML
+      // Homepage
       if (url.pathname === "/" && req.method === "GET") {
         return new Response(HOME_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -87,12 +73,13 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
         });
       }
 
-      // Extract per-request RPC override
       const requestRpcUrl = req.headers.get("x-rpc-url") ?? undefined;
+      const chainIdHeader = req.headers.get("x-chain-id");
+      const chainId = chainIdHeader ? parseInt(chainIdHeader) : undefined;
 
-      // Route REST API requests (/v1/...)
+      // REST API (/v1/...)
       const restResponse = await handleRestApi(
-        req, url, ctx.accountService, rateLimitConfig, requestRpcUrl,
+        req, url, chainRegistry, config, rateLimitConfig, requestRpcUrl,
       );
       if (restResponse) return restResponse;
 
@@ -100,7 +87,7 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
       const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Rpc-Url",
+        "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url, X-Chain-Id",
       };
 
       if (req.method === "OPTIONS") {
@@ -121,30 +108,29 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
         return jsonResponse({ jsonrpc: "2.0", id: null, error: parseError() }, corsHeaders);
       }
 
-      const reqCtx: RequestContext = { requestRpcUrl };
+      const reqCtx: RequestContext = { requestRpcUrl, chainId };
 
-      // Handle batch requests
       if (Array.isArray(body)) {
         const responses = await Promise.all(
-          body.map((item) => processRequest(item, ctx, reqCtx)),
+          body.map((item) => processRequest(item, config, chainRegistry, reqCtx)),
         );
         return jsonResponse(responses, corsHeaders);
       }
 
-      const response = await processRequest(body, ctx, reqCtx);
+      const response = await processRequest(body, config, chainRegistry, reqCtx);
       return jsonResponse(response, corsHeaders);
     },
   );
 
   console.log(`[RPC] Server listening on ${config.host}:${config.port}`);
   console.log(`[RPC] REST API: GET /v1/account/:chainId/:safeAddress`);
-  console.log(`[RPC] Per-request RPC override: X-Rpc-Url header`);
   return server;
 }
 
 async function processRequest(
   body: unknown,
-  ctx: RpcContext,
+  config: BundlerConfig,
+  chainRegistry: ChainRegistry,
   reqCtx: RequestContext,
 ): Promise<JsonRpcResponse> {
   if (!body || typeof body !== "object") {
@@ -173,7 +159,7 @@ async function processRequest(
   const params = Array.isArray(req.params) ? req.params : [];
 
   try {
-    const result = await handleRpcMethod(req.method, params, ctx, reqCtx);
+    const result = await handleRpcMethod(req.method, params, config, chainRegistry, reqCtx);
     return { jsonrpc: "2.0", id, result };
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && "message" in err) {
