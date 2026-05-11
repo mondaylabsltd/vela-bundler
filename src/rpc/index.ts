@@ -83,9 +83,6 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
       if (url.pathname === "/health" && req.method === "GET") {
         return Response.json({
           service: "vela-bundler",
-          version: "0.1.0",
-          chainId: config.chainId,
-          entryPoint: config.entryPointAddress,
           status: "ok",
         });
       }
