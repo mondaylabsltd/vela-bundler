@@ -11,7 +11,7 @@ src/
 ├── config/          Configuration + chain registry (auto-resolve RPC from chainId)
 ├── keys/            Deterministic key derivation (HKDF-SHA256) + KeyManager interface
 ├── account/         Per-EOA balance, reservations, lock management (no database)
-├── auth/            Bearer token auth + rate limiting
+├── auth/            Rate limiting
 ├── contracts/       EntryPoint v0.7 ABI, constants, ERC-7769 error codes
 ├── userop/          UserOperation types, packing, hashing, validation, encoding
 ├── gas/             preVerificationGas calculation, profitability model
@@ -19,14 +19,14 @@ src/
 ├── mempool/         In-memory mempool with reputation tracking
 ├── bundler/         Bundle building per-safeAddress, profitability gating, submission
 ├── rpc/             JSON-RPC server (ERC-7769) + REST API (/v1/account)
-└── utils/           Hex utilities
+└── utils/           Hex utilities, RPC client factory
 ```
 
 ## Quick Start
 
 ```bash
 cp .env.example .env
-# Edit .env: set CHAIN_ID, OPERATOR_SECRET, API_TOKEN
+# Edit .env: set CHAIN_ID, OPERATOR_SECRET
 
 deno task dev     # Development with watch mode
 deno task start   # Production
@@ -76,11 +76,26 @@ reservedBalance  = in-memory pending reservation
 spendableBalance = onchainBalance - reservedBalance
 ```
 
+## RPC URL Priority
+
+All chain interactions (simulation, submission, balance queries) use the RPC resolved by this priority:
+
+| Priority | Source | Scope |
+|----------|--------|-------|
+| 1 | `X-Rpc-Url` header | Per-request |
+| 2 | `USER_RPC_URLS` env | Startup config (comma-separated) |
+| 3 | `RPC_URL` env | Startup config (operator override) |
+| 4 | Chain registry | Auto-resolved from `CHAIN_ID` |
+
+User-provided RPCs flow through the entire call chain: simulation, bundle submission, receipt waiting, and balance queries. In prepaid mode the EOA funds belong to the user, so there is no operator risk from using a user-supplied RPC.
+
 ## REST API
 
 ### GET /v1/account/:chainId/:safeAddress
 
-Returns deposit address, balance, and status. Requires `Authorization: Bearer <token>`.
+Returns deposit address, balance, and status. No authentication required. Rate limited per IP.
+
+Supports `X-Rpc-Url` header for per-request RPC override.
 
 **Response:**
 ```json
@@ -96,7 +111,8 @@ Returns deposit address, balance, and status. Requires `Authorization: Bearer <t
   "spendableBalance": "0x...",
   "latestNonce": 0,
   "pendingNonce": 0,
-  "status": "ACTIVE"
+  "status": "ACTIVE",
+  "rpcUsed": "https://..."
 }
 ```
 
@@ -107,6 +123,8 @@ Returns deposit address, balance, and status. Requires `Authorization: Bearer <t
 - `LOCKED_IN_MEMORY_PENDING` — bundle currently in flight.
 
 ## ERC-7769 JSON-RPC Methods
+
+All JSON-RPC methods support `X-Rpc-Url` header for per-request RPC override.
 
 | Method | Description |
 |--------|-------------|
@@ -182,12 +200,13 @@ See [.env.example](.env.example) for all variables.
 |----------|---------|-------------|
 | `CHAIN_ID` | — | Required. Chain ID |
 | `OPERATOR_SECRET` | — | Required. Master secret for key derivation |
-| `API_TOKEN` | — | Required. Bearer token for REST API |
+| `USER_RPC_URLS` | — | User-provided RPCs, comma-separated (highest priority) |
+| `RPC_URL` | auto | Operator RPC override |
 | `ACTIVE_KEY_VERSION` | `1` | Current key version |
 | `DRAINING_KEY_VERSIONS` | — | Comma-separated old versions |
 | `BALANCE_RESERVE_MULTIPLIER` | `2` | Require N× expected cost |
 | `MIN_PROFIT_MARGIN_BPS` | `2000` | Minimum profit margin (20%) |
-| `RPC_URL` | auto | Manual override (local dev only) |
+| `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
 
 ## Known Limitations
 
