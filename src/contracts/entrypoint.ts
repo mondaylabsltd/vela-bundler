@@ -123,7 +123,58 @@ export const ENTRYPOINT_V07_ABI = [
         ],
       },
     ],
-    outputs: [],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          {
+            name: "returnInfo", type: "tuple",
+            components: [
+              { name: "preOpGas", type: "uint256" },
+              { name: "prefund", type: "uint256" },
+              { name: "accountValidationData", type: "uint256" },
+              { name: "paymasterValidationData", type: "uint256" },
+              { name: "paymasterContext", type: "bytes" },
+            ],
+          },
+          {
+            name: "senderInfo", type: "tuple",
+            components: [
+              { name: "stake", type: "uint256" },
+              { name: "unstakeDelaySec", type: "uint256" },
+            ],
+          },
+          {
+            name: "factoryInfo", type: "tuple",
+            components: [
+              { name: "stake", type: "uint256" },
+              { name: "unstakeDelaySec", type: "uint256" },
+            ],
+          },
+          {
+            name: "paymasterInfo", type: "tuple",
+            components: [
+              { name: "stake", type: "uint256" },
+              { name: "unstakeDelaySec", type: "uint256" },
+            ],
+          },
+          {
+            name: "aggregatorInfo", type: "tuple",
+            components: [
+              { name: "aggregator", type: "address" },
+              {
+                name: "stakeInfo", type: "tuple",
+                components: [
+                  { name: "stake", type: "uint256" },
+                  { name: "unstakeDelaySec", type: "uint256" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
     stateMutability: "nonpayable",
   },
   {
