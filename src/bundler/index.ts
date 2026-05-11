@@ -258,22 +258,11 @@ export class BundlerService {
       if (simResult.valid) {
         checkedEntries.push(entry);
       } else {
-        // Anvil (chainId 31337) returns empty revert data for simulateValidation.
-        // Skip re-validation on dev chains and let handleOps do on-chain verification.
-        const isDevChain = this.config.chainId === 31337;
-        const isEmptyRevert = simResult.errorMessage?.includes("0x") &&
-          !simResult.errorMessage.includes("AA") &&
-          !simResult.errorMessage.includes("FailedOp");
-        if (isDevChain && isEmptyRevert) {
-          console.warn(`[Bundler] chain ${this.config.chainId}: UserOp ${entry.userOpHash} re-validation empty revert — skipping (dev chain)`);
-          checkedEntries.push(entry);
-        } else {
-          this.mempool.remove(entry.userOpHash);
-          this.mempool.reputation.penalize(entry.userOp.sender, "sender");
-          console.warn(
-            `[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`,
-          );
-        }
+        this.mempool.remove(entry.userOpHash);
+        this.mempool.reputation.penalize(entry.userOp.sender, "sender");
+        console.warn(
+          `[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`,
+        );
       }
     }
 

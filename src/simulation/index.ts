@@ -51,50 +51,71 @@ export function createSimulator(config: BundlerConfig) {
 
   /**
    * Simulate validation of a single UserOperation via eth_call to simulateValidation.
+   * Uses raw fetch instead of viem's client.call to reliably extract revert data
+   * from the JSON-RPC error response (viem swallows/reformats revert data).
    */
   async function simulateValidation(
     userOp: UserOperation,
     rpcUrlOverride?: string,
   ): Promise<SimulationResult> {
-    const client = clientFor(rpcUrlOverride);
     const packed = packUserOp(userOp);
-
     const calldata = encodeFunctionData({
       abi: ENTRYPOINT_V07_ABI,
       functionName: "simulateValidation",
       args: [packed],
     });
 
+    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+
     try {
-      await client.call({
-        to: config.entryPointAddress,
-        data: calldata,
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [{ to: config.entryPointAddress, data: calldata }, "latest"],
+        }),
       });
 
-      // simulateValidation should always revert; if it doesn't, treat as error
+      const json = await res.json() as {
+        result?: string;
+        error?: { code: number; message: string; data?: string };
+      };
+
+      if (json.result) {
+        // simulateValidation should always revert; normal return is unexpected
+        return {
+          valid: false,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: "simulateValidation did not revert as expected",
+        };
+      }
+
+      // Extract revert data directly from the JSON-RPC error response
+      const revertData = json.error?.data as `0x${string}` | undefined;
+      if (!revertData || revertData === "0x") {
+        return {
+          valid: false,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: `Simulation reverted with no data (RPC error: ${json.error?.message ?? "unknown"})`,
+        };
+      }
+
+      return parseRevertData(revertData);
+    } catch (err: unknown) {
       return {
         valid: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: "simulateValidation did not revert as expected",
+        errorMessage: `Simulation RPC failed: ${err instanceof Error ? err.message : String(err)}`,
       };
-    } catch (err: unknown) {
-      return parseSimulationRevert(err);
     }
   }
 
   /**
-   * Parse the revert data from simulateValidation.
+   * Parse raw revert data hex from simulateValidation.
    */
-  function parseSimulationRevert(err: unknown): SimulationResult {
-    const revertData = extractRevertData(err);
-    if (!revertData) {
-      return {
-        valid: false,
-        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `Simulation failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
+  function parseRevertData(revertData: `0x${string}`): SimulationResult {
     try {
       const decoded = decodeErrorResult({
         abi: ENTRYPOINT_V07_ABI,
