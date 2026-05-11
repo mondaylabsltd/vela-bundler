@@ -327,6 +327,15 @@ export const DUMMY_SIGNATURE =
   "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c" as `0x${string}`;
 
 /**
+ * EntryPointSimulations deployed bytecode for v0.7.
+ * Used via eth_call stateOverride to inject simulateValidation into EntryPoint.
+ * Compiled from: eth-infinitism/account-abstraction v0.7 EntryPointSimulations.sol
+ */
+const __epSimBytecodeUrl = new URL("./EntryPointSimulations_v07_bytecode.txt", import.meta.url);
+export const ENTRY_POINT_SIMULATIONS_BYTECODE: `0x${string}` =
+  Deno.readTextFileSync(__epSimBytecodeUrl).trim() as `0x${string}`;
+
+/**
  * Known constants for EntryPoint v0.7.
  */
 export const MAX_VERIFICATION_GAS = 2_000_000n;
