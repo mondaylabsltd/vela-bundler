@@ -23,11 +23,14 @@ import {
   ensureServiceUser,
   installDeno,
   installSudoers,
+  isEnvConfigured,
   probeRemote,
+  readEnvFile,
   RELEASES_DIR,
   releaseTag,
   swapSymlink,
   uploadRelease,
+  writeEnvFile,
 } from "./deploy/remote.ts";
 
 const SYSTEMD_UNIT = "vela-bundler.service";
@@ -149,6 +152,64 @@ async function runDeploy(cfg: DeployConfig) {
     await ensureDirectories(ssh);
     console.log("-> Ensuring env file...");
     await ensureEnvFile(ssh);
+
+    // Configure env vars
+    const configured = await isEnvConfigured(ssh);
+    if (!configured || state.firstTime) {
+      console.log("\n--- Environment Configuration ---");
+      console.log("(These are written to /opt/vela-bundler/data/vela.env on the server)\n");
+
+      const operatorSecret = await prompt("OPERATOR_SECRET (32+ byte hex, 0x...)");
+      if (!operatorSecret || !operatorSecret.startsWith("0x") || operatorSecret.length < 66) {
+        throw new Error("OPERATOR_SECRET must be a 0x-prefixed hex string of at least 32 bytes (66 chars)");
+      }
+      const treasuryAddress = await prompt("TREASURY_ADDRESS (0x...)");
+      if (!treasuryAddress || !/^0x[0-9a-fA-F]{40}$/.test(treasuryAddress)) {
+        throw new Error("TREASURY_ADDRESS must be a valid Ethereum address");
+      }
+      const chainId = await prompt("CHAIN_ID", "1");
+      const userRpcUrls = await prompt("USER_RPC_URLS (comma-separated, optional)", "");
+
+      const envVars: Record<string, string> = {
+        OPERATOR_SECRET: operatorSecret,
+        TREASURY_ADDRESS: treasuryAddress,
+        CHAIN_ID: chainId,
+      };
+      if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
+
+      await writeEnvFile(ssh, envVars);
+      console.log("-> Env file written.\n");
+    } else {
+      console.log("  Env already configured. To update, edit /opt/vela-bundler/data/vela.env on server.");
+      const updateEnv = await prompt("Update env config? (y/N)", "N");
+      if (updateEnv.toLowerCase() === "y") {
+        const currentEnv = await readEnvFile(ssh);
+        // Parse existing values as defaults
+        const existing: Record<string, string> = {};
+        for (const line of currentEnv.split("\n")) {
+          const match = line.match(/^([A-Z_]+)=(.*)$/);
+          if (match) existing[match[1]!] = match[2]!;
+        }
+
+        const operatorSecret = await prompt("OPERATOR_SECRET", existing.OPERATOR_SECRET ?? "");
+        const treasuryAddress = await prompt("TREASURY_ADDRESS", existing.TREASURY_ADDRESS ?? "");
+        const chainId = await prompt("CHAIN_ID", existing.CHAIN_ID ?? "1");
+        const userRpcUrls = await prompt("USER_RPC_URLS", existing.USER_RPC_URLS ?? "");
+        const oldSecrets = await prompt("OLD_OPERATOR_SECRETS", existing.OLD_OPERATOR_SECRETS ?? "");
+
+        const envVars: Record<string, string> = {
+          OPERATOR_SECRET: operatorSecret,
+          TREASURY_ADDRESS: treasuryAddress,
+          CHAIN_ID: chainId,
+        };
+        if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
+        if (oldSecrets) envVars.OLD_OPERATOR_SECRETS = oldSecrets;
+
+        await writeEnvFile(ssh, envVars);
+        console.log("-> Env file updated.\n");
+      }
+    }
+
     console.log("-> Installing sudoers...");
     await installSudoers(ssh, target.user);
 
@@ -210,12 +271,7 @@ async function runDeploy(cfg: DeployConfig) {
     console.log(`  RPC:      http://${target.host}:${HTTP_PORT}/`);
     console.log(`  Account:  http://${target.host}:${HTTP_PORT}/v1/account/:chainId/:safeAddress`);
     console.log(`  Env file: /opt/vela-bundler/data/vela.env`);
-    console.log("=".repeat(50));
-    if (state.firstTime) {
-      console.log("\n  IMPORTANT: Edit /opt/vela-bundler/data/vela.env on the server");
-      console.log("  Set OPERATOR_SECRET and TREASURY_ADDRESS, then restart:");
-      console.log(`  sudo systemctl restart ${SYSTEMD_UNIT}\n`);
-    }
+    console.log("=".repeat(50) + "\n");
   } finally {
     await ssh.close();
   }

@@ -69,19 +69,57 @@ export async function ensureEnvFile(ssh: SshSession): Promise<void> {
     set -e
     if [ ! -f ${sh(ENV_FILE)} ]; then
       sudo install -o ${SERVICE_USER} -g ${SERVICE_USER} -m 0600 /dev/null ${sh(ENV_FILE)}
-      cat <<'ENVEOF' | sudo tee ${sh(ENV_FILE)} >/dev/null
-# vela-bundler configuration (required)
-OPERATOR_SECRET=CHANGE_ME
-TREASURY_ADDRESS=CHANGE_ME
-# CHAIN_ID=1
-# USER_RPC_URLS=
-# OLD_OPERATOR_SECRETS=
-ENVEOF
     fi
     sudo chown ${SERVICE_USER}:${SERVICE_USER} ${sh(ENV_FILE)}
     sudo chmod 0600 ${sh(ENV_FILE)}
   `);
   if (code !== 0) throw new Error("failed to ensure env file");
+}
+
+/**
+ * Check if the env file has been configured (not placeholder values).
+ */
+export async function isEnvConfigured(ssh: SshSession): Promise<boolean> {
+  const result = await ssh.runCapture([
+    "bash", "-lc",
+    `sudo cat ${sh(ENV_FILE)} 2>/dev/null || echo ''`,
+  ]);
+  const content = result.stdout;
+  if (!content || content.includes("CHANGE_ME")) return false;
+  if (!content.includes("OPERATOR_SECRET=")) return false;
+  if (!content.includes("TREASURY_ADDRESS=")) return false;
+  return true;
+}
+
+/**
+ * Read the current env file contents.
+ */
+export async function readEnvFile(ssh: SshSession): Promise<string> {
+  const result = await ssh.runCapture([
+    "bash", "-lc",
+    `sudo cat ${sh(ENV_FILE)} 2>/dev/null || echo ''`,
+  ]);
+  return result.stdout;
+}
+
+/**
+ * Write env configuration to the remote env file.
+ */
+export async function writeEnvFile(
+  ssh: SshSession,
+  envVars: Record<string, string>,
+): Promise<void> {
+  const lines = Object.entries(envVars)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+  const b64 = btoa(lines + "\n");
+  const code = await ssh.runShell(`
+    set -e
+    printf '%s' '${b64}' | base64 -d | sudo tee ${sh(ENV_FILE)} >/dev/null
+    sudo chown ${SERVICE_USER}:${SERVICE_USER} ${sh(ENV_FILE)}
+    sudo chmod 0600 ${sh(ENV_FILE)}
+  `);
+  if (code !== 0) throw new Error("failed to write env file");
 }
 
 export async function installSudoers(ssh: SshSession, deployUser: string): Promise<void> {
