@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vela Bundler — Private Prepaid ERC-4337 Bundler</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css">
+<style>
+  * { box-sizing: border-box; }
+  html { background: #f6f8fa; }
+  body {
+    max-width: 980px;
+    margin: 40px auto;
+    padding: 40px 48px;
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .markdown-body { font-size: 16px; line-height: 1.7; margin: 40px auto !important; }
+  @media (max-width: 767px) {
+    body { margin: 16px; padding: 24px 16px; }
+  }
+</style>
+</head>
+<body class="markdown-body">
+<h1>Vela Bundler</h1>
+<p>Private prepaid ERC-4337 / ERC-7769 bundler for EntryPoint v0.7, built with Deno 2 + TypeScript.</p>
+<p>Supports any EVM network listed at <a href="https://ethereum-data.awesometools.dev/">ethereum-data.awesometools.dev</a>.</p>
+<h2>Quick Start</h2>
+<pre><code class="language-bash"># Only two required env vars:
+export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
+export TREASURY_ADDRESS=0x...  # Where excess EOA balance is swept
+
+deno task start
+</code></pre>
+<p>Everything else has sensible defaults (Ethereum mainnet, auto RPC, port 3300).</p>
+<h2>How It Works</h2>
+<ol>
+<li>Each user&#39;s <strong>safeAddress</strong> gets a <strong>dedicated bundler EOA</strong>, deterministically derived from <code>(chainId, entryPoint, safeAddress, operatorSecret)</code>.</li>
+<li>Users deposit native tokens to their dedicated EOA.</li>
+<li>The bundler submits <code>handleOps</code> when the EOA has sufficient balance.</li>
+<li>Each bundle contains ops from <strong>one safeAddress only</strong>, signed by its dedicated EOA.</li>
+<li>Every 30 bundles, excess balance is swept to the treasury.</li>
+</ol>
+<p>No database — all state is derived or in-memory.</p>
+<h2>Architecture</h2>
+<pre><code>src/
+├── config/          Configuration + chain registry (auto-resolve RPC)
+├── keys/            Deterministic key derivation (HKDF-SHA256)
+├── account/         Per-EOA balance, reservations, lock management
+├── auth/            Rate limiting
+├── contracts/       EntryPoint v0.7 ABI, constants, error codes
+├── userop/          UserOperation types, packing, hashing, validation
+├── gas/             preVerificationGas, profitability model
+├── simulation/      simulateValidation + bundle simulation
+├── mempool/         In-memory mempool with reputation tracking
+├── bundler/         Bundle building, submission, treasury sweep
+├── rpc/             JSON-RPC (ERC-7769) + REST API
+└── utils/           Hex utilities, RPC client factory
+</code></pre>
+<h2>Key Derivation</h2>
+<pre><code>HKDF-SHA256(
+  IKM  = operatorSecret,
+  salt = &quot;vela-bundler-dedicated-eoa-v1&quot;,
+  info = &quot;chainId={id}|entryPoint={addr}|safeAddress={addr}&quot;,
+  L    = 32 bytes
+) → secp256k1 private key → Ethereum address
+</code></pre>
+<ul>
+<li>HKDF-SHA256 with domain separation.</li>
+<li>Inputs canonicalized (lowercase, decimal chainId).</li>
+<li>Invalid keys auto-retry with counter.</li>
+<li><code>KeyManager</code> interface for future KMS/HSM/MPC.</li>
+</ul>
+<h2>RPC URL Priority</h2>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Source</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>X-Rpc-Url</code> header</td>
+<td>Per-request</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>USER_RPC_URLS</code> env</td>
+<td>Startup (comma-separated)</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>RPC_URL</code> env</td>
+<td>Startup (operator override)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Chain registry</td>
+<td>Auto-resolved from CHAIN_ID</td>
+</tr>
+</tbody></table>
+<p>User RPCs flow through the entire chain: simulation, submission, balance queries.</p>
+<h2>REST API</h2>
+<h3>GET /v1/account/:chainId/:safeAddress</h3>
+<p>No authentication. Rate limited per IP. Supports <code>X-Rpc-Url</code> header.</p>
+<pre><code class="language-json">{
+  &quot;chainId&quot;: 1,
+  &quot;entryPoint&quot;: &quot;0x0000000071727De22E5E9d8BAf0edAc6f37da032&quot;,
+  &quot;safeAddress&quot;: &quot;0x...&quot;,
+  &quot;activeDepositAddress&quot;: &quot;0x...&quot;,
+  &quot;oldDepositAddresses&quot;: [],
+  &quot;onchainBalance&quot;: &quot;0x...&quot;,
+  &quot;reservedBalance&quot;: &quot;0x0&quot;,
+  &quot;spendableBalance&quot;: &quot;0x...&quot;,
+  &quot;latestNonce&quot;: 0,
+  &quot;pendingNonce&quot;: 0,
+  &quot;status&quot;: &quot;ACTIVE&quot;,
+  &quot;rpcUsed&quot;: &quot;https://...&quot;
+}
+</code></pre>
+<p><strong>Status:</strong> <code>ACTIVE</code> | <code>INSUFFICIENT_BALANCE</code> | <code>LOCKED_PENDING_UNKNOWN</code> | <code>LOCKED_IN_MEMORY_PENDING</code></p>
+<h2>JSON-RPC Methods</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>eth_sendUserOperation</code></td>
+<td>Submit UserOp (checks balance, binding, profitability)</td>
+</tr>
+<tr>
+<td><code>eth_estimateUserOperationGas</code></td>
+<td>Estimate gas limits</td>
+</tr>
+<tr>
+<td><code>eth_getUserOperationByHash</code></td>
+<td>Get UserOp by hash</td>
+</tr>
+<tr>
+<td><code>eth_getUserOperationReceipt</code></td>
+<td>Get receipt</td>
+</tr>
+<tr>
+<td><code>eth_supportedEntryPoints</code></td>
+<td>List EntryPoints</td>
+</tr>
+<tr>
+<td><code>eth_chainId</code></td>
+<td>Chain ID</td>
+</tr>
+</tbody></table>
+<p>All methods support <code>X-Rpc-Url</code> header.</p>
+<h2>Treasury Sweep</h2>
+<p>Excess EOA balance is automatically swept to <code>TREASURY_ADDRESS</code>:</p>
+<ul>
+<li><strong>Trigger:</strong> before bundling, when <code>nonce % SWEEP_INTERVAL === 0</code></li>
+<li><strong>Retain:</strong> <code>currentGasPrice × 10M gas</code> (enough for future bundles)</li>
+<li><strong>Runs inside bundle lock</strong> — no nonce conflicts</li>
+<li><strong>Non-fatal:</strong> failure skips, retries next trigger</li>
+</ul>
+<h2>Secret Rotation</h2>
+<p>No <code>keyVersion</code>. Rotation = change <code>OPERATOR_SECRET</code>, put old one in <code>OLD_OPERATOR_SECRETS</code>.</p>
+<ul>
+<li>New secret → new EOAs for all users</li>
+<li>Old secret → old EOAs still derivable for balance queries + sweep</li>
+<li>Sweep clears old EOAs → remove old secret from config</li>
+</ul>
+<h2>Binding Rules</h2>
+<ul>
+<li>Dedicated EOA only serves its bound safeAddress</li>
+<li>One safeAddress per bundle</li>
+<li>Signer = beneficiary = dedicated EOA</li>
+<li>Only <code>handleOps</code> calldata to configured EntryPoint</li>
+</ul>
+<h2>Configuration</h2>
+<p>Only <code>OPERATOR_SECRET</code> and <code>TREASURY_ADDRESS</code> are required. See <a href=".env.example">.env.example</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>OPERATOR_SECRET</code></td>
+<td>—</td>
+<td><strong>Required.</strong> 32+ byte hex secret</td>
+</tr>
+<tr>
+<td><code>TREASURY_ADDRESS</code></td>
+<td>—</td>
+<td><strong>Required.</strong> Sweep destination</td>
+</tr>
+<tr>
+<td><code>CHAIN_ID</code></td>
+<td><code>1</code></td>
+<td>Chain ID</td>
+</tr>
+<tr>
+<td><code>SWEEP_INTERVAL</code></td>
+<td><code>30</code></td>
+<td>Sweep every N bundles per EOA</td>
+</tr>
+<tr>
+<td><code>OLD_OPERATOR_SECRETS</code></td>
+<td>—</td>
+<td>Old secrets for sweep (comma-separated)</td>
+</tr>
+</tbody></table>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>No database</strong> — no billing history, profit reports. In-memory state lost on restart.</li>
+<li><strong>Single instance</strong> — no distributed locking.</li>
+<li><strong>No opcode tracing</strong> — ERC-7562 not implemented.</li>
+<li><strong>No aggregator support.</strong></li>
+<li><strong>Reorg risk</strong> — profitability checks apply to normal execution only.</li>
+<li><strong>Conservative restart</strong> — unknown pending nonce locks the EOA.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>
+</body>
+</html>

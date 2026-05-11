@@ -20,6 +20,14 @@ import {
   type JsonRpcError,
 } from "./errors.ts";
 
+// Load homepage HTML at startup (built from README.md via `deno task build`)
+let HOME_HTML = "";
+try {
+  HOME_HTML = await Deno.readTextFile(new URL("../index.html", import.meta.url));
+} catch {
+  HOME_HTML = "<html><body><h1>Vela Bundler</h1><p>Run <code>deno task build</code> to generate homepage.</p></body></html>";
+}
+
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
   id: number | string;
@@ -63,6 +71,24 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
     { port: config.port, hostname: config.host },
     async (req: Request): Promise<Response> => {
       const url = new URL(req.url);
+
+      // Homepage — README as HTML
+      if (url.pathname === "/" && req.method === "GET") {
+        return new Response(HOME_HTML, {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
+
+      // Health / service identification
+      if (url.pathname === "/health" && req.method === "GET") {
+        return Response.json({
+          service: "vela-bundler",
+          version: "0.1.0",
+          chainId: config.chainId,
+          entryPoint: config.entryPointAddress,
+          status: "ok",
+        });
+      }
 
       // Extract per-request RPC override
       const requestRpcUrl = req.headers.get("x-rpc-url") ?? undefined;

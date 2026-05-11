@@ -3,6 +3,7 @@
     "dev": "deno run --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno run --allow-net --allow-env --allow-read main.ts",
     "test": "deno test --allow-net --allow-env --allow-read --allow-run -A",
+    "build": "deno run --allow-read --allow-write scripts/build-html.ts",
     "lint": "deno lint && deno check main.ts",
     "deploy": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts",
     "deploy:status": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts status",

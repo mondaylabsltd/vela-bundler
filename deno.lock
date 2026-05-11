@@ -3,6 +3,7 @@
   "specifiers": {
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.12",
+    "npm:marked@15": "15.0.12",
     "npm:viem@2.27.2": "2.27.2"
   },
   "jsr": {
@@ -58,6 +59,10 @@
       "dependencies": [
         "ws"
       ]
+    },
+    "marked@15.0.12": {
+      "integrity": "sha512-8dD6FusOQSrpv9Z1rdNMdlSgQOIP880DHqnohobOmYLElGEqAL/JvxvuxZO16r4HtjTlfPRDC1hbvxC9dPN2nA==",
+      "bin": true
     },
     "ox@0.6.9": {
       "integrity": "sha512-wi5ShvzE4eOcTwQVsIPdFr+8ycyX+5le/96iAJutaZAvCes1J0+RvpEPg5QDPDiaR0XQQAvZVl7AwqQcINuUug==",
