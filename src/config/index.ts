@@ -29,18 +29,6 @@ export interface BundlerConfig {
 
   readonly entryPointAddress: `0x${string}`;
 
-  /**
-   * Legacy beneficiary — in private mode, each bundle uses the dedicated EOA
-   * as beneficiary. This field is kept for non-private / testing fallback.
-   */
-  readonly beneficiaryAddress: `0x${string}`;
-
-  /**
-   * Legacy signer key — in private mode, each bundle uses the derived EOA key.
-   * This field is kept for non-private / testing fallback.
-   */
-  readonly privateKey: `0x${string}`;
-
   readonly port: number;
   readonly host: string;
 
@@ -170,15 +158,6 @@ export async function loadConfig(): Promise<BundlerConfig> {
       "ENTRY_POINT_ADDRESS",
       "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
     ),
-    beneficiaryAddress: getEnvHex(
-      "BENEFICIARY_ADDRESS",
-      "0x0000000000000000000000000000000000000001",
-    ),
-    privateKey: getEnvHex(
-      "PRIVATE_KEY",
-      "0x0000000000000000000000000000000000000000000000000000000000000001",
-    ),
-
     port: parseInt(getEnv("PORT", "3300")),
     host: getEnv("HOST", "0.0.0.0"),
 

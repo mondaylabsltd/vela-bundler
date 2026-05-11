@@ -17,8 +17,6 @@ function makeConfig(overrides: Partial<BundlerConfig> = {}): BundlerConfig {
     ],
     chainInfo: null,
     entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-    beneficiaryAddress: "0x0000000000000000000000000000000000000001",
-    privateKey: "0x0000000000000000000000000000000000000000000000000000000000000001",
     port: 3300,
     host: "0.0.0.0",
     bundlingMode: "auto",
