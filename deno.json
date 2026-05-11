@@ -3,7 +3,10 @@
     "dev": "deno run --allow-net --allow-env --allow-read --watch main.ts",
     "start": "deno run --allow-net --allow-env --allow-read main.ts",
     "test": "deno test --allow-net --allow-env --allow-read --allow-run -A",
-    "lint": "deno lint && deno check main.ts"
+    "lint": "deno lint && deno check main.ts",
+    "deploy": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts",
+    "deploy:status": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts status",
+    "deploy:rollback": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts rollback"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@1",

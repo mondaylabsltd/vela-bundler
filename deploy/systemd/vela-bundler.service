@@ -1,0 +1,46 @@
+[Unit]
+Description=Vela Bundler — Private Prepaid ERC-4337 Bundler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vela
+Group=vela
+WorkingDirectory=/opt/vela-bundler/current
+ExecStart=/usr/bin/env deno task start
+
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/opt/vela-bundler/data
+Environment=NO_COLOR=1
+EnvironmentFile=/opt/vela-bundler/data/vela.env
+
+Restart=on-failure
+RestartSec=3s
+StartLimitInterval=60s
+StartLimitBurst=5
+
+# ── Resource limits ──
+MemoryMax=1G
+MemoryHigh=800M
+
+# ── Hardening ──
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/vela-bundler/data
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vela-bundler
+
+[Install]
+WantedBy=multi-user.target
