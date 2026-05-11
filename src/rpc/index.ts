@@ -66,7 +66,7 @@ export function startRpcServer(
       }
 
       // Health / service identification
-      if (url.pathname === "/health" && req.method === "GET") {
+      if ((url.pathname === "/health" || url.pathname === "/api/health") && req.method === "GET") {
         return Response.json({
           service: "vela-bundler",
           status: "ok",

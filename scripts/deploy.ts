@@ -167,13 +167,10 @@ async function runDeploy(cfg: DeployConfig) {
       if (!treasuryAddress || !/^0x[0-9a-fA-F]{40}$/.test(treasuryAddress)) {
         throw new Error("TREASURY_ADDRESS must be a valid Ethereum address");
       }
-      const userRpcUrls = await prompt("USER_RPC_URLS (comma-separated, optional)", "");
-
       const envVars: Record<string, string> = {
         OPERATOR_SECRET: operatorSecret,
         TREASURY_ADDRESS: treasuryAddress,
       };
-      if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
 
       await writeEnvFile(ssh, envVars);
       console.log("-> Env file written.\n");
@@ -191,14 +188,12 @@ async function runDeploy(cfg: DeployConfig) {
 
         const operatorSecret = await prompt("OPERATOR_SECRET", existing.OPERATOR_SECRET ?? "");
         const treasuryAddress = await prompt("TREASURY_ADDRESS", existing.TREASURY_ADDRESS ?? "");
-        const userRpcUrls = await prompt("USER_RPC_URLS", existing.USER_RPC_URLS ?? "");
         const oldSecrets = await prompt("OLD_OPERATOR_SECRETS", existing.OLD_OPERATOR_SECRETS ?? "");
 
         const envVars: Record<string, string> = {
           OPERATOR_SECRET: operatorSecret,
           TREASURY_ADDRESS: treasuryAddress,
         };
-        if (userRpcUrls) envVars.USER_RPC_URLS = userRpcUrls;
         if (oldSecrets) envVars.OLD_OPERATOR_SECRETS = oldSecrets;
 
         await writeEnvFile(ssh, envVars);

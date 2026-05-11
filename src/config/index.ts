@@ -20,7 +20,6 @@ export interface BundlerConfig {
   readonly chainId: number;
   /** Set per-chain at runtime by ChainRegistry. */
   readonly rpcUrl: string;
-  readonly userRpcUrls: string[];
   /** Set per-chain at runtime by ChainRegistry. */
   readonly publicRpcs: string[];
   /** Set per-chain at runtime by ChainRegistry. */
@@ -92,7 +91,6 @@ export function loadConfig(): BundlerConfig {
     // Per-chain defaults — overridden by ChainRegistry at runtime
     chainId: 0,
     rpcUrl: "",
-    userRpcUrls: envCsv("USER_RPC_URLS"),
     publicRpcs: [],
     chainInfo: null,
 

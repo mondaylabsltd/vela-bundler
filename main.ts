@@ -23,9 +23,6 @@ function main() {
   console.log(`[Vela Bundler] Starting...`);
   console.log(`  EntryPoint:      ${config.entryPointAddress}`);
   console.log(`  Multi-chain:     yes (chainId per-request)`);
-  if (config.userRpcUrls.length > 0) {
-    console.log(`  User RPCs:       ${config.userRpcUrls.length} configured`);
-  }
   console.log(`  Treasury:        ${config.treasuryAddress}`);
   console.log(`  Sweep interval:  every ${config.sweepInterval} bundles per EOA`);
   console.log(`  Min Margin:      ${config.minProfitMarginBps} bps`);
