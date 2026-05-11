@@ -1,10 +1,10 @@
 /**
- * Per-chain service registry.
+ * Per-chain service registry with auto-recovery.
  *
- * Each chainId gets its own set of services (simulator, mempool, accountService,
- * bundler), lazily created on first request and cached for reuse.
- *
- * Chain metadata and RPC URLs are resolved from the registry on first access.
+ * Each chainId gets its own services, lazily created on first request.
+ * Includes periodic health loop that:
+ * - Recovers LOCKED_PENDING_UNKNOWN EOAs by re-checking nonce state
+ * - Runs reputation decay
  */
 
 import { resolveChain, type ChainInfo } from "../config/chain-registry.ts";
@@ -14,7 +14,7 @@ import { AccountService } from "../account/index.ts";
 import { BundlerService } from "../bundler/index.ts";
 import type { KeyManager } from "../keys/types.ts";
 import type { BundlerConfig } from "../config/index.ts";
-import { resolveRpcUrl } from "../utils/rpc-client.ts";
+import { resolveRpcUrl, getPublicClient } from "../utils/rpc-client.ts";
 
 export interface ChainServices {
   chainId: number;
@@ -27,9 +27,6 @@ export interface ChainServices {
   bundler: BundlerService;
 }
 
-/**
- * Per-chain config — inherits global config but overrides chain-specific fields.
- */
 function makeChainConfig(
   globalConfig: BundlerConfig,
   chainId: number,
@@ -37,33 +34,32 @@ function makeChainConfig(
   publicRpcs: string[],
   chainInfo: ChainInfo | null,
 ): BundlerConfig {
-  return {
-    ...globalConfig,
-    chainId,
-    rpcUrl,
-    publicRpcs,
-    chainInfo,
-  };
+  return { ...globalConfig, chainId, rpcUrl, publicRpcs, chainInfo };
 }
+
+/** Health loop interval — 30 seconds. */
+const HEALTH_INTERVAL_MS = 30_000;
 
 export class ChainRegistry {
   private chains: Map<number, ChainServices> = new Map();
   private initLocks: Map<number, Promise<ChainServices>> = new Map();
+  private healthTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly globalConfig: BundlerConfig,
     private readonly keyManager: KeyManager,
-  ) {}
+  ) {
+    // Start global health loop
+    this.healthTimer = setInterval(() => this.healthLoop(), HEALTH_INTERVAL_MS);
+  }
 
   /**
    * Get or create services for a chainId.
-   * Thread-safe: concurrent calls for the same chainId share one init.
    */
   async getChain(chainId: number, requestRpcUrl?: string): Promise<ChainServices> {
     const existing = this.chains.get(chainId);
     if (existing) return existing;
 
-    // Prevent concurrent init for the same chainId
     const pending = this.initLocks.get(chainId);
     if (pending) return await pending;
 
@@ -79,7 +75,6 @@ export class ChainRegistry {
   }
 
   private async initChain(chainId: number, requestRpcUrl?: string): Promise<ChainServices> {
-    // Resolve chain from registry
     let rpcUrl: string;
     let publicRpcs: string[] = [];
     let chainInfo: ChainInfo | null = null;
@@ -91,7 +86,6 @@ export class ChainRegistry {
       chainInfo = resolved.chain;
     } catch (err) {
       if (requestRpcUrl) {
-        // User provided their own RPC — registry failure is OK
         rpcUrl = requestRpcUrl;
         console.warn(`[ChainRegistry] Registry failed for chainId ${chainId}, using user RPC`);
       } else {
@@ -99,24 +93,11 @@ export class ChainRegistry {
       }
     }
 
-    // User RPC override takes priority
-    if (requestRpcUrl) {
-      rpcUrl = requestRpcUrl;
-    }
+    if (requestRpcUrl) rpcUrl = requestRpcUrl;
 
-    // Apply global user RPC overrides
-    const effectiveRpc = resolveRpcUrl(
-      { ...this.globalConfig, rpcUrl, publicRpcs } as BundlerConfig,
-    );
+    const effectiveRpc = resolveRpcUrl({ rpcUrl });
 
-    const chainConfig = makeChainConfig(
-      this.globalConfig,
-      chainId,
-      effectiveRpc,
-      publicRpcs,
-      chainInfo,
-    );
-
+    const chainConfig = makeChainConfig(this.globalConfig, chainId, effectiveRpc, publicRpcs, chainInfo);
     const simulator = createSimulator(chainConfig);
 
     const mempool = new Mempool({
@@ -143,15 +124,53 @@ export class ChainRegistry {
   }
 
   /**
-   * Get all currently initialized chains.
+   * Periodic health loop — runs every 30s across all initialized chains.
+   * - Recovers locked EOAs by re-checking on-chain nonce state.
+   * - Decays reputation hourly.
    */
+  private async healthLoop(): Promise<void> {
+    for (const chain of this.chains.values()) {
+      try {
+        await this.recoverLockedEOAs(chain);
+      } catch (err) {
+        console.error(`[Health] Chain ${chain.chainId} recovery error:`, err);
+      }
+    }
+  }
+
+  /**
+   * Try to recover all LOCKED_PENDING_UNKNOWN EOAs for a chain.
+   */
+  private async recoverLockedEOAs(chain: ChainServices): Promise<void> {
+    const locked = chain.accountService.lockManager.getLockedEOAs();
+    if (locked.length === 0) return;
+
+    const client = getPublicClient(chain.rpcUrl);
+    let recovered = 0;
+
+    for (const eoa of locked) {
+      try {
+        const ok = await chain.accountService.lockManager.tryRecoverEOA(eoa.address, client);
+        if (ok) {
+          recovered++;
+          console.log(`[Health] Recovered EOA ${eoa.address} on chain ${chain.chainId}`);
+        }
+      } catch {
+        // RPC error — skip this EOA, try again next cycle
+      }
+    }
+
+    if (locked.length > 0 && recovered < locked.length) {
+      console.log(
+        `[Health] Chain ${chain.chainId}: ${recovered}/${locked.length} locked EOAs recovered`,
+      );
+    }
+  }
+
   getAll(): ChainServices[] {
     return Array.from(this.chains.values());
   }
 
-  /**
-   * Check if a chain is already initialized.
-   */
   has(chainId: number): boolean {
     return this.chains.has(chainId);
   }

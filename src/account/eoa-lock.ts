@@ -6,7 +6,7 @@
  * - Pending reservation tracking: atomic balance reservation.
  */
 
-import { createPublicClient, http, type PublicClient, type Transport, type Chain } from "viem";
+import { type PublicClient, type Transport, type Chain } from "viem";
 
 export type EOAStatus =
   | "ACTIVE"
@@ -173,8 +173,18 @@ export class EOALockManager {
     const state = this.states.get(k);
     if (state) {
       state.status = reason;
-      state.bundleLock = true;
+      // Don't set bundleLock — that's for in-flight bundles only.
+      // LOCKED_PENDING_UNKNOWN already prevents isAvailable() from returning true.
     }
+  }
+
+  /**
+   * Get all locked EOAs (for periodic recovery).
+   */
+  getLockedEOAs(): EOAState[] {
+    return Array.from(this.states.values()).filter(
+      (s) => s.status === "LOCKED_PENDING_UNKNOWN",
+    );
   }
 
   /**

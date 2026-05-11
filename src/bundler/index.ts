@@ -405,10 +405,29 @@ export class BundlerService {
       const receiptClient = rpcOverride
         ? getPublicClient(rpcOverride)
         : this.publicClient;
-      const receipt = await receiptClient.waitForTransactionReceipt({
-        hash: txHash,
-        timeout: 120_000,
-      });
+
+      // Retry receipt polling up to 3 times with increasing timeout.
+      // Avoids locking the EOA just because the RPC is slow.
+      let receipt;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          receipt = await receiptClient.waitForTransactionReceipt({
+            hash: txHash,
+            timeout: 120_000, // 2 min per attempt
+          });
+          break;
+        } catch (err) {
+          if (attempt < 2) {
+            console.warn(
+              `[Bundler] Receipt poll attempt ${attempt + 1} failed for ${txHash}, retrying...`,
+            );
+            await new Promise((r) => setTimeout(r, 5_000));
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!receipt) throw new Error(`Receipt not found for ${txHash} after retries`);
 
       const logs = parseEventLogs({
         abi: ENTRYPOINT_V07_ABI,

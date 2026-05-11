@@ -1,7 +1,5 @@
 /**
- * RPC client factory with per-request override support.
- *
- * Priority: X-Rpc-Url header > chain config rpcUrl > registry-resolved
+ * RPC client factory with fallback and per-request override support.
  */
 
 import {
@@ -11,12 +9,10 @@ import {
   type Transport,
   type Chain,
 } from "viem";
-import type { BundlerConfig } from "../config/index.ts";
 
 /**
  * Resolve the effective RPC URL for a request.
- * @param config - Chain-specific config (contains rpcUrl from registry)
- * @param requestRpcUrl - Per-request override from X-Rpc-Url header
+ * Per-request X-Rpc-Url override > chain config rpcUrl.
  */
 export function resolveRpcUrl(
   config: { rpcUrl: string },
@@ -43,4 +39,35 @@ export function getPublicClient(rpcUrl: string): PublicClient<Transport, Chain> 
     clientCache.set(rpcUrl, client);
   }
   return client;
+}
+
+/**
+ * Try an RPC call with automatic fallback to alternative URLs.
+ * Returns the result from the first RPC that succeeds.
+ */
+export async function withRpcFallback<T>(
+  primaryRpcUrl: string,
+  fallbackRpcUrls: string[],
+  fn: (client: PublicClient<Transport, Chain>) => Promise<T>,
+): Promise<T> {
+  // Try primary first
+  try {
+    return await fn(getPublicClient(primaryRpcUrl));
+  } catch (primaryErr) {
+    // Try fallbacks
+    for (const fallbackUrl of fallbackRpcUrls) {
+      if (fallbackUrl === primaryRpcUrl) continue;
+      try {
+        const result = await fn(getPublicClient(fallbackUrl));
+        console.warn(
+          `[RPC] Primary ${primaryRpcUrl} failed, used fallback ${fallbackUrl}`,
+        );
+        return result;
+      } catch {
+        // This fallback also failed, try next
+      }
+    }
+    // All failed — throw original error
+    throw primaryErr;
+  }
 }
