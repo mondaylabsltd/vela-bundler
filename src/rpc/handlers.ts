@@ -30,7 +30,7 @@ export async function handleRpcMethod(
   params: unknown[],
   config: BundlerConfig,
   chainRegistry: ChainRegistry,
-  reqCtx: RequestContext = {},
+  reqCtx: RequestContext,
 ): Promise<unknown> {
   switch (method) {
     case "eth_sendUserOperation":
@@ -43,25 +43,11 @@ export async function handleRpcMethod(
       return handleGetUserOperationReceipt(params, config, chainRegistry, reqCtx);
     case "eth_supportedEntryPoints":
       return [config.entryPointAddress];
-    case "eth_chainId": {
-      // Multi-chain: return the chainId from the request context, or 0 if not specified
-      const chainId = reqCtx.chainId;
-      if (!chainId) throw invalidParams("X-Chain-Id header required for multi-chain bundler");
-      return "0x" + chainId.toString(16);
-    }
+    case "eth_chainId":
+      return "0x" + reqCtx.chainId.toString(16);
     default:
       throw methodNotFound(method);
   }
-}
-
-/**
- * Resolve chainId from request context. Required for all chain-specific methods.
- */
-function requireChainId(reqCtx: RequestContext): number {
-  if (!reqCtx.chainId) {
-    throw invalidParams("X-Chain-Id header is required");
-  }
-  return reqCtx.chainId;
 }
 
 async function resolveChain(
@@ -91,8 +77,7 @@ async function handleSendUserOperation(
     throw invalidParams("Expected [userOp, entryPoint]");
   }
 
-  const chainId = requireChainId(reqCtx);
-  const chain = await resolveChain(chainId, chainRegistry, reqCtx);
+  const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
   const rpcOverride = reqCtx.requestRpcUrl;
 
   const entryPoint = params[1] as string;
@@ -236,8 +221,7 @@ async function handleEstimateUserOperationGas(
     throw invalidParams("Expected [userOp, entryPoint]");
   }
 
-  const chainId = requireChainId(reqCtx);
-  const chain = await resolveChain(chainId, chainRegistry, reqCtx);
+  const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
 
   const entryPoint = params[1] as string;
   if (entryPoint.toLowerCase() !== config.entryPointAddress.toLowerCase()) {

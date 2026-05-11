@@ -39,7 +39,7 @@ export interface RpcContext {
 
 export interface RequestContext {
   requestRpcUrl?: string;
-  chainId?: number;
+  chainId: number;
 }
 
 /**
@@ -74,8 +74,6 @@ export function startRpcServer(
       }
 
       const requestRpcUrl = req.headers.get("x-rpc-url") ?? undefined;
-      const chainIdHeader = req.headers.get("x-chain-id");
-      const chainId = chainIdHeader ? parseInt(chainIdHeader) : undefined;
 
       // REST API (/v1/...)
       const restResponse = await handleRestApi(
@@ -83,23 +81,28 @@ export function startRpcServer(
       );
       if (restResponse) return restResponse;
 
-      // CORS headers for JSON-RPC
+      // CORS headers
       const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url, X-Chain-Id",
+        "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
       };
 
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });
       }
 
-      if (req.method !== "POST") {
+      // JSON-RPC: POST /:chainId
+      // Extract chainId from URL path (e.g. /1, /137, /42161)
+      const pathChainId = url.pathname.match(/^\/(\d+)$/);
+      if (!pathChainId || req.method !== "POST") {
         return new Response(
-          JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("Only POST allowed for JSON-RPC") }),
+          JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("POST /:chainId for JSON-RPC (e.g. POST /1)") }),
           { status: 405, headers: { "Content-Type": "application/json", ...corsHeaders } },
         );
       }
+
+      const chainId = parseInt(pathChainId[1]!);
 
       let body: unknown;
       try {
