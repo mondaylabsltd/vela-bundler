@@ -4,13 +4,12 @@
  * GET /v1/account/:chainId/:safeAddress
  *   — Returns deposit address, balance, and status for a safeAddress.
  *   — Idempotent: same inputs always return the same activeDepositAddress.
- *   — Requires authentication.
- *   — Supports X-Rpc-Url header for per-request RPC override (used for balance queries).
+ *   — Supports X-Rpc-Url header for per-request RPC override.
  */
 
 import type { AccountService } from "../account/index.ts";
-import { authGuard, type AuthConfig } from "../auth/index.ts";
-import { resolveRpcUrl, getPublicClient } from "../utils/rpc-client.ts";
+import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
+import { resolveRpcUrl } from "../utils/rpc-client.ts";
 
 /**
  * Handle REST API routes. Returns a Response if matched, null otherwise.
@@ -19,26 +18,24 @@ export async function handleRestApi(
   req: Request,
   url: URL,
   accountService: AccountService,
-  authConfig: AuthConfig,
+  rateLimitConfig: RateLimitConfig,
   requestRpcUrl?: string,
 ): Promise<Response | null> {
-  // Only handle /v1/ routes
   if (!url.pathname.startsWith("/v1/")) return null;
 
-  // CORS
   const corsHeaders: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Rpc-Url",
+    "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
   };
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // Auth guard on all /v1/ endpoints
-  const authResponse = authGuard(req, authConfig);
-  if (authResponse) return authResponse;
+  // Rate limit only
+  const limited = rateLimitGuard(req, rateLimitConfig);
+  if (limited) return limited;
 
   // GET /v1/account/:chainId/:safeAddress
   const accountMatch = url.pathname.match(
@@ -67,7 +64,6 @@ async function handleGetAccount(
   corsHeaders: Record<string, string>,
   requestRpcUrl?: string,
 ): Promise<Response> {
-  // Validate chainId matches this bundler's chain
   if (chainId !== accountService["config"].chainId) {
     return jsonResponse(
       { error: `This bundler serves chainId ${accountService["config"].chainId}, not ${chainId}` },
@@ -76,17 +72,11 @@ async function handleGetAccount(
     );
   }
 
-  // Validate safeAddress format
   if (!/^0x[0-9a-f]{40}$/.test(safeAddress)) {
-    return jsonResponse(
-      { error: "Invalid safeAddress" },
-      400,
-      corsHeaders,
-    );
+    return jsonResponse({ error: "Invalid safeAddress" }, 400, corsHeaders);
   }
 
   try {
-    // Resolve effective RPC: X-Rpc-Url > user RPCs > config default
     const effectiveRpc = resolveRpcUrl(accountService["config"], requestRpcUrl);
     const info = await accountService.getAccountInfo(safeAddress, effectiveRpc);
 
@@ -111,11 +101,7 @@ async function handleGetAccount(
     );
   } catch (err) {
     console.error(`[REST] Error fetching account info for ${safeAddress}:`, err);
-    return jsonResponse(
-      { error: "Internal error" },
-      500,
-      corsHeaders,
-    );
+    return jsonResponse({ error: "Internal error" }, 500, corsHeaders);
   }
 }
 
@@ -124,14 +110,8 @@ function jsonResponse(
   status: number,
   extraHeaders: Record<string, string> = {},
 ): Response {
-  return new Response(
-    JSON.stringify(data),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json",
-        ...extraHeaders,
-      },
-    },
-  );
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+  });
 }

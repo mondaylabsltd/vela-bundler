@@ -12,7 +12,7 @@ import { BundlerService } from "../bundler/index.ts";
 import type { AccountService } from "../account/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import { handleRestApi } from "./rest-api.ts";
-import type { AuthConfig } from "../auth/index.ts";
+import type { RateLimitConfig } from "../auth/index.ts";
 import {
   parseError,
   invalidRequest,
@@ -55,8 +55,7 @@ export interface RequestContext {
  */
 export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
   const { config } = ctx;
-  const authConfig: AuthConfig = {
-    apiToken: config.apiToken,
+  const rateLimitConfig: RateLimitConfig = {
     rateLimitPerMinute: config.apiRateLimitPerMinute,
   };
 
@@ -70,7 +69,7 @@ export function startRpcServer(ctx: RpcContext): Deno.HttpServer {
 
       // Route REST API requests (/v1/...)
       const restResponse = await handleRestApi(
-        req, url, ctx.accountService, authConfig, requestRpcUrl,
+        req, url, ctx.accountService, rateLimitConfig, requestRpcUrl,
       );
       if (restResponse) return restResponse;
 

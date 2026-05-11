@@ -68,8 +68,6 @@ export interface BundlerConfig {
   readonly activeKeyVersion: string;
   /** Old key versions that are draining (no new ops accepted). */
   readonly drainingKeyVersions: string[];
-  /** API authentication token for private endpoints. */
-  readonly apiToken: string;
   /** Rate limit for API requests per minute per IP. */
   readonly apiRateLimitPerMinute: number;
   /** Balance reserve multiplier (default 2). */
@@ -204,7 +202,6 @@ export async function loadConfig(): Promise<BundlerConfig> {
     operatorSecret: getEnv("OPERATOR_SECRET"),
     activeKeyVersion: getEnv("ACTIVE_KEY_VERSION", "1"),
     drainingKeyVersions,
-    apiToken: getEnv("API_TOKEN"),
     apiRateLimitPerMinute: parseInt(getEnv("API_RATE_LIMIT_PER_MINUTE", "60")),
     balanceReserveMultiplier: parseInt(getEnv("BALANCE_RESERVE_MULTIPLIER", "2")),
   };
