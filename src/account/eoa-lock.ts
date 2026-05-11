@@ -31,8 +31,6 @@ export interface EOAState {
  */
 export class EOALockManager {
   private states: Map<string, EOAState> = new Map();
-  private mutexes: Map<string, Promise<void>> = new Map();
-  private mutexResolvers: Map<string, () => void> = new Map();
 
   private key(address: `0x${string}`): string {
     return address.toLowerCase();
@@ -195,7 +193,5 @@ export class EOALockManager {
    */
   clear(): void {
     this.states.clear();
-    this.mutexes.clear();
-    this.mutexResolvers.clear();
   }
 }

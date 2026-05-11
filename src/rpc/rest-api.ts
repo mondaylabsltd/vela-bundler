@@ -9,7 +9,6 @@
 import type { ChainRegistry } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
-import { resolveRpcUrl } from "../utils/rpc-client.ts";
 
 /**
  * Handle REST API routes. Returns a Response if matched, null otherwise.

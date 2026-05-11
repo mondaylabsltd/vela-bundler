@@ -44,8 +44,11 @@ export interface BundleResult {
   error?: string;
 }
 
+/** Receipt TTL — 24 hours. */
+const RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
+
 export class BundlerService {
-  private receiptStore: Map<string, UserOperationReceipt> = new Map();
+  private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
   private autoBundleTimer?: ReturnType<typeof setInterval>;
 
@@ -78,7 +81,16 @@ export class BundlerService {
       } catch (err) {
         console.error("[Bundler] Auto-bundle error:", err);
       }
+      // Periodic receipt cleanup
+      this.cleanExpiredReceipts();
     }, this.config.autoBundleIntervalMs);
+  }
+
+  private cleanExpiredReceipts(): void {
+    const now = Date.now();
+    for (const [hash, entry] of this.receiptStore) {
+      if (now > entry.expiresAt) this.receiptStore.delete(hash);
+    }
   }
 
   stopAutoBundling(): void {
@@ -439,7 +451,10 @@ export class BundlerService {
           },
         };
 
-        this.receiptStore.set(userOpHash, opReceipt);
+        this.receiptStore.set(userOpHash, {
+          receipt: opReceipt,
+          expiresAt: Date.now() + RECEIPT_TTL_MS,
+        });
       }
     } finally {
       // Always release reservation after confirmation/failure
@@ -448,7 +463,13 @@ export class BundlerService {
   }
 
   getReceipt(userOpHash: string): UserOperationReceipt | undefined {
-    return this.receiptStore.get(userOpHash);
+    const entry = this.receiptStore.get(userOpHash);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.receiptStore.delete(userOpHash);
+      return undefined;
+    }
+    return entry.receipt;
   }
 
   getUserOpByHash(
@@ -456,7 +477,7 @@ export class BundlerService {
   ): { userOp: MempoolEntry["userOp"]; receipt?: UserOperationReceipt } | undefined {
     const memEntry = this.mempool.get(userOpHash);
     if (memEntry) return { userOp: memEntry.userOp };
-    const receipt = this.receiptStore.get(userOpHash);
+    const receipt = this.getReceipt(userOpHash);
     if (receipt) return { userOp: undefined as unknown as MempoolEntry["userOp"], receipt };
     return undefined;
   }
