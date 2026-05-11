@@ -70,6 +70,11 @@ export function startRpcServer(
         return Response.json({
           service: "vela-bundler",
           status: "ok",
+        }, {
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+          },
         });
       }
 

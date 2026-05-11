@@ -19,6 +19,9 @@ import { deriveEOAAddress } from "../keys/derive.ts";
 import { EOALockManager, type EOAStatus, type EOAState } from "./eoa-lock.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
+import { withTimeout } from "../utils/timeout.ts";
+
+const RPC_TIMEOUT_MS = 5_000;
 
 export { EOALockManager, type EOAStatus, type EOAState } from "./eoa-lock.ts";
 
@@ -100,10 +103,14 @@ export class AccountService {
       oldAddresses.push(oldAddr);
     }
 
-    // Query on-chain balance
+    // Query on-chain balance (with timeout)
     let onchainBalance: bigint;
     try {
-      onchainBalance = await queryClient.getBalance({ address: activeEOA.address });
+      onchainBalance = await withTimeout(
+        queryClient.getBalance({ address: activeEOA.address }),
+        RPC_TIMEOUT_MS,
+        "getBalance",
+      );
     } catch {
       onchainBalance = 0n;
     }
@@ -176,7 +183,11 @@ export class AccountService {
 
   async getOnchainBalance(address: `0x${string}`): Promise<bigint> {
     try {
-      return await this.client.getBalance({ address });
+      return await withTimeout(
+        this.client.getBalance({ address }),
+        RPC_TIMEOUT_MS,
+        "getBalance",
+      );
     } catch {
       return 0n;
     }

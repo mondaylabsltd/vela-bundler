@@ -79,21 +79,27 @@ export class ChainRegistry {
     let publicRpcs: string[] = [];
     let chainInfo: ChainInfo | null = null;
 
-    try {
-      const resolved = await resolveChain(chainId);
-      rpcUrl = resolved.rpcUrl;
-      publicRpcs = resolved.publicRpcs;
-      chainInfo = resolved.chain;
-    } catch (err) {
-      if (requestRpcUrl) {
-        rpcUrl = requestRpcUrl;
-        console.warn(`[ChainRegistry] Registry failed for chainId ${chainId}, using user RPC`);
-      } else {
+    if (requestRpcUrl) {
+      // User provided their own RPC — use it directly, skip slow registry resolution.
+      rpcUrl = requestRpcUrl;
+      // Still try to fetch chain metadata (name, features) but don't block on RPC health checks.
+      try {
+        const { fetchChainInfo } = await import("../config/chain-registry.ts");
+        chainInfo = await fetchChainInfo(chainId);
+      } catch {
+        // Metadata fetch failed — not critical, proceed without it.
+      }
+    } else {
+      // No user RPC — resolve from registry (includes health check).
+      try {
+        const resolved = await resolveChain(chainId);
+        rpcUrl = resolved.rpcUrl;
+        publicRpcs = resolved.publicRpcs;
+        chainInfo = resolved.chain;
+      } catch (err) {
         throw err;
       }
     }
-
-    if (requestRpcUrl) rpcUrl = requestRpcUrl;
 
     const effectiveRpc = resolveRpcUrl({ rpcUrl });
 

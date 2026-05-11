@@ -7,6 +7,10 @@
  */
 
 import { type PublicClient, type Transport, type Chain } from "viem";
+import { withTimeout } from "../utils/timeout.ts";
+
+/** Timeout for individual RPC calls (5 seconds). */
+const RPC_TIMEOUT_MS = 5_000;
 
 export type EOAStatus =
   | "ACTIVE"
@@ -38,7 +42,12 @@ export class EOALockManager {
 
   /**
    * Initialize or refresh EOA state from on-chain nonce data.
-   * Call this on startup and periodically.
+   *
+   * Nonce logic:
+   * - If both latest and pending nonces match → ACTIVE
+   * - If pending > latest → there's an in-flight tx we don't know about → LOCKED
+   * - If pending nonce query fails → assume same as latest (many RPCs don't support "pending")
+   * - All RPC calls have 5s timeout to avoid blocking
    */
   async initEOA(
     address: `0x${string}`,
@@ -50,29 +59,30 @@ export class EOALockManager {
     let pendingNonce: number;
 
     try {
-      // latest = confirmed nonce
-      latestNonce = await client.getTransactionCount({
-        address,
-        blockTag: "latest",
-      });
+      latestNonce = await withTimeout(
+        client.getTransactionCount({ address, blockTag: "latest" }),
+        RPC_TIMEOUT_MS,
+        "getTransactionCount(latest)",
+      );
     } catch {
       latestNonce = 0;
     }
 
     try {
-      // pending = includes pending pool txs
-      pendingNonce = await client.getTransactionCount({
-        address,
-        blockTag: "pending",
-      });
+      pendingNonce = await withTimeout(
+        client.getTransactionCount({ address, blockTag: "pending" }),
+        RPC_TIMEOUT_MS,
+        "getTransactionCount(pending)",
+      );
     } catch {
-      // If RPC doesn't support reliable pending nonce, fail closed
-      pendingNonce = latestNonce + 1; // Force lock
+      // Many RPCs don't support "pending" reliably.
+      // Default to same as latest — treat as no pending txs.
+      // The bundler itself tracks its own in-flight txs via bundleLock.
+      pendingNonce = latestNonce;
     }
 
     let status: EOAStatus = "ACTIVE";
     if (pendingNonce > latestNonce) {
-      // Unknown pending transactions — lock this EOA
       status = "LOCKED_PENDING_UNKNOWN";
     }
 
@@ -90,26 +100,16 @@ export class EOALockManager {
     return state;
   }
 
-  /**
-   * Get current state for an EOA (without refreshing from chain).
-   */
   getState(address: `0x${string}`): EOAState | undefined {
     return this.states.get(this.key(address));
   }
 
-  /**
-   * Check if an EOA is available for a new bundle.
-   */
   isAvailable(address: `0x${string}`): boolean {
     const state = this.states.get(this.key(address));
     if (!state) return false;
     return state.status === "ACTIVE" && !state.bundleLock;
   }
 
-  /**
-   * Acquire the bundle lock for an EOA.
-   * Returns false if the EOA is not available.
-   */
   acquireBundleLock(address: `0x${string}`): boolean {
     const k = this.key(address);
     const state = this.states.get(k);
@@ -122,9 +122,6 @@ export class EOALockManager {
     return true;
   }
 
-  /**
-   * Release the bundle lock after a bundle completes (success or failure).
-   */
   releaseBundleLock(address: `0x${string}`): void {
     const k = this.key(address);
     const state = this.states.get(k);
@@ -136,9 +133,6 @@ export class EOALockManager {
     }
   }
 
-  /**
-   * Add a balance reservation (before submitting a bundle).
-   */
   addReservation(address: `0x${string}`, amount: bigint): void {
     const k = this.key(address);
     const state = this.states.get(k);
@@ -146,9 +140,6 @@ export class EOALockManager {
     state.reservedBalance += amount;
   }
 
-  /**
-   * Release a balance reservation (after bundle confirmed or failed).
-   */
   releaseReservation(address: `0x${string}`, amount: bigint): void {
     const k = this.key(address);
     const state = this.states.get(k);
@@ -158,38 +149,24 @@ export class EOALockManager {
       : 0n;
   }
 
-  /**
-   * Get reserved balance for an EOA.
-   */
   getReservedBalance(address: `0x${string}`): bigint {
     return this.states.get(this.key(address))?.reservedBalance ?? 0n;
   }
 
-  /**
-   * Mark an EOA as locked due to uncertain state.
-   */
   lockEOA(address: `0x${string}`, reason: "LOCKED_PENDING_UNKNOWN"): void {
     const k = this.key(address);
     const state = this.states.get(k);
     if (state) {
       state.status = reason;
-      // Don't set bundleLock — that's for in-flight bundles only.
-      // LOCKED_PENDING_UNKNOWN already prevents isAvailable() from returning true.
     }
   }
 
-  /**
-   * Get all locked EOAs (for periodic recovery).
-   */
   getLockedEOAs(): EOAState[] {
     return Array.from(this.states.values()).filter(
       (s) => s.status === "LOCKED_PENDING_UNKNOWN",
     );
   }
 
-  /**
-   * Attempt to recover a locked EOA by re-checking nonce state.
-   */
   async tryRecoverEOA(
     address: `0x${string}`,
     client: PublicClient<Transport, Chain>,
@@ -198,9 +175,6 @@ export class EOALockManager {
     return refreshed.status === "ACTIVE";
   }
 
-  /**
-   * Clear all state (for testing).
-   */
   clear(): void {
     this.states.clear();
   }
