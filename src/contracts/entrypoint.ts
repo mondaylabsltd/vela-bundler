@@ -329,7 +329,7 @@ export const DUMMY_SIGNATURE =
 /**
  * Known constants for EntryPoint v0.7.
  */
-export const MAX_VERIFICATION_GAS = 500_000n;
+export const MAX_VERIFICATION_GAS = 2_000_000n;
 export const PRE_VERIFICATION_OVERHEAD_GAS = 50_000n;
 export const TRANSACTION_BASE_COST = 21_000n;
 
