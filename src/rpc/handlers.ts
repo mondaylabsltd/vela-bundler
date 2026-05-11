@@ -189,10 +189,20 @@ async function handleSendUserOperation(
   // Simulate validation
   const simResult = await chain.simulator.simulateValidation(userOp, rpcOverride);
   if (!simResult.valid) {
-    throw bundlerError(
-      simResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-      simResult.errorMessage ?? "Simulation failed",
-    );
+    // Anvil (chainId 31337) returns empty revert data for simulateValidation.
+    // Skip validation on dev chains and let handleOps do on-chain verification.
+    const isDevChain = reqCtx.chainId === 31337;
+    const isEmptyRevert = simResult.errorMessage?.includes("0x") &&
+      !simResult.errorMessage.includes("AA") &&
+      !simResult.errorMessage.includes("FailedOp");
+    if (isDevChain && isEmptyRevert) {
+      console.warn(`[Bundler] chain ${reqCtx.chainId}: simulateValidation returned empty revert — skipping (dev chain)`);
+    } else {
+      throw bundlerError(
+        simResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        simResult.errorMessage ?? "Simulation failed",
+      );
+    }
   }
 
   // Add to mempool
