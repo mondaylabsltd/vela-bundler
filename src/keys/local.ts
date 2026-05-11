@@ -19,9 +19,19 @@ export class LocalKeyManager implements KeyManager {
     activeKeyVersion: string;
     drainingKeyVersions?: string[];
   }) {
-    if (!params.operatorSecret || params.operatorSecret.length < 32) {
+    if (!params.operatorSecret) {
+      throw new Error("operatorSecret is required");
+    }
+    // Validate: must be a hex string that decodes to at least 32 bytes (256 bits)
+    const clean = params.operatorSecret.startsWith("0x")
+      ? params.operatorSecret.slice(2)
+      : params.operatorSecret;
+    if (!/^[0-9a-fA-F]+$/.test(clean)) {
+      throw new Error("operatorSecret must be a hex string (with or without 0x prefix)");
+    }
+    if (clean.length < 64) {
       throw new Error(
-        "operatorSecret must be a high-entropy secret of at least 32 characters",
+        `operatorSecret must be at least 32 bytes (64 hex chars), got ${clean.length / 2} bytes`,
       );
     }
     this.operatorSecret = params.operatorSecret;

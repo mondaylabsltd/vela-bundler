@@ -139,15 +139,38 @@ Deno.test("LocalKeyManager - active and draining versions", () => {
   assertEquals(km.getDrainingKeyVersions(), ["0", "1"]);
 });
 
-Deno.test("LocalKeyManager - rejects short operator secret", () => {
+Deno.test("LocalKeyManager - rejects short operator secret (< 32 bytes)", () => {
   let threw = false;
   try {
+    // Only 16 bytes (32 hex chars) — must be rejected
     new LocalKeyManager({
-      operatorSecret: "tooshort",
+      operatorSecret: "0xdeadbeefdeadbeefdeadbeefdeadbeef",
       activeKeyVersion: "1",
     });
   } catch {
     threw = true;
   }
-  assert(threw, "Should reject short operator secret");
+  assert(threw, "Should reject secret shorter than 32 bytes");
+});
+
+Deno.test("LocalKeyManager - rejects non-hex operator secret", () => {
+  let threw = false;
+  try {
+    new LocalKeyManager({
+      operatorSecret: "this-is-not-hex-but-its-long-enough-to-pass-length-check!!",
+      activeKeyVersion: "1",
+    });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Should reject non-hex secret");
+});
+
+Deno.test("LocalKeyManager - accepts exactly 32-byte hex secret", () => {
+  // 32 bytes = 64 hex chars
+  const km = new LocalKeyManager({
+    operatorSecret: "0x" + "ab".repeat(32),
+    activeKeyVersion: "1",
+  });
+  assertEquals(km.getActiveKeyVersion(), "1");
 });
