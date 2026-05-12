@@ -698,12 +698,70 @@ export function createSimulator(config: BundlerConfig) {
     return block.baseFeePerGas ?? 0n;
   }
 
+  /**
+   * Get current gas prices from the network: baseFee + suggested maxPriorityFeePerGas.
+   *
+   * Chains like Polygon/BSC enforce a minimum gas price that may be much higher
+   * than the bundler's configured tip. This fetches the chain's actual suggestion
+   * so the bundler can use max(config tip, chain suggestion).
+   */
+  async function getGasPrices(rpcUrlOverride?: string): Promise<{
+    baseFee: bigint;
+    suggestedMaxPriorityFeePerGas: bigint;
+  }> {
+    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+
+    // Fetch baseFee and suggested priority fee in parallel
+    const [blockRes, tipRes] = await Promise.allSettled([
+      fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: ["latest", false] }),
+      }).then((r) => r.json()),
+      fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_maxPriorityFeePerGas", params: [] }),
+      }).then((r) => r.json()),
+    ]);
+
+    let baseFee = 0n;
+    if (blockRes.status === "fulfilled" && blockRes.value?.result?.baseFeePerGas) {
+      baseFee = BigInt(blockRes.value.result.baseFeePerGas);
+    }
+
+    let suggestedMaxPriorityFeePerGas = 0n;
+    if (tipRes.status === "fulfilled" && tipRes.value?.result) {
+      suggestedMaxPriorityFeePerGas = BigInt(tipRes.value.result);
+    } else {
+      // Fallback for chains that don't support eth_maxPriorityFeePerGas:
+      // use eth_gasPrice - baseFee as the implied tip
+      try {
+        const gasPriceRes = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "eth_gasPrice", params: [] }),
+        });
+        const gasPriceJson = await gasPriceRes.json() as { result?: string };
+        if (gasPriceJson.result) {
+          const gasPrice = BigInt(gasPriceJson.result);
+          suggestedMaxPriorityFeePerGas = gasPrice > baseFee ? gasPrice - baseFee : gasPrice;
+        }
+      } catch {
+        // All gas price methods failed — use 0, caller will use config default
+      }
+    }
+
+    return { baseFee, suggestedMaxPriorityFeePerGas };
+  }
+
   return {
     simulateValidation,
     simulateExecution,
     simulateBundle,
     estimateUserOpGas,
     getCurrentBaseFee,
+    getGasPrices,
   };
 }
 

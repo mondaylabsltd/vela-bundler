@@ -107,15 +107,26 @@ export function checkUserOpProfitability(params: {
 
 /**
  * Calculate outer transaction gas pricing (EIP-1559).
+ *
+ * The final maxPriorityFeePerGas is max(bundler config tip, chain suggested tip).
+ * This prevents "gas price below minimum" errors on chains like Polygon/BSC
+ * that enforce a minimum gas price well above Ethereum's typical 1-2 Gwei.
  */
 export function calcOuterTxGasPrice(params: {
   currentBaseFee: bigint;
   baseFeeMultiplier: number;
   bundlerTipGwei: number;
+  /** Chain-suggested maxPriorityFeePerGas from eth_maxPriorityFeePerGas or eth_gasPrice. */
+  chainSuggestedTip?: bigint;
 }): { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; effectiveGasPrice: bigint } {
-  const { currentBaseFee, baseFeeMultiplier, bundlerTipGwei } = params;
+  const { currentBaseFee, baseFeeMultiplier, bundlerTipGwei, chainSuggestedTip } = params;
 
-  const maxPriorityFeePerGas = BigInt(Math.ceil(bundlerTipGwei * 1e9));
+  const configTip = BigInt(Math.ceil(bundlerTipGwei * 1e9));
+  // Use the higher of config tip and chain suggestion to meet chain minimums
+  const maxPriorityFeePerGas = chainSuggestedTip && chainSuggestedTip > configTip
+    ? chainSuggestedTip
+    : configTip;
+
   const scaledBaseFee = (currentBaseFee * BigInt(Math.ceil(baseFeeMultiplier * 100))) / 100n;
   const maxFeePerGas = scaledBaseFee + maxPriorityFeePerGas;
 

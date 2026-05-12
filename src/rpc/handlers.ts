@@ -137,12 +137,14 @@ async function handleSendUserOperation(
     }
   }
 
-  // Check balance
-  const baseFee = await chain.simulator.getCurrentBaseFee(rpcOverride);
+  // Check balance — use chain-aware gas pricing
+  const gasPrices = await chain.simulator.getGasPrices(rpcOverride);
+  const baseFee = gasPrices.baseFee;
   const outerGas = calcOuterTxGasPrice({
     currentBaseFee: baseFee,
     baseFeeMultiplier: config.baseFeeMultiplier,
     bundlerTipGwei: config.bundlerTipGwei,
+    chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
   });
   const maxGas = calcUserOpMaxGas(userOp);
   const estimatedCost = maxGas * outerGas.effectiveGasPrice;

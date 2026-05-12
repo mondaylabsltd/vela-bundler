@@ -66,7 +66,35 @@ export async function executeSweep(params: {
     ]);
 
     const baseFee = block.baseFeePerGas ?? parseGwei("1");
-    const tip = BigInt(Math.ceil(config.bundlerTipGwei * 1e9));
+    const configTip = BigInt(Math.ceil(config.bundlerTipGwei * 1e9));
+
+    // Query chain-suggested tip to respect chain minimums (Polygon, BSC, etc.)
+    let chainTip = 0n;
+    try {
+      const tipRes = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_maxPriorityFeePerGas", params: [] }),
+      });
+      const tipJson = await tipRes.json() as { result?: string };
+      if (tipJson.result) chainTip = BigInt(tipJson.result);
+    } catch {
+      // Fallback: use eth_gasPrice
+      try {
+        const gpRes = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_gasPrice", params: [] }),
+        });
+        const gpJson = await gpRes.json() as { result?: string };
+        if (gpJson.result) {
+          const gp = BigInt(gpJson.result);
+          chainTip = gp > baseFee ? gp - baseFee : gp;
+        }
+      } catch { /* use config default */ }
+    }
+
+    const tip = chainTip > configTip ? chainTip : configTip;
     const gasPrice = baseFee + tip;
 
     // Retain enough for future bundles: gasPrice × 10_000_000

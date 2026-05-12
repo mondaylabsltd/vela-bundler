@@ -233,11 +233,13 @@ export class BundlerService {
       );
     }
 
-    const baseFee = await this.simulator.getCurrentBaseFee(rpcOverride);
+    const gasPrices = await this.simulator.getGasPrices(rpcOverride);
+    const baseFee = gasPrices.baseFee;
     const outerGas = calcOuterTxGasPrice({
       currentBaseFee: baseFee,
       baseFeeMultiplier: this.config.baseFeeMultiplier,
       bundlerTipGwei: this.config.bundlerTipGwei,
+      chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
     });
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
