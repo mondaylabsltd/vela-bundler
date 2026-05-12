@@ -14,9 +14,9 @@ import {
   type Transport,
   type Chain,
 } from "viem";
-import type { KeyManager, KeyDerivationParams, DerivedEOA } from "../keys/types.ts";
+import type { KeyManager, DerivedEOA } from "../keys/types.ts";
 import { deriveEOAAddress } from "../keys/derive.ts";
-import { EOALockManager, type EOAStatus, type EOAState } from "./eoa-lock.ts";
+import { EOALockManager, type EOAStatus } from "./eoa-lock.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { withTimeout, RPC_TIMEOUT_MS } from "../utils/timeout.ts";
@@ -101,17 +101,12 @@ export class AccountService {
       oldAddresses.push(oldAddr);
     }
 
-    // Query on-chain balance (with timeout)
-    let onchainBalance: bigint;
-    try {
-      onchainBalance = await withTimeout(
-        queryClient.getBalance({ address: activeEOA.address }),
-        RPC_TIMEOUT_MS,
-        "getBalance",
-      );
-    } catch {
-      onchainBalance = 0n;
-    }
+    // Query on-chain balance (with timeout) — throws on RPC failure
+    const onchainBalance = await withTimeout(
+      queryClient.getBalance({ address: activeEOA.address }),
+      RPC_TIMEOUT_MS,
+      "getBalance",
+    );
 
     // Get in-memory reservation
     const reservedBalance = this.lockManager.getReservedBalance(activeEOA.address);
@@ -147,13 +142,15 @@ export class AccountService {
 
   /**
    * Check if a safeAddress has sufficient balance for a bundle.
+   * Throws on RPC failure — caller should handle the error.
    */
   async checkBalance(
     safeAddress: `0x${string}`,
     expectedCost: bigint,
+    rpcUrlOverride?: string,
   ): Promise<{ sufficient: boolean; spendableBalance: bigint; requiredBalance: bigint }> {
     const eoa = await this.deriveEOA(safeAddress);
-    const onchainBalance = await this.getOnchainBalance(eoa.address);
+    const onchainBalance = await this.getOnchainBalance(eoa.address, rpcUrlOverride);
     const reservedBalance = this.lockManager.getReservedBalance(eoa.address);
     const spendableBalance = onchainBalance > reservedBalance
       ? onchainBalance - reservedBalance
@@ -179,16 +176,18 @@ export class AccountService {
     return this.keyManager;
   }
 
-  async getOnchainBalance(address: `0x${string}`): Promise<bigint> {
-    try {
-      return await withTimeout(
-        this.client.getBalance({ address }),
-        RPC_TIMEOUT_MS,
-        "getBalance",
-      );
-    } catch {
-      return 0n;
-    }
+  async getOnchainBalance(
+    address: `0x${string}`,
+    rpcUrlOverride?: string,
+  ): Promise<bigint> {
+    const client = rpcUrlOverride
+      ? getPublicClient(rpcUrlOverride)
+      : this.client;
+    return await withTimeout(
+      client.getBalance({ address }),
+      RPC_TIMEOUT_MS,
+      "getBalance",
+    );
   }
 
   getClient(): PublicClient<Transport, Chain> {

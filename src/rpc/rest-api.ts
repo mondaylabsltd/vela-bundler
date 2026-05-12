@@ -94,8 +94,7 @@ async function handleGetAccount(
     );
   } catch (err) {
     console.error(`[REST] Error for chain ${chainId} / ${safeAddress}:`, err);
-    const message = err instanceof Error ? err.message : "Internal error";
-    return jsonResponse({ error: message }, 500, corsHeaders);
+    return jsonResponse({ error: "Internal error" }, 500, corsHeaders);
   }
 }
 

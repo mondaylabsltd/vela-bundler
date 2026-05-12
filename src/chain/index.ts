@@ -40,10 +40,14 @@ function makeChainConfig(
 /** Health loop interval — 30 seconds. */
 const HEALTH_INTERVAL_MS = 30_000;
 
+/** Reputation decay interval — 1 hour (in ms). */
+const REPUTATION_DECAY_INTERVAL_MS = 60 * 60 * 1000;
+
 export class ChainRegistry {
   private chains: Map<number, ChainServices> = new Map();
   private initLocks: Map<number, Promise<ChainServices>> = new Map();
   private healthTimer?: ReturnType<typeof setInterval>;
+  private lastDecayAt: number = Date.now();
 
   constructor(
     private readonly globalConfig: BundlerConfig,
@@ -135,12 +139,28 @@ export class ChainRegistry {
    * - Decays reputation hourly.
    */
   private async healthLoop(): Promise<void> {
+    const now = Date.now();
+    const shouldDecay = now - this.lastDecayAt >= REPUTATION_DECAY_INTERVAL_MS;
+
     for (const chain of this.chains.values()) {
       try {
         await this.recoverLockedEOAs(chain);
       } catch (err) {
         console.error(`[Health] Chain ${chain.chainId} recovery error:`, err);
       }
+
+      // Hourly reputation decay
+      if (shouldDecay) {
+        try {
+          chain.mempool.reputation.decay();
+        } catch (err) {
+          console.error(`[Health] Chain ${chain.chainId} reputation decay error:`, err);
+        }
+      }
+    }
+
+    if (shouldDecay) {
+      this.lastDecayAt = now;
     }
   }
 

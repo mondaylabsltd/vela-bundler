@@ -11,6 +11,38 @@ import {
 } from "viem";
 
 /**
+ * Validate a user-provided RPC URL.
+ * Blocks non-HTTPS URLs and obvious dangerous targets (link-local, metadata endpoints).
+ * Returns null if valid, or an error message if rejected.
+ */
+export function validateRpcUrl(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "Invalid URL format";
+  }
+
+  if (parsed.protocol !== "https:") {
+    return "Only HTTPS RPC URLs are accepted";
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // Block cloud metadata endpoints
+  if (hostname === "169.254.169.254" || hostname === "metadata.google.internal") {
+    return "Blocked hostname";
+  }
+
+  // Block loopback
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]") {
+    return "Loopback addresses are not allowed";
+  }
+
+  return null;
+}
+
+/**
  * Resolve the effective RPC URL for a request.
  * Per-request X-Rpc-Url override > chain config rpcUrl.
  */

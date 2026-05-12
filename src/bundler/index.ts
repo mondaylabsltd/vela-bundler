@@ -48,11 +48,15 @@ export interface BundleResult {
 /** Receipt TTL — 24 hours. */
 const RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** Max receipt store entries — prevents unbounded memory growth. */
+const RECEIPT_STORE_MAX = 10_000;
+
 export class BundlerService {
   private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
   private autoBundleTimer?: ReturnType<typeof setInterval>;
   private receiptCleanupTimer?: ReturnType<typeof setInterval>;
+  private currentBundlingMode: "auto" | "manual";
 
   constructor(
     private readonly config: BundlerConfig,
@@ -60,6 +64,7 @@ export class BundlerService {
     private readonly simulator: Simulator,
     private readonly accountService: AccountService,
   ) {
+    this.currentBundlingMode = config.bundlingMode;
     this.publicClient = createPublicClient({
       transport: http(config.rpcUrl),
     }) as PublicClient<Transport, Chain>;
@@ -71,7 +76,7 @@ export class BundlerService {
    * Start auto-bundling if configured.
    */
   startAutoBundling(): void {
-    if (this.config.bundlingMode !== "auto") return;
+    if (this.currentBundlingMode !== "auto") return;
     if (this.autoBundleTimer) return;
 
     console.log(
@@ -105,7 +110,7 @@ export class BundlerService {
   }
 
   setBundlingMode(mode: "auto" | "manual"): void {
-    (this.config as { bundlingMode: string }).bundlingMode = mode;
+    this.currentBundlingMode = mode;
     if (mode === "auto") {
       this.startAutoBundling();
     } else {
@@ -414,12 +419,28 @@ export class BundlerService {
 
       // Process receipt in background — unlocks EOA on success
       this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
-        .then(() => {
-          // Re-init EOA to restore ACTIVE state with updated nonce
-          this.accountService.lockManager.initEOA(
-            eoa.address,
-            rpcOverride ? getPublicClient(rpcOverride) : this.publicClient,
-          ).catch(() => {/* best effort */});
+        .then(async () => {
+          // Re-init EOA to restore ACTIVE state with updated nonce.
+          // Retry up to 3 times with exponential backoff to avoid
+          // permanently locking the EOA due to transient RPC failures.
+          const client = rpcOverride ? getPublicClient(rpcOverride) : this.publicClient;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              await this.accountService.lockManager.initEOA(eoa.address, client);
+              return; // success — EOA is now ACTIVE
+            } catch (err) {
+              const delay = 2_000 * (2 ** attempt); // 2s, 4s, 8s
+              console.warn(
+                `[Bundler] initEOA recovery attempt ${attempt + 1}/3 failed for ${eoa.address}: ${err instanceof Error ? err.message : err}. Retrying in ${delay}ms...`,
+              );
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+          // All retries failed — EOA stays locked, health loop will keep trying
+          console.error(
+            `[Bundler] Failed to recover EOA ${eoa.address} after 3 retries. ` +
+            `EOA remains LOCKED_PENDING_UNKNOWN — health loop will continue recovery attempts.`,
+          );
         })
         .catch((err) => {
           console.error("[Bundler] Failed to process receipt:", err);
@@ -528,6 +549,12 @@ export class BundlerService {
             effectiveGasPrice: receipt.effectiveGasPrice,
           },
         };
+
+        // Evict oldest entry if at capacity (Map iterates in insertion order)
+        if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
+          const oldest = this.receiptStore.keys().next().value;
+          if (oldest !== undefined) this.receiptStore.delete(oldest);
+        }
 
         this.receiptStore.set(userOpHash, {
           receipt: opReceipt,

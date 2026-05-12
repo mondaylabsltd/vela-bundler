@@ -12,6 +12,24 @@ const requestCounts: Map<string, { count: number; resetAt: number }> = new Map()
 let lastPruneAt = 0;
 
 /**
+ * Extract client IP from request headers.
+ *
+ * When behind a reverse proxy, X-Forwarded-For contains a comma-separated
+ * list of IPs. The rightmost entry is the one appended by the trusted proxy
+ * and is the most reliable. If no proxy headers are present, falls back
+ * to "unknown" (Deno.serve does not expose remote address via Request).
+ */
+function extractClientIp(req: Request): string {
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    // Rightmost IP = appended by the closest trusted proxy
+    const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    return parts[parts.length - 1] ?? "unknown";
+  }
+  return req.headers.get("x-real-ip") ?? "unknown";
+}
+
+/**
  * Check rate limit for a request.
  * Returns null if within limit, or a 429 Response if rate limited.
  */
@@ -19,9 +37,7 @@ export function rateLimitGuard(
   req: Request,
   config: RateLimitConfig,
 ): Response | null {
-  const ip = req.headers.get("x-forwarded-for")
-    ?? req.headers.get("x-real-ip")
-    ?? "unknown";
+  const ip = extractClientIp(req);
 
   const now = Date.now();
   const windowMs = 60_000;

@@ -58,9 +58,10 @@ async function resolveChain(
   try {
     return await chainRegistry.getChain(chainId, reqCtx.requestRpcUrl);
   } catch (err) {
+    console.error(`[RPC] Chain resolution failed for chainId ${chainId}:`, err);
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `Unsupported chain ${chainId}: ${err instanceof Error ? err.message : err}`,
+      `Unsupported or unreachable chain: ${chainId}`,
     );
   }
 }
@@ -146,7 +147,16 @@ async function handleSendUserOperation(
   const maxGas = calcUserOpMaxGas(userOp);
   const estimatedCost = maxGas * outerGas.effectiveGasPrice;
 
-  const balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost);
+  let balanceCheck;
+  try {
+    balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, rpcOverride);
+  } catch (err) {
+    console.error(`[RPC] Balance query failed for ${safeAddress}:`, err);
+    throw bundlerError(
+      RPC_ERROR_CODES.INVALID_USEROPERATION,
+      "Failed to query EOA balance — RPC temporarily unavailable",
+    );
+  }
   if (!balanceCheck.sufficient) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,

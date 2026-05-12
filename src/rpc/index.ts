@@ -9,13 +9,14 @@ import type { BundlerConfig } from "../config/index.ts";
 import type { ChainRegistry, ChainServices } from "../chain/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import { handleRestApi } from "./rest-api.ts";
-import type { RateLimitConfig } from "../auth/index.ts";
+import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import {
   parseError,
   invalidRequest,
   internalError,
   type JsonRpcError,
 } from "./errors.ts";
+import { validateRpcUrl } from "../utils/rpc-client.ts";
 
 // Load homepage HTML at startup (built from README.md via `deno task build`)
 let HOME_HTML = "";
@@ -78,7 +79,18 @@ export function startRpcServer(
         });
       }
 
-      const requestRpcUrl = req.headers.get("x-rpc-url") ?? undefined;
+      const rawRpcUrl = req.headers.get("x-rpc-url") ?? undefined;
+      let requestRpcUrl: string | undefined;
+      if (rawRpcUrl) {
+        const validationError = validateRpcUrl(rawRpcUrl);
+        if (validationError) {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest(`Invalid X-Rpc-Url: ${validationError}`) }),
+            { status: 400, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        requestRpcUrl = rawRpcUrl;
+      }
 
       // REST API (/v1/...)
       const restResponse = await handleRestApi(
@@ -96,6 +108,10 @@ export function startRpcServer(
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });
       }
+
+      // Rate limit JSON-RPC requests (same limiter as REST API)
+      const limited = rateLimitGuard(req, rateLimitConfig);
+      if (limited) return limited;
 
       // JSON-RPC: POST /:chainId
       // Extract chainId from URL path (e.g. /1, /137, /42161)
