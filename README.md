@@ -30,7 +30,7 @@ No database — all state is derived or in-memory.
 
 ```
 src/
-├── config/          Configuration + chain registry (auto-resolve RPC)
+├── config/          Configuration + chain registry + Alchemy RPC support
 ├── keys/            Deterministic key derivation (HKDF-SHA256)
 ├── account/         Per-EOA balance, reservations, lock management
 ├── auth/            Rate limiting
@@ -40,6 +40,7 @@ src/
 ├── simulation/      simulateValidation + bundle simulation
 ├── mempool/         In-memory mempool with reputation tracking
 ├── bundler/         Bundle building, submission, treasury sweep
+├── chain/           Per-chain service registry (lazy init + health loop)
 ├── rpc/             JSON-RPC (ERC-7769) + REST API
 └── utils/           Hex utilities, RPC client factory
 ```
@@ -65,11 +66,10 @@ HKDF-SHA256(
 | Priority | Source | Scope |
 |----------|--------|-------|
 | 1 | `X-Rpc-Url` header | Per-request |
-| 2 | `USER_RPC_URLS` env | Startup (comma-separated) |
-| 3 | `RPC_URL` env | Startup (operator override) |
-| 4 | Chain registry | Auto-resolved from CHAIN_ID |
+| 2 | Alchemy RPC | If `ALCHEMY_API_KEY` set + chain supported |
+| 3 | Chain registry | Public RPCs, health-checked |
 
-User RPCs flow through the entire chain: simulation, submission, balance queries.
+Per-request RPCs flow through the entire chain: simulation, submission, balance queries.
 
 ## REST API
 
@@ -98,6 +98,8 @@ No authentication. Rate limited per IP. Supports `X-Rpc-Url` header.
 
 ## JSON-RPC Methods
 
+Endpoint: `POST /:chainId` (e.g., `POST /1`, `POST /137`, `POST /42161`).
+
 | Method | Description |
 |--------|-------------|
 | `eth_sendUserOperation` | Submit UserOp (checks balance, binding, profitability) |
@@ -108,6 +110,23 @@ No authentication. Rate limited per IP. Supports `X-Rpc-Url` header.
 | `eth_chainId` | Chain ID |
 
 All methods support `X-Rpc-Url` header.
+
+## Health Endpoint
+
+`GET /health` or `GET /api/health`
+
+```json
+{
+  "service": "vela-bundler",
+  "status": "ok",
+  "activeChains": 3,
+  "mempoolSize": 0,
+  "lockedEOAs": 0,
+  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+}
+```
+
+**Status:** `ok` when no locked EOAs, `degraded` when any EOA is locked.
 
 ## Treasury Sweep
 
@@ -137,13 +156,31 @@ No `keyVersion`. Rotation = change `OPERATOR_SECRET`, put old one in `OLD_OPERAT
 
 Only `OPERATOR_SECRET` and `TREASURY_ADDRESS` are required. See [.env.example](.env.example).
 
+Chain ID is per-request (via URL path), not a global config.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPERATOR_SECRET` | — | **Required.** 32+ byte hex secret |
 | `TREASURY_ADDRESS` | — | **Required.** Sweep destination |
-| `CHAIN_ID` | `1` | Chain ID |
+| `PORT` | `3300` | Server port |
+| `HOST` | `0.0.0.0` | Server bind address |
+| `ENTRY_POINT_ADDRESS` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7 address |
+| `BUNDLING_MODE` | `auto` | `auto` or `manual` |
+| `MAX_BUNDLE_SIZE` | `10` | Max UserOps per bundle |
+| `MAX_BUNDLE_GAS` | `5000000` | Max gas per bundle |
+| `AUTO_BUNDLE_INTERVAL_MS` | `10000` | Auto-bundling interval (ms) |
 | `SWEEP_INTERVAL` | `30` | Sweep every N bundles per EOA |
 | `OLD_OPERATOR_SECRETS` | — | Old secrets for sweep (comma-separated) |
+| `ALCHEMY_API_KEY` | — | Alchemy API key for preferred RPCs |
+| `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
+| `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |
+| `BUNDLER_TIP_GWEI` | `1.5` | Minimum priority fee tip (Gwei) |
+| `MIN_PRIORITY_FEE_PER_GAS` | `1000000000` | Minimum priority fee (wei) |
+| `MIN_PROFIT_MARGIN_BPS` | `2000` | Minimum profitability (basis points) |
+| `TARGET_PROFIT_MARGIN_BPS` | `3500` | Target margin (basis points) |
+| `HIGH_RISK_MARGIN_BPS` | `5000` | High-risk margin (basis points) |
+| `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
+| `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve requirement multiplier |
 
 ## Known Limitations
 
