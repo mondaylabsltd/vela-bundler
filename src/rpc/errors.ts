@@ -2,7 +2,6 @@
  * JSON-RPC error utilities.
  */
 
-import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 
 export interface JsonRpcError {
   code: number;

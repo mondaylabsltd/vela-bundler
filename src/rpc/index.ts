@@ -209,9 +209,7 @@ async function processRequest(
     return {
       jsonrpc: "2.0",
       id,
-      error: internalError(
-        err instanceof Error ? err.message : "Internal error",
-      ),
+      error: internalError("Internal error"),
     };
   }
 }

@@ -11,10 +11,10 @@
  * - Check paymaster deposit reservation across pending UserOps.
  */
 
-import type { MempoolEntry, UserOperation, PackedUserOperation } from "../userop/types.ts";
+import type { MempoolEntry, UserOperation } from "../userop/types.ts";
 import { packUserOp } from "../userop/pack.ts";
 import { getUserOpHash } from "../userop/hash.ts";
-import { ReputationManager, type EntityStatus } from "./reputation.ts";
+import { ReputationManager } from "./reputation.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { UserOpValidationError } from "../userop/validate.ts";
 import { isEmptyHex } from "../utils/hex.ts";
@@ -31,6 +31,9 @@ export interface MempoolConfig {
 }
 
 const MIN_REPLACEMENT_FEE_INCREASE_PERCENT = 10n; // 10% minimum increase
+
+/** Mempool entry TTL — 5 minutes. Stale ops are evicted to prevent unbounded buildup. */
+const MEMPOOL_ENTRY_TTL_MS = 5 * 60 * 1000;
 
 export class Mempool {
   /** Map from userOpHash to MempoolEntry. */
@@ -167,9 +170,15 @@ export class Mempool {
   }
 
   /**
-   * Get all pending entries, optionally sorted.
+   * Get all pending entries, evicting stale ones first.
    */
   getAll(): MempoolEntry[] {
+    const now = Date.now();
+    for (const [hash, entry] of this.entries) {
+      if (now - entry.addedAt > MEMPOOL_ENTRY_TTL_MS) {
+        this.removeEntry(hash);
+      }
+    }
     return Array.from(this.entries.values());
   }
 

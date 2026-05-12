@@ -10,7 +10,6 @@ import {
   createWalletClient,
   createPublicClient,
   http,
-  type WalletClient,
   type PublicClient,
   type Transport,
   type Chain,
@@ -26,7 +25,6 @@ import { Mempool } from "../mempool/index.ts";
 import type { AccountService } from "../account/index.ts";
 import type {
   MempoolEntry,
-  PackedUserOperation,
   UserOperationReceipt,
 } from "../userop/types.ts";
 import { encodeHandleOps } from "../userop/encode.ts";

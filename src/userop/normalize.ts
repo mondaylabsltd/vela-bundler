@@ -44,14 +44,15 @@ function requireAddress(value: unknown, field: string): `0x${string}` {
 
 function optionalAddress(value: unknown): `0x${string}` | null {
   if (value === null || value === undefined || value === "" || value === "0x") return null;
-  if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/i.test(value)) return null;
-  const lower = value.toLowerCase();
-  if (lower === "0x0000000000000000000000000000000000000000") return null;
-  return lower as `0x${string}`;
+  if (typeof value === "string" && value.toLowerCase() === "0x0000000000000000000000000000000000000000") return null;
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/i.test(value)) {
+    throw new UserOpValidationError("Invalid address format for optional address field");
+  }
+  return value.toLowerCase() as `0x${string}`;
 }
 
 function requireHex(value: unknown, field: string): `0x${string}` {
-  if (typeof value !== "string" || !value.startsWith("0x")) {
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]*$/.test(value)) {
     throw new UserOpValidationError(`${field} must be a hex string`);
   }
   return value as `0x${string}`;
@@ -59,7 +60,9 @@ function requireHex(value: unknown, field: string): `0x${string}` {
 
 function optionalHex(value: unknown): `0x${string}` | null {
   if (value === null || value === undefined || value === "" || value === "0x") return null;
-  if (typeof value !== "string" || !value.startsWith("0x")) return null;
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]*$/.test(value)) {
+    throw new UserOpValidationError("Invalid hex string for optional hex field");
+  }
   return value as `0x${string}`;
 }
 

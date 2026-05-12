@@ -61,7 +61,7 @@ async function handleGetAccount(
   chainId: number,
   safeAddress: `0x${string}`,
   chainRegistry: ChainRegistry,
-  config: BundlerConfig,
+  _config: BundlerConfig,
   corsHeaders: Record<string, string>,
   requestRpcUrl?: string,
 ): Promise<Response> {

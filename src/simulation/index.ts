@@ -25,6 +25,10 @@ import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 import { encodeHandleOps } from "../userop/encode.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient, resolveRpcUrl } from "../utils/rpc-client.ts";
+import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
+
+/** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
+const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
 
 export interface SimulationResult {
   valid: boolean;
@@ -82,20 +86,28 @@ export function createSimulator(config: BundlerConfig) {
     const ep = config.entryPointAddress;
 
     try {
-      const res = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: 1,
-          method: "eth_call",
-          params: [
-            { to: ep, data: calldata },
-            "latest",
-            // State override: inject EntryPointSimulations code at the EntryPoint address
-            { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
-          ],
-        }),
-      });
+      const controller = new AbortController();
+      const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: 1,
+            method: "eth_call",
+            params: [
+              { to: ep, data: calldata },
+              "latest",
+              // State override: inject EntryPointSimulations code at the EntryPoint address
+              { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
+            ],
+          }),
+        });
+      } finally {
+        clearTimeout(simTimeout);
+      }
 
       const json = await res.json() as {
         result?: string;
@@ -179,19 +191,27 @@ export function createSimulator(config: BundlerConfig) {
     const ep = config.entryPointAddress;
 
     try {
-      const res = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: 1,
-          method: "eth_call",
-          params: [
-            { to: ep, data: calldata },
-            "latest",
-            { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
-          ],
-        }),
-      });
+      const controller = new AbortController();
+      const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: 1,
+            method: "eth_call",
+            params: [
+              { to: ep, data: calldata },
+              "latest",
+              { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
+            ],
+          }),
+        });
+      } finally {
+        clearTimeout(simTimeout);
+      }
 
       const json = await res.json() as {
         result?: string;
@@ -244,11 +264,12 @@ export function createSimulator(config: BundlerConfig) {
    */
   function parseExecutionResultReturn(data: `0x${string}`): ExecutionSimulationResult {
     try {
-      const decoded = decodeFunctionResult({
+      // deno-lint-ignore no-explicit-any
+      const decoded: any = decodeFunctionResult({
         abi: ENTRYPOINT_V07_ABI,
         functionName: "simulateHandleOp",
         data,
-      }) as any;
+      });
 
       const targetSuccess: boolean = decoded.targetSuccess ?? decoded[4];
       const targetResult: `0x${string}` = decoded.targetResult ?? decoded[5];
@@ -382,11 +403,12 @@ export function createSimulator(config: BundlerConfig) {
    */
   function parseReturnedValidationResult(data: `0x${string}`): SimulationResult {
     try {
-      const decoded = decodeFunctionResult({
+      // deno-lint-ignore no-explicit-any
+      const decoded: any = decodeFunctionResult({
         abi: ENTRYPOINT_V07_ABI,
         functionName: "simulateValidation",
         data,
-      }) as any;
+      });
 
       const returnInfo = decoded.returnInfo ?? decoded[0];
       const senderInfo = decoded.senderInfo ?? decoded[1];
@@ -542,18 +564,26 @@ export function createSimulator(config: BundlerConfig) {
     // UserOperationEvent with success=false and UserOperationRevertReason)
     try {
       const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
-      const callRes = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: 1,
-          method: "eth_call",
-          params: [
-            { to: config.entryPointAddress, data: calldata, from: beneficiary },
-            "latest",
-          ],
-        }),
-      });
+      const bundleController = new AbortController();
+      const bundleTimeout = setTimeout(() => bundleController.abort(), SIMULATION_TIMEOUT_MS);
+      let callRes: Response;
+      try {
+        callRes = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: bundleController.signal,
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: 1,
+            method: "eth_call",
+            params: [
+              { to: config.entryPointAddress, data: calldata, from: beneficiary },
+              "latest",
+            ],
+          }),
+        });
+      } finally {
+        clearTimeout(bundleTimeout);
+      }
       const callJson = await callRes.json() as {
         result?: string;
         error?: { code: number; message: string; data?: string };

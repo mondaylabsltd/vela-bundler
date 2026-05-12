@@ -53,10 +53,12 @@ export function unpackUint128(packed: `0x${string}`): [bigint, bigint] {
  */
 export function countCalldataBytes(hex: `0x${string}`): { zeroBytes: number; nonZeroBytes: number } {
   const raw = hex.slice(2);
+  // Odd-length hex: pad with leading zero so byte boundaries are correct
+  const padded = raw.length % 2 !== 0 ? "0" + raw : raw;
   let zeroBytes = 0;
   let nonZeroBytes = 0;
-  for (let i = 0; i < raw.length; i += 2) {
-    const byte = raw.slice(i, i + 2);
+  for (let i = 0; i < padded.length; i += 2) {
+    const byte = padded.slice(i, i + 2);
     if (byte === "00") {
       zeroBytes++;
     } else {
