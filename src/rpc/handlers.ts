@@ -147,9 +147,11 @@ async function handleSendUserOperation(
   const maxGas = calcUserOpMaxGas(userOp);
   const estimatedCost = maxGas * outerGas.effectiveGasPrice;
 
+  console.log(`[RPC] Balance check: eoa=${eoa.address} maxGas=${maxGas} effectiveGasPrice=${outerGas.effectiveGasPrice} estimatedCost=${estimatedCost} rpcOverride=${rpcOverride ?? 'none'}`);
   let balanceCheck;
   try {
     balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, rpcOverride);
+    console.log(`[RPC] Balance result: spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
   } catch (err) {
     console.error(`[RPC] Balance query failed for ${safeAddress}:`, err);
     throw bundlerError(

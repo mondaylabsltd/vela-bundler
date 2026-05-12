@@ -275,9 +275,12 @@ export function createSimulator(config: BundlerConfig) {
       const targetResult: `0x${string}` = decoded.targetResult ?? decoded[5];
       const paid: bigint = decoded.paid ?? decoded[1];
 
-      if (!targetSuccess) {
+      // targetSuccess only applies when a secondary target call is specified.
+      // When target=address(0) (no extra call), targetSuccess defaults to false — ignore it.
+      // The UserOp's own execution success is determined by whether paid > 0.
+      if (!targetSuccess && targetResult && targetResult !== "0x" && targetResult.length > 2) {
         console.warn(
-          `[Simulator] simulateHandleOp: execution would REVERT. targetResult=${(targetResult ?? "0x").slice(0, 66)}`,
+          `[Simulator] simulateHandleOp: target call would REVERT. targetResult=${(targetResult ?? "0x").slice(0, 66)}`,
         );
         return {
           success: false,
