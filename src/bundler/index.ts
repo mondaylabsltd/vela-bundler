@@ -345,7 +345,17 @@ export class BundlerService {
 
     // Balance check before submission
     const expectedCost = bundleSim.estimatedGas! * outerGas.effectiveGasPrice;
-    const balanceCheck = await this.accountService.checkBalance(safeAddress, expectedCost);
+    let balanceCheck;
+    try {
+      balanceCheck = await this.accountService.checkBalance(safeAddress, expectedCost, rpcOverride);
+    } catch (err) {
+      console.error(`[Bundler] Balance check failed for ${safeAddress}:`, err);
+      return {
+        submitted: false,
+        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+        error: "Balance check RPC failed",
+      };
+    }
     if (!balanceCheck.sufficient) {
       return {
         submitted: false,

@@ -277,15 +277,19 @@ function handleGetUserOperationByHash(
   params: unknown[],
   config: BundlerConfig,
   chainRegistry: ChainRegistry,
-  _reqCtx: RequestContext,
+  reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
   }
 
-  // Search all initialized chains
-  for (const chain of chainRegistry.getAll()) {
+  // Search requested chain first, then fall back to all chains
+  const allChains = chainRegistry.getAll();
+  const sortedChains = allChains.sort((a, b) =>
+    a.chainId === reqCtx.chainId ? -1 : b.chainId === reqCtx.chainId ? 1 : 0,
+  );
+  for (const chain of sortedChains) {
     const memEntry = chain.mempool.get(hash);
     if (memEntry) {
       return {
@@ -316,14 +320,18 @@ function handleGetUserOperationReceipt(
   params: unknown[],
   _config: BundlerConfig,
   chainRegistry: ChainRegistry,
-  _reqCtx: RequestContext,
+  reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;
   if (!hash || typeof hash !== "string" || !hash.startsWith("0x")) {
     throw invalidParams("Expected userOpHash as hex string");
   }
 
-  for (const chain of chainRegistry.getAll()) {
+  const allChains = chainRegistry.getAll();
+  const sortedChains = allChains.sort((a, b) =>
+    a.chainId === reqCtx.chainId ? -1 : b.chainId === reqCtx.chainId ? 1 : 0,
+  );
+  for (const chain of sortedChains) {
     const receipt = chain.bundler.getReceipt(hash);
     if (!receipt) continue;
 

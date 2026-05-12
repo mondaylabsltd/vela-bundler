@@ -68,9 +68,20 @@ export function startRpcServer(
 
       // Health / service identification
       if ((url.pathname === "/health" || url.pathname === "/api/health") && req.method === "GET") {
+        const chains = chainRegistry.getAll();
+        let totalMempoolSize = 0;
+        let totalLockedEOAs = 0;
+        for (const chain of chains) {
+          totalMempoolSize += chain.mempool.size;
+          totalLockedEOAs += chain.accountService.lockManager.getLockedEOAs().length;
+        }
         return Response.json({
           service: "vela-bundler",
-          status: "ok",
+          status: totalLockedEOAs > 0 ? "degraded" : "ok",
+          activeChains: chains.length,
+          mempoolSize: totalMempoolSize,
+          lockedEOAs: totalLockedEOAs,
+          entryPoint: config.entryPointAddress,
         }, {
           headers: {
             "Access-Control-Allow-Origin": "*",
@@ -135,8 +146,13 @@ export function startRpcServer(
       const reqCtx: RequestContext = { requestRpcUrl, chainId };
 
       if (Array.isArray(body)) {
-        const responses = await Promise.all(
+        const results = await Promise.allSettled(
           body.map((item) => processRequest(item, config, chainRegistry, reqCtx)),
+        );
+        const responses = results.map((r, i) =>
+          r.status === "fulfilled"
+            ? r.value
+            : { jsonrpc: "2.0" as const, id: (body[i]?.id as number | string) ?? null, error: internalError("Internal error") },
         );
         return jsonResponse(responses, corsHeaders);
       }
