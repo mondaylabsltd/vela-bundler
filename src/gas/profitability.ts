@@ -122,8 +122,12 @@ export function calcOuterTxGasPrice(params: {
   const { currentBaseFee, baseFeeMultiplier, bundlerTipGwei, chainSuggestedTip } = params;
 
   const configTip = BigInt(Math.ceil(bundlerTipGwei * 1e9));
-  // Use the higher of config tip and chain suggestion to meet chain minimums
-  const maxPriorityFeePerGas = chainSuggestedTip && chainSuggestedTip > configTip
+  // Prefer chain's suggested tip — it reflects actual network conditions.
+  // Only fall back to configTip when chain suggestion is unavailable.
+  // Old logic used max(config, chain) which caused the bundler to demand
+  // higher gas than the chain needs (e.g. 1.5 gwei on BSC where 1 gwei suffices),
+  // inflating costs and creating MEV extraction opportunities.
+  const maxPriorityFeePerGas = chainSuggestedTip && chainSuggestedTip > 0n
     ? chainSuggestedTip
     : configTip;
 

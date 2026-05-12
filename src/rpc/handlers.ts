@@ -200,6 +200,23 @@ async function handleSendUserOperation(
     );
   }
 
+  // Cap: reject UserOps with excessive gas price to protect users from overpaying.
+  // EntryPoint charges sender at effectiveGasPrice = min(maxFee, baseFee+maxPriority).
+  // If this is much higher than the bundler's actual tx cost, the excess becomes
+  // pure profit — attracts MEV bots and overcharges users.
+  // Margin >50% means the UserOp is paying 1.5x+ the actual cost — reject it.
+  const MAX_MARGIN_BPS = 5000; // 50%
+  const maxAllowedPrice =
+    (outerGas.effectiveGasPrice * BigInt(10000 + MAX_MARGIN_BPS)) / 10000n;
+  if (userOpGasPrice > maxAllowedPrice) {
+    throw bundlerError(
+      RPC_ERROR_CODES.INVALID_USEROPERATION,
+      `UserOperation gas price too high: ${userOpGasPrice} exceeds ` +
+      `${MAX_MARGIN_BPS / 100}% cap over network rate ${outerGas.effectiveGasPrice}. ` +
+      `Lower maxFeePerGas to at most ${maxAllowedPrice}.`,
+    );
+  }
+
   // Simulate validation
   const simResult = await chain.simulator.simulateValidation(userOp, rpcOverride);
   if (!simResult.valid) {

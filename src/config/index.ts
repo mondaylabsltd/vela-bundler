@@ -105,15 +105,15 @@ export function loadConfig(): BundlerConfig {
     bundlingMode: env("BUNDLING_MODE", "auto") as "auto" | "manual",
     maxBundleSize: parseInt(env("MAX_BUNDLE_SIZE", "10")),
     maxBundleGas: BigInt(env("MAX_BUNDLE_GAS", "5000000")),
-    minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "1000000000")),
+    minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "1000000")),
 
-    minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "2000")),
-    targetProfitMarginBps: parseInt(env("TARGET_PROFIT_MARGIN_BPS", "3500")),
-    highRiskMarginBps: parseInt(env("HIGH_RISK_MARGIN_BPS", "5000")),
+    minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "1000")),
+    targetProfitMarginBps: parseInt(env("TARGET_PROFIT_MARGIN_BPS", "2000")),
+    highRiskMarginBps: parseInt(env("HIGH_RISK_MARGIN_BPS", "3000")),
 
     useEip1559,
     baseFeeMultiplier: parseFloat(env("BASE_FEE_MULTIPLIER", "1.25")),
-    bundlerTipGwei: parseFloat(env("BUNDLER_TIP_GWEI", "1.5")),
+    bundlerTipGwei: parseFloat(env("BUNDLER_TIP_GWEI", "0.5")),
 
     autoBundleIntervalMs: parseInt(env("AUTO_BUNDLE_INTERVAL_MS", "10000")),
 
