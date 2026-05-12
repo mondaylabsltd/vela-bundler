@@ -14,13 +14,14 @@
  * URL pattern: https://{slug}.g.alchemy.com/v2/{apiKey}
  *
  * Only EVM-compatible chains are included (non-EVM like Solana, Bitcoin,
- * Aptos, Sui, Starknet are excluded as they use different RPC protocols).
+ * Aptos, Sui, Starknet, Tron are excluded as they use different RPC protocols).
  */
 const ALCHEMY_CHAINS: Record<number, string> = {
   // ── Ethereum ──
   1: "eth-mainnet",
   11155111: "eth-sepolia",
   17000: "eth-holesky",
+  560048: "eth-hoodi",
 
   // ── Polygon PoS ──
   137: "polygon-mainnet",
@@ -89,6 +90,7 @@ const ALCHEMY_CHAINS: Record<number, string> = {
   // ── Sonic ──
   146: "sonic-mainnet",
   64165: "sonic-testnet",
+  57054: "sonic-blaze",
 
   // ── Sei ──
   1329: "sei-mainnet",
@@ -145,8 +147,8 @@ const ALCHEMY_CHAINS: Record<number, string> = {
   1088: "metis-mainnet",
 
   // ── CrossFi ──
-  4158: "crossfi-testnet",
   4157: "crossfi-mainnet",
+  4158: "crossfi-testnet",
 
   // ── Moonbeam ──
   1284: "moonbeam-mainnet",
@@ -157,6 +159,7 @@ const ALCHEMY_CHAINS: Record<number, string> = {
 
   // ── Frax ──
   252: "frax-mainnet",
+  2523: "frax-hoodi",
 
   // ── Zora ──
   7777777: "zora-mainnet",
@@ -197,6 +200,79 @@ const ALCHEMY_CHAINS: Record<number, string> = {
   // ── Ronin ──
   2020: "ronin-mainnet",
   2021: "ronin-saigon",
+
+  // ── BOB ──
+  60808: "bob-mainnet",
+  808813: "bob-sepolia",
+
+  // ── MegaETH ──
+  4326: "megaeth-mainnet",
+  6343: "megaeth-testnet",
+
+  // ── Monad ──
+  143: "monad-mainnet",
+  10143: "monad-testnet",
+
+  // ── RISE ──
+  4153: "rise-mainnet",
+  11155931: "rise-testnet",
+
+  // ── RACE ──
+  6805: "race-mainnet",
+  6806: "race-sepolia",
+
+  // ── Citrea ──
+  4114: "citrea-mainnet",
+  5115: "citrea-testnet",
+
+  // ── Galactica ──
+  613419: "galactica-mainnet",
+  843843: "galactica-cassiopeia",
+
+  // ── Humanity ──
+  6985385: "humanity-mainnet",
+  7080969: "humanity-testnet",
+
+  // ── Stable ──
+  988: "stable-mainnet",
+  2201: "stable-testnet",
+
+  // ── Edge ──
+  3343: "edge-mainnet",
+
+  // ── Plasma ──
+  9745: "plasma-mainnet",
+  9746: "plasma-testnet",
+
+  // ── Unite ──
+  88899: "unite-mainnet",
+  888991: "unite-testnet",
+
+  // ── Tempo ──
+  4217: "tempo-mainnet",
+  42431: "tempo-moderato",
+
+  // ── Mythos ──
+  201804: "mythos-mainnet",
+
+  // ── Tea ──
+  10218: "tea-sepolia",
+
+  // ── Settlus ──
+  5371: "settlus-mainnet",
+  5373: "settlus-septestnet",
+
+  // ── Syndicate ──
+  510: "synd-mainnet",
+
+  // ── Commons ──
+  510003: "commons-mainnet",
+
+  // ── World Mobile Chain ──
+  869: "worldmobilechain-mainnet",
+
+  // ── ADI ──
+  99999: "adi-testnet",
 };
 
 /**

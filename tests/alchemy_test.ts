@@ -91,7 +91,7 @@ Deno.test("buildAlchemyRpcUrl - all testnets have correct slug", () => {
 
 Deno.test("getAlchemySupportedChainIds - returns non-empty array", () => {
   const ids = getAlchemySupportedChainIds();
-  assert(ids.length > 50, `Expected >50 supported chains, got ${ids.length}`);
+  assert(ids.length > 80, `Expected >80 supported chains, got ${ids.length}`);
 });
 
 Deno.test("getAlchemySupportedChainIds - all IDs are positive numbers", () => {
@@ -131,6 +131,34 @@ Deno.test("Alchemy chains - covers all major L2s", () => {
   };
   for (const [name, chainId] of Object.entries(l2s)) {
     assert(isAlchemySupported(chainId), `L2 ${name} (${chainId}) not in Alchemy support`);
+  }
+});
+
+Deno.test("Alchemy chains - covers newly added chains from 2026 docs", () => {
+  const newChains: Record<string, number> = {
+    "BOB": 60808,
+    "MegaETH": 4326,
+    "Monad": 143,
+    "RISE": 4153,
+    "RACE": 6805,
+    "Citrea": 4114,
+    "Galactica": 613419,
+    "Humanity": 6985385,
+    "Plasma": 9745,
+    "Unite": 88899,
+    "Tempo": 4217,
+    "Mythos": 201804,
+    "Stable": 988,
+    "Settlus": 5371,
+    "Edge": 3343,
+    "Ethereum Hoodi": 560048,
+    "Sonic Blaze": 57054,
+    "Frax Hoodi": 2523,
+  };
+  for (const [name, chainId] of Object.entries(newChains)) {
+    assert(isAlchemySupported(chainId), `${name} (${chainId}) not in Alchemy support`);
+    const url = buildAlchemyRpcUrl(chainId, "test");
+    assert(url !== null, `${name} (${chainId}) returned null URL`);
   }
 });
 

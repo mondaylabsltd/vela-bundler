@@ -167,10 +167,13 @@ async function runDeploy(cfg: DeployConfig) {
       if (!treasuryAddress || !/^0x[0-9a-fA-F]{40}$/.test(treasuryAddress)) {
         throw new Error("TREASURY_ADDRESS must be a valid Ethereum address");
       }
+      const alchemyApiKey = await prompt("ALCHEMY_API_KEY (optional, press Enter to skip)", "");
+
       const envVars: Record<string, string> = {
         OPERATOR_SECRET: operatorSecret,
         TREASURY_ADDRESS: treasuryAddress,
       };
+      if (alchemyApiKey) envVars.ALCHEMY_API_KEY = alchemyApiKey;
 
       await writeEnvFile(ssh, envVars);
       console.log("-> Env file written.\n");
@@ -189,12 +192,14 @@ async function runDeploy(cfg: DeployConfig) {
         const operatorSecret = await prompt("OPERATOR_SECRET", existing.OPERATOR_SECRET ?? "");
         const treasuryAddress = await prompt("TREASURY_ADDRESS", existing.TREASURY_ADDRESS ?? "");
         const oldSecrets = await prompt("OLD_OPERATOR_SECRETS", existing.OLD_OPERATOR_SECRETS ?? "");
+        const alchemyApiKey = await prompt("ALCHEMY_API_KEY", existing.ALCHEMY_API_KEY ?? "");
 
         const envVars: Record<string, string> = {
           OPERATOR_SECRET: operatorSecret,
           TREASURY_ADDRESS: treasuryAddress,
         };
         if (oldSecrets) envVars.OLD_OPERATOR_SECRETS = oldSecrets;
+        if (alchemyApiKey) envVars.ALCHEMY_API_KEY = alchemyApiKey;
 
         await writeEnvFile(ssh, envVars);
         console.log("-> Env file updated.\n");
