@@ -95,8 +95,9 @@ export class ChainRegistry {
       }
     } else {
       // No user RPC — resolve from registry (includes health check).
+      // Pass Alchemy key for priority RPC selection.
       try {
-        const resolved = await resolveChain(chainId);
+        const resolved = await resolveChain(chainId, this.globalConfig.alchemyApiKey);
         rpcUrl = resolved.rpcUrl;
         publicRpcs = resolved.publicRpcs;
         chainInfo = resolved.chain;

@@ -7,6 +7,8 @@
  * Only networks listed in this registry are supported.
  */
 
+import { buildAlchemyRpcUrl } from "./alchemy.ts";
+
 const REGISTRY_BASE_URL = "https://ethereum-data.awesometools.dev";
 
 /**
@@ -148,8 +150,10 @@ export function chainSupportsEip1559(chain: ChainInfo): boolean {
 /**
  * Resolve chain info + best RPC for a given chainId.
  * This is the main entry point for chain resolution.
+ *
+ * Priority: Alchemy (if API key set + chain supported) > public RPC health check.
  */
-export async function resolveChain(chainId: number): Promise<{
+export async function resolveChain(chainId: number, alchemyApiKey?: string | null): Promise<{
   chain: ChainInfo;
   rpcUrl: string;
   publicRpcs: string[];
@@ -159,6 +163,19 @@ export async function resolveChain(chainId: number): Promise<{
   const chain = await fetchChainInfo(chainId);
 
   const publicRpcs = filterPublicRpcUrls(chain.rpc);
+  const supportsEip1559 = chainSupportsEip1559(chain);
+
+  // Prefer Alchemy if API key is configured and chain is supported
+  if (alchemyApiKey) {
+    const alchemyUrl = buildAlchemyRpcUrl(chainId, alchemyApiKey);
+    if (alchemyUrl) {
+      console.log(`[ChainRegistry] ${chain.name} — using Alchemy RPC`);
+      console.log(`[ChainRegistry] EIP-1559: ${supportsEip1559}`);
+      return { chain, rpcUrl: alchemyUrl, publicRpcs, supportsEip1559 };
+    }
+  }
+
+  // Fallback: pick best public RPC
   if (publicRpcs.length === 0) {
     throw new Error(
       `Chain "${chain.name}" (${chainId}) has no usable public HTTPS RPC endpoints`,
@@ -170,7 +187,6 @@ export async function resolveChain(chainId: number): Promise<{
   );
 
   const rpcUrl = await pickBestRpc(publicRpcs, chainId);
-  const supportsEip1559 = chainSupportsEip1559(chain);
 
   console.log(`[ChainRegistry] Selected RPC: ${rpcUrl}`);
   console.log(`[ChainRegistry] EIP-1559: ${supportsEip1559}`);
