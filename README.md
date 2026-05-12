@@ -174,13 +174,24 @@ Chain ID is per-request (via URL path), not a global config.
 | `ALCHEMY_API_KEY` | — | Alchemy API key for preferred RPCs |
 | `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
 | `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |
-| `BUNDLER_TIP_GWEI` | `1.5` | Minimum priority fee tip (Gwei) |
-| `MIN_PRIORITY_FEE_PER_GAS` | `1000000000` | Minimum priority fee (wei) |
-| `MIN_PROFIT_MARGIN_BPS` | `2000` | Minimum profitability (basis points) |
-| `TARGET_PROFIT_MARGIN_BPS` | `3500` | Target margin (basis points) |
-| `HIGH_RISK_MARGIN_BPS` | `5000` | High-risk margin (basis points) |
+| `BUNDLER_TIP_GWEI` | `0.5` | Fallback priority fee tip (Gwei). Chain's suggested tip is preferred when available. |
+| `MIN_PRIORITY_FEE_PER_GAS` | `1000000` | Minimum priority fee (wei, 0.001 Gwei). Low to support cheap L2s. |
+| `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum profitability (10%). UserOps below this are rejected. |
+| `TARGET_PROFIT_MARGIN_BPS` | `2000` | Target margin (20%). |
+| `HIGH_RISK_MARGIN_BPS` | `3000` | High-risk margin (30%). |
 | `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
 | `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve requirement multiplier |
+
+## Gas Pricing & Margin Control
+
+The bundler enforces a **10–50% margin band** to balance profitability with user protection:
+
+- **Floor (10%)**: UserOps with `effectiveGasPrice < outerGasPrice × 1.1` are rejected as unprofitable.
+- **Cap (50%)**: UserOps with `effectiveGasPrice > outerGasPrice × 1.5` are rejected to protect users from overpaying. This also eliminates MEV extraction incentive — at 30% margin the profit is too small for MEV bots to front-run.
+
+**Outer gas pricing** prefers the chain's suggested tip (`eth_maxPriorityFeePerGas` or derived from `eth_gasPrice`) over the configured `BUNDLER_TIP_GWEI`. This prevents the bundler from demanding higher gas than the network requires (e.g., 1.5 Gwei config tip on BSC where the chain only needs 1 Gwei).
+
+**Client-side**: Vela Wallet sets `maxFeePerGas = gasPrice × 1.3`, keeping the UserOp gas price ~30% above the chain rate — within the bundler's accepted band.
 
 ## Known Limitations
 
