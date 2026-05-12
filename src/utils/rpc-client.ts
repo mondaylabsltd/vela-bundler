@@ -24,15 +24,22 @@ export function resolveRpcUrl(
   return config.rpcUrl;
 }
 
-/** Cache of public clients by RPC URL to avoid re-creation. */
+/** Cache of public clients by RPC URL to avoid re-creation. Max 50 entries. */
+const CLIENT_CACHE_MAX = 50;
 const clientCache = new Map<string, PublicClient<Transport, Chain>>();
 
 /**
  * Get or create a PublicClient for the given RPC URL.
+ * Evicts oldest entry when cache exceeds max size.
  */
 export function getPublicClient(rpcUrl: string): PublicClient<Transport, Chain> {
   let client = clientCache.get(rpcUrl);
   if (!client) {
+    // Evict oldest entry if at capacity (Map iterates in insertion order)
+    if (clientCache.size >= CLIENT_CACHE_MAX) {
+      const oldest = clientCache.keys().next().value;
+      if (oldest !== undefined) clientCache.delete(oldest);
+    }
     client = createPublicClient({
       transport: http(rpcUrl),
     }) as PublicClient<Transport, Chain>;

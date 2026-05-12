@@ -9,6 +9,7 @@ export interface RateLimitConfig {
 
 /** In-memory rate limiter. */
 const requestCounts: Map<string, { count: number; resetAt: number }> = new Map();
+let lastPruneAt = 0;
 
 /**
  * Check rate limit for a request.
@@ -24,6 +25,15 @@ export function rateLimitGuard(
 
   const now = Date.now();
   const windowMs = 60_000;
+
+  // Prune expired entries every 5 minutes to prevent unbounded growth
+  if (now - lastPruneAt > 300_000) {
+    for (const [key, val] of requestCounts) {
+      if (now > val.resetAt) requestCounts.delete(key);
+    }
+    lastPruneAt = now;
+  }
+
   let entry = requestCounts.get(ip);
 
   if (!entry || now > entry.resetAt) {

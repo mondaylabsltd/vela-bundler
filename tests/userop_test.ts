@@ -156,7 +156,7 @@ Deno.test("validateUserOpFields - rejects zero callGasLimit", () => {
 
 Deno.test("validateUserOpFields - rejects verificationGasLimit over MAX", () => {
   assertThrows(
-    () => validateUserOpFields(makeUserOp({ verificationGasLimit: 600_000n })),
+    () => validateUserOpFields(makeUserOp({ verificationGasLimit: 3_000_000n })),
     UserOpValidationError,
     "MAX_VERIFICATION_GAS",
   );

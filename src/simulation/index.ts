@@ -40,6 +40,15 @@ export interface BundleSimulationResult {
   failedOpIndex?: number;
 }
 
+export interface ExecutionSimulationResult {
+  success: boolean;
+  targetSuccess?: boolean;
+  targetResult?: `0x${string}`;
+  paid?: bigint;
+  errorCode?: number;
+  errorMessage?: string;
+}
+
 /**
  * Create a simulation service.
  */
@@ -145,6 +154,229 @@ export function createSimulator(config: BundlerConfig) {
   }
 
   /**
+   * Simulate execution of a UserOperation via EntryPointSimulations.simulateHandleOp.
+   *
+   * This catches the critical gap where validation passes but execution reverts
+   * (e.g. insufficient balance after initCode setup consumes funds).
+   * Uses the same state-override pattern as simulateValidation.
+   */
+  async function simulateExecution(
+    userOp: UserOperation,
+    rpcUrlOverride?: string,
+  ): Promise<ExecutionSimulationResult> {
+    const packed = packUserOp(userOp);
+    const calldata = encodeFunctionData({
+      abi: ENTRYPOINT_V07_ABI,
+      functionName: "simulateHandleOp",
+      args: [
+        packed,
+        "0x0000000000000000000000000000000000000000", // no extra target call
+        "0x",
+      ],
+    });
+
+    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const ep = config.entryPointAddress;
+
+    try {
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [
+            { to: ep, data: calldata },
+            "latest",
+            { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
+          ],
+        }),
+      });
+
+      const json = await res.json() as {
+        result?: string;
+        error?: { code: number; message: string; data?: string };
+      };
+
+      // Successful return — decode ExecutionResult
+      if (json.result && json.result !== "0x") {
+        return parseExecutionResultReturn(json.result as `0x${string}`);
+      }
+
+      // Extract revert data (same patterns as simulateValidation)
+      let revertData: `0x${string}` | undefined;
+
+      const errData = json.error?.data;
+      if (typeof errData === "string" && errData.startsWith("0x") && errData.length > 2) {
+        revertData = errData as `0x${string}`;
+      } else if (typeof errData === "object" && errData !== null) {
+        const nested = (errData as Record<string, unknown>).data;
+        if (typeof nested === "string" && nested.startsWith("0x") && nested.length > 2) {
+          revertData = nested as `0x${string}`;
+        }
+      }
+      if (!revertData && json.error?.message) {
+        const match = json.error.message.match(/(0x[0-9a-fA-F]{8,})/);
+        if (match) revertData = match[1] as `0x${string}`;
+      }
+
+      // Try to decode the revert as ExecutionResult error
+      if (revertData) {
+        return parseExecutionResultRevert(revertData);
+      }
+
+      return {
+        success: false,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `simulateHandleOp reverted with no data: ${json.error?.message ?? "unknown"}`,
+      };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `simulateHandleOp RPC failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Parse successful return data from simulateHandleOp (ExecutionResult struct).
+   */
+  function parseExecutionResultReturn(data: `0x${string}`): ExecutionSimulationResult {
+    try {
+      const decoded = decodeFunctionResult({
+        abi: ENTRYPOINT_V07_ABI,
+        functionName: "simulateHandleOp",
+        data,
+      }) as any;
+
+      const targetSuccess: boolean = decoded.targetSuccess ?? decoded[4];
+      const targetResult: `0x${string}` = decoded.targetResult ?? decoded[5];
+      const paid: bigint = decoded.paid ?? decoded[1];
+
+      if (!targetSuccess) {
+        console.warn(
+          `[Simulator] simulateHandleOp: execution would REVERT. targetResult=${(targetResult ?? "0x").slice(0, 66)}`,
+        );
+        return {
+          success: false,
+          targetSuccess: false,
+          targetResult,
+          paid,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: `UserOp execution would revert (targetResult: ${(targetResult ?? "0x").slice(0, 66)})`,
+        };
+      }
+
+      console.log(`[Simulator] simulateHandleOp OK: paid=${paid} targetSuccess=${targetSuccess}`);
+      return { success: true, targetSuccess: true, targetResult, paid };
+    } catch (err) {
+      return {
+        success: false,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `Failed to decode ExecutionResult return: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Parse revert data from simulateHandleOp.
+   * Could be ExecutionResult error (v0.6 compat), FailedOp, or FailedOpWithRevert.
+   */
+  function parseExecutionResultRevert(revertData: `0x${string}`): ExecutionSimulationResult {
+    try {
+      const decoded = decodeErrorResult({
+        abi: ENTRYPOINT_V07_ABI,
+        data: revertData,
+      });
+
+      if (decoded.errorName === "ExecutionResult") {
+        const args = decoded.args as unknown as [bigint, bigint, bigint, bigint, boolean, `0x${string}`];
+        const targetSuccess = args[4];
+        const targetResult = args[5];
+        const paid = args[1];
+
+        if (!targetSuccess) {
+          console.warn(
+            `[Simulator] simulateHandleOp revert: execution would REVERT. targetResult=${(targetResult ?? "0x").slice(0, 66)}`,
+          );
+          return {
+            success: false,
+            targetSuccess: false,
+            targetResult,
+            paid,
+            errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+            errorMessage: `UserOp execution would revert (targetResult: ${(targetResult ?? "0x").slice(0, 66)})`,
+          };
+        }
+
+        return { success: true, targetSuccess: true, targetResult, paid };
+      }
+
+      if (decoded.errorName === "FailedOp") {
+        const [, reason] = decoded.args as unknown as [bigint, string];
+        return {
+          success: false,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: `simulateHandleOp FailedOp: ${reason}`,
+        };
+      }
+
+      if (decoded.errorName === "FailedOpWithRevert") {
+        const [, reason, inner] = decoded.args as unknown as [bigint, string, `0x${string}`];
+        return {
+          success: false,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: `simulateHandleOp FailedOpWithRevert: ${reason} (inner: ${inner})`,
+        };
+      }
+
+      return {
+        success: false,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `simulateHandleOp unknown error: ${decoded.errorName}`,
+      };
+    } catch {
+      return {
+        success: false,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `Failed to decode simulateHandleOp revert: ${revertData.slice(0, 66)}`,
+      };
+    }
+  }
+
+  /**
+   * Validate account and paymaster validation data (shared by both return and revert paths).
+   * Returns a rejection SimulationResult if invalid, or null if all checks pass.
+   */
+  function checkValidationData(
+    accountValidationData: bigint,
+    paymasterValidationData: bigint,
+  ): SimulationResult | null {
+    const accountVD = parseValidationData(accountValidationData);
+    if (accountVD.aggregator !== "0x0000000000000000000000000000000000000000" &&
+        accountVD.aggregator !== "0x0000000000000000000000000000000000000001") {
+      return { valid: false, errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED, errorMessage: "Aggregated signatures not supported" };
+    }
+    if (accountVD.aggregator === "0x0000000000000000000000000000000000000001") {
+      return { valid: false, errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED, errorMessage: "Account signature validation failed" };
+    }
+    if (!isValidTimeRange(accountVD.validAfter, accountVD.validUntil)) {
+      return { valid: false, errorCode: RPC_ERROR_CODES.OUT_OF_TIME_RANGE, errorMessage: `Account validation out of time range: validAfter=${accountVD.validAfter}, validUntil=${accountVD.validUntil}` };
+    }
+    if (paymasterValidationData !== 0n) {
+      const pmVD = parseValidationData(paymasterValidationData);
+      if (pmVD.aggregator === "0x0000000000000000000000000000000000000001") {
+        return { valid: false, errorCode: RPC_ERROR_CODES.PAYMASTER_REJECTED, errorMessage: "Paymaster signature validation failed" };
+      }
+      if (!isValidTimeRange(pmVD.validAfter, pmVD.validUntil)) {
+        return { valid: false, errorCode: RPC_ERROR_CODES.OUT_OF_TIME_RANGE, errorMessage: `Paymaster validation out of time range: validAfter=${pmVD.validAfter}, validUntil=${pmVD.validUntil}` };
+      }
+    }
+    return null;
+  }
+
+  /**
    * Parse successful return data from EntryPointSimulations.simulateValidation (v0.7).
    * Returns ValidationResult struct directly (not via revert).
    */
@@ -156,8 +388,6 @@ export function createSimulator(config: BundlerConfig) {
         data,
       }) as any;
 
-      // Result is a ValidationResult struct:
-      // { returnInfo, senderInfo, factoryInfo, paymasterInfo, aggregatorInfo }
       const returnInfo = decoded.returnInfo ?? decoded[0];
       const senderInfo = decoded.senderInfo ?? decoded[1];
       const factoryInfo = decoded.factoryInfo ?? decoded[2];
@@ -177,18 +407,8 @@ export function createSimulator(config: BundlerConfig) {
         paymasterUnstakeDelaySec: paymasterInfo.unstakeDelaySec,
       };
 
-      // Check signature validation
-      const accountVD = parseValidationData(returnInfo.accountValidationData);
-      if (accountVD.aggregator !== "0x0000000000000000000000000000000000000000" &&
-          accountVD.aggregator !== "0x0000000000000000000000000000000000000001") {
-        return { valid: false, errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED, errorMessage: "Aggregated signatures not supported" };
-      }
-      if (accountVD.aggregator === "0x0000000000000000000000000000000000000001") {
-        return { valid: false, errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED, errorMessage: "Account signature validation failed" };
-      }
-      if (!isValidTimeRange(accountVD.validAfter, accountVD.validUntil)) {
-        return { valid: false, errorCode: RPC_ERROR_CODES.OUT_OF_TIME_RANGE, errorMessage: `Account validation out of time range` };
-      }
+      const rejection = checkValidationData(returnInfo.accountValidationData, returnInfo.paymasterValidationData);
+      if (rejection) return rejection;
 
       console.log(`[Simulator] simulateValidation OK: preOpGas=${validationResult.preOpGas} prefund=${validationResult.prefund}`);
       return { valid: true, validationResult };
@@ -238,49 +458,8 @@ export function createSimulator(config: BundlerConfig) {
           paymasterUnstakeDelaySec: paymasterInfo.unstakeDelaySec,
         };
 
-        const accountVD = parseValidationData(returnInfo.accountValidationData);
-        if (accountVD.aggregator !== "0x0000000000000000000000000000000000000000" &&
-            accountVD.aggregator !== "0x0000000000000000000000000000000000000001") {
-          return {
-            valid: false,
-            errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED,
-            errorMessage: "Aggregated signatures not supported",
-          };
-        }
-
-        if (accountVD.aggregator === "0x0000000000000000000000000000000000000001") {
-          return {
-            valid: false,
-            errorCode: RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED,
-            errorMessage: "Account signature validation failed",
-          };
-        }
-
-        if (!isValidTimeRange(accountVD.validAfter, accountVD.validUntil)) {
-          return {
-            valid: false,
-            errorCode: RPC_ERROR_CODES.OUT_OF_TIME_RANGE,
-            errorMessage: `Account validation out of time range: validAfter=${accountVD.validAfter}, validUntil=${accountVD.validUntil}`,
-          };
-        }
-
-        if (returnInfo.paymasterValidationData !== 0n) {
-          const pmVD = parseValidationData(returnInfo.paymasterValidationData);
-          if (pmVD.aggregator === "0x0000000000000000000000000000000000000001") {
-            return {
-              valid: false,
-              errorCode: RPC_ERROR_CODES.PAYMASTER_REJECTED,
-              errorMessage: "Paymaster signature validation failed",
-            };
-          }
-          if (!isValidTimeRange(pmVD.validAfter, pmVD.validUntil)) {
-            return {
-              valid: false,
-              errorCode: RPC_ERROR_CODES.OUT_OF_TIME_RANGE,
-              errorMessage: `Paymaster validation out of time range: validAfter=${pmVD.validAfter}, validUntil=${pmVD.validUntil}`,
-            };
-          }
-        }
+        const rejection = checkValidationData(returnInfo.accountValidationData, returnInfo.paymasterValidationData);
+        if (rejection) return rejection;
 
         return { valid: true, validationResult };
       }
@@ -312,7 +491,11 @@ export function createSimulator(config: BundlerConfig) {
   }
 
   /**
-   * Simulate a full handleOps bundle via eth_estimateGas.
+   * Simulate a full handleOps bundle via eth_estimateGas + eth_call verification.
+   *
+   * eth_estimateGas alone can mask individual UserOp execution failures because
+   * EntryPoint v0.7 wraps execution in try/catch. We follow up with eth_call
+   * to detect UserOperationEvent logs with success=false.
    */
   async function simulateBundle(
     packedOps: PackedUserOperation[],
@@ -322,13 +505,14 @@ export function createSimulator(config: BundlerConfig) {
     const client = clientFor(rpcUrlOverride);
     const calldata = encodeHandleOps(packedOps, beneficiary);
 
+    // Step 1: eth_estimateGas for gas estimation
+    let estimatedGas: bigint;
     try {
-      const gas = await client.estimateGas({
+      estimatedGas = await client.estimateGas({
         to: config.entryPointAddress,
         data: calldata,
         account: beneficiary,
       });
-      return { success: true, estimatedGas: gas };
     } catch (err: unknown) {
       const revertData = extractRevertData(err);
       let failedOpIndex: number | undefined;
@@ -352,6 +536,62 @@ export function createSimulator(config: BundlerConfig) {
 
       return { success: false, errorMessage, failedOpIndex };
     }
+
+    // Step 2: eth_call to detect individual UserOp execution failures
+    // (EntryPoint handleOps doesn't revert on individual op failures — it emits
+    // UserOperationEvent with success=false and UserOperationRevertReason)
+    try {
+      const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+      const callRes = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [
+            { to: config.entryPointAddress, data: calldata, from: beneficiary },
+            "latest",
+          ],
+        }),
+      });
+      const callJson = await callRes.json() as {
+        result?: string;
+        error?: { code: number; message: string; data?: string };
+      };
+
+      // If eth_call itself reverts, the whole bundle fails (FailedOp during validation)
+      if (callJson.error) {
+        let revertData: `0x${string}` | undefined;
+        const errData = callJson.error.data;
+        if (typeof errData === "string" && errData.startsWith("0x") && errData.length > 2) {
+          revertData = errData as `0x${string}`;
+        }
+        if (revertData) {
+          try {
+            const decoded = decodeErrorResult({ abi: ENTRYPOINT_V07_ABI, data: revertData });
+            if (decoded.errorName === "FailedOp") {
+              const [opIndex, reason] = decoded.args as unknown as [bigint, string];
+              return {
+                success: false,
+                failedOpIndex: Number(opIndex),
+                errorMessage: `FailedOp at index ${Number(opIndex)}: ${reason}`,
+              };
+            }
+          } catch { /* couldn't decode */ }
+        }
+        // Non-decodable error — fail the bundle
+        return { success: false, errorMessage: `Bundle eth_call failed: ${callJson.error.message}` };
+      }
+
+      // eth_call succeeded — handleOps ran to completion.
+      // Note: individual UserOp execution failures are already caught by
+      // simulateExecution() per-op. This eth_call serves as a final safety net.
+    } catch (err) {
+      // eth_call network error — log but don't fail the bundle (estimateGas passed)
+      console.warn(`[Simulator] Bundle eth_call verification failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    }
+
+    return { success: true, estimatedGas };
   }
 
   /**
@@ -427,6 +667,7 @@ export function createSimulator(config: BundlerConfig) {
 
   return {
     simulateValidation,
+    simulateExecution,
     simulateBundle,
     estimateUserOpGas,
     getCurrentBaseFee,

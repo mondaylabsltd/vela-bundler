@@ -199,7 +199,20 @@ export const ENTRYPOINT_V07_ABI = [
       { name: "target", type: "address" },
       { name: "targetCallData", type: "bytes" },
     ],
-    outputs: [],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        components: [
+          { name: "preOpGas", type: "uint256" },
+          { name: "paid", type: "uint256" },
+          { name: "accountValidationData", type: "uint256" },
+          { name: "paymasterValidationData", type: "uint256" },
+          { name: "targetSuccess", type: "bool" },
+          { name: "targetResult", type: "bytes" },
+        ],
+      },
+    ],
     stateMutability: "nonpayable",
   },
   // Events

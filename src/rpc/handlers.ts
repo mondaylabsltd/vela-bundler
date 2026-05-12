@@ -195,6 +195,15 @@ async function handleSendUserOperation(
     );
   }
 
+  // Simulate execution — catch callData reverts before accepting into mempool
+  const execResult = await chain.simulator.simulateExecution(userOp, rpcOverride);
+  if (!execResult.success) {
+    throw bundlerError(
+      execResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+      execResult.errorMessage ?? "Execution simulation failed",
+    );
+  }
+
   // Add to mempool
   try {
     const userOpHash = chain.mempool.add(

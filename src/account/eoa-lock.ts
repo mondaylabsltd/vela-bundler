@@ -7,10 +7,7 @@
  */
 
 import { type PublicClient, type Transport, type Chain } from "viem";
-import { withTimeout } from "../utils/timeout.ts";
-
-/** Timeout for individual RPC calls (5 seconds). */
-const RPC_TIMEOUT_MS = 5_000;
+import { withTimeout, RPC_TIMEOUT_MS } from "../utils/timeout.ts";
 
 export type EOAStatus =
   | "ACTIVE"
@@ -64,8 +61,11 @@ export class EOALockManager {
         RPC_TIMEOUT_MS,
         "getTransactionCount(latest)",
       );
-    } catch {
-      latestNonce = 0;
+    } catch (err) {
+      // Use existing state nonce if RPC fails, fall back to 0 only for new EOAs
+      const existing = this.states.get(k);
+      latestNonce = existing?.latestNonce ?? 0;
+      console.warn(`[EOALock] getTransactionCount(latest) failed for ${address}, using cached nonce=${latestNonce}: ${err instanceof Error ? err.message : err}`);
     }
 
     try {

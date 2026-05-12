@@ -36,6 +36,7 @@ import {
   checkBundleProfitability,
   calcUserOpMaxGas,
 } from "../gas/profitability.ts";
+import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 
 export interface BundleResult {
   submitted: boolean;
@@ -51,6 +52,7 @@ export class BundlerService {
   private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
   private autoBundleTimer?: ReturnType<typeof setInterval>;
+  private receiptCleanupTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly config: BundlerConfig,
@@ -61,6 +63,8 @@ export class BundlerService {
     this.publicClient = createPublicClient({
       transport: http(config.rpcUrl),
     }) as PublicClient<Transport, Chain>;
+    // Receipt cleanup runs regardless of bundling mode (every 10 min)
+    this.receiptCleanupTimer = setInterval(() => this.cleanExpiredReceipts(), 600_000);
   }
 
   /**
@@ -251,18 +255,38 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "No valid ops after binding check" };
     }
 
-    // Re-validate each op
-    const checkedEntries: MempoolEntry[] = [];
-    for (const entry of validEntries) {
-      const simResult = await this.simulator.simulateValidation(entry.userOp, rpcOverride);
-      if (simResult.valid) {
-        checkedEntries.push(entry);
+    // Re-validate all ops in parallel: validation + execution simulation
+    type CheckedEntry = { entry: MempoolEntry; accountValidationData: bigint; paymasterValidationData: bigint };
+    const simResults = await Promise.allSettled(
+      validEntries.map(async (entry): Promise<CheckedEntry | null> => {
+        const simResult = await this.simulator.simulateValidation(entry.userOp, rpcOverride);
+        if (!simResult.valid) {
+          console.warn(`[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`);
+          return null;
+        }
+        const execResult = await this.simulator.simulateExecution(entry.userOp, rpcOverride);
+        if (!execResult.success) {
+          console.warn(`[Bundler] UserOp ${entry.userOpHash} failed execution simulation: ${execResult.errorMessage}`);
+          return null;
+        }
+        return {
+          entry,
+          accountValidationData: simResult.validationResult?.accountValidationData ?? 0n,
+          paymasterValidationData: simResult.validationResult?.paymasterValidationData ?? 0n,
+        };
+      }),
+    );
+
+    const checkedEntries: CheckedEntry[] = [];
+    for (let i = 0; i < simResults.length; i++) {
+      const result = simResults[i]!;
+      if (result.status === "fulfilled" && result.value) {
+        checkedEntries.push(result.value);
       } else {
-        this.mempool.remove(entry.userOpHash);
-        this.mempool.reputation.penalize(entry.userOp.sender, "sender");
-        console.warn(
-          `[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`,
-        );
+        // Failed validation or execution — remove from mempool
+        const failed = validEntries[i]!;
+        this.mempool.remove(failed.userOpHash);
+        this.mempool.reputation.penalize(failed.userOp.sender, "sender");
       }
     }
 
@@ -274,7 +298,7 @@ export class BundlerService {
     const beneficiary = eoa.address;
 
     // Full bundle simulation
-    const packedOps = checkedEntries.map((e) => e.packed);
+    const packedOps = checkedEntries.map((e) => e.entry.packed);
     const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, rpcOverride);
 
     if (!bundleSim.success) {
@@ -282,21 +306,21 @@ export class BundlerService {
       if (bundleSim.failedOpIndex !== undefined) {
         const failed = checkedEntries[bundleSim.failedOpIndex];
         if (failed) {
-          this.mempool.remove(failed.userOpHash);
-          this.mempool.reputation.penalize(failed.userOp.sender, "sender");
+          this.mempool.remove(failed.entry.userOpHash);
+          this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
         }
       }
       return {
         submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.userOpHash),
+        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
         error: `Bundle simulation failed: ${bundleSim.errorMessage}`,
       };
     }
 
     // Profitability check
-    const actualGasCosts = checkedEntries.map((entry) => {
-      const opGasPrice = calcUserOpGasPrice(entry.userOp, baseFee);
-      return calcUserOpMaxGas(entry.userOp) * opGasPrice;
+    const actualGasCosts = checkedEntries.map((checked) => {
+      const opGasPrice = calcUserOpGasPrice(checked.entry.userOp, baseFee);
+      return calcUserOpMaxGas(checked.entry.userOp) * opGasPrice;
     });
 
     const profitResult = checkBundleProfitability({
@@ -309,7 +333,7 @@ export class BundlerService {
     if (!profitResult.profitable) {
       return {
         submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.userOpHash),
+        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
         error: `Unprofitable: ${profitResult.marginBps}bps < ${this.config.minProfitMarginBps}bps`,
       };
     }
@@ -320,9 +344,33 @@ export class BundlerService {
     if (!balanceCheck.sufficient) {
       return {
         submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.userOpHash),
+        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
         error: `Insufficient balance: ${balanceCheck.spendableBalance} < ${balanceCheck.requiredBalance}`,
       };
+    }
+
+    // Final time-range re-check right before submission to guard against expiry
+    for (const checked of checkedEntries) {
+      const acctVD = parseValidationData(checked.accountValidationData);
+      if (!isValidTimeRange(acctVD.validAfter, acctVD.validUntil, 10)) {
+        this.mempool.remove(checked.entry.userOpHash);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `UserOp ${checked.entry.userOpHash} expired before submission (validUntil=${acctVD.validUntil})`,
+        };
+      }
+      if (checked.paymasterValidationData !== 0n) {
+        const pmVD = parseValidationData(checked.paymasterValidationData);
+        if (!isValidTimeRange(pmVD.validAfter, pmVD.validUntil, 10)) {
+          this.mempool.remove(checked.entry.userOpHash);
+          return {
+            submitted: false,
+            userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+            error: `UserOp ${checked.entry.userOpHash} paymaster expired before submission`,
+          };
+        }
+      }
     }
 
     // Reserve balance atomically
@@ -337,7 +385,7 @@ export class BundlerService {
     });
 
     const calldata = encodeHandleOps(packedOps, beneficiary);
-    const userOpHashes = checkedEntries.map((e) => e.userOpHash);
+    const userOpHashes = checkedEntries.map((e) => e.entry.userOpHash);
 
     try {
       const txHash = await walletClient.sendTransaction({
@@ -355,16 +403,27 @@ export class BundlerService {
       );
 
       // Remove from mempool
-      for (const entry of checkedEntries) {
+      const submittedEntries = checkedEntries.map((e) => e.entry);
+      for (const entry of submittedEntries) {
         this.mempool.remove(entry.userOpHash);
         this.mempool.reputation.updateIncluded(entry.userOp.sender, "sender");
       }
 
-      // Process receipt in background
-      this.processReceipt(txHash, checkedEntries, eoa.address, expectedCost, rpcOverride)
+      // Lock EOA until receipt is confirmed to prevent double-spend
+      this.accountService.lockManager.lockEOA(eoa.address, "LOCKED_PENDING_UNKNOWN");
+
+      // Process receipt in background — unlocks EOA on success
+      this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
+        .then(() => {
+          // Re-init EOA to restore ACTIVE state with updated nonce
+          this.accountService.lockManager.initEOA(
+            eoa.address,
+            rpcOverride ? getPublicClient(rpcOverride) : this.publicClient,
+          ).catch(() => {/* best effort */});
+        })
         .catch((err) => {
           console.error("[Bundler] Failed to process receipt:", err);
-          // Fail closed: lock the EOA if we can't confirm
+          // Fail closed: keep locked if we can't confirm
           this.accountService.lockManager.lockEOA(
             eoa.address,
             "LOCKED_PENDING_UNKNOWN",

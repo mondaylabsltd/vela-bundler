@@ -168,12 +168,18 @@ export class ReputationManager {
 
   /**
    * Hourly decay: reduce opsSeen by half to allow entities to recover.
+   * Also prunes entries that have decayed to zero and are stale (>24h).
    */
   decay(): void {
-    for (const entry of this.entries.values()) {
+    const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [key, entry] of this.entries) {
       entry.opsSeen = Math.floor(entry.opsSeen / 2);
       entry.opsIncluded = Math.floor(entry.opsIncluded / 2);
       this.updateStatus(entry);
+      // Remove fully-decayed, stale entries to prevent unbounded growth
+      if (entry.opsSeen === 0 && entry.opsIncluded === 0 && entry.lastUpdated < staleThreshold) {
+        this.entries.delete(key);
+      }
     }
   }
 }
