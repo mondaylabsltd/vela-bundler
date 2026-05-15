@@ -478,18 +478,58 @@ export class BundlerService {
     } catch (err) {
       // Release reservation on submission failure
       this.accountService.releaseBalance(eoa.address, expectedCost);
-      console.error("[Bundler] Failed to submit bundle:", err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error("[Bundler] Failed to submit bundle:", errorMsg);
 
-      // Fail closed if state uncertain
-      this.accountService.lockManager.lockEOA(
-        eoa.address,
-        "LOCKED_PENDING_UNKNOWN",
-      );
+      // Store failed receipts so wallet gets immediate feedback via
+      // eth_getUserOperationReceipt instead of polling until timeout.
+      for (const checked of checkedEntries) {
+        const entry = checked.entry;
+        if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
+          const oldest = this.receiptStore.keys().next().value;
+          if (oldest !== undefined) this.receiptStore.delete(oldest);
+        }
+        this.receiptStore.set(entry.userOpHash, {
+          receipt: {
+            userOpHash: entry.userOpHash as `0x${string}`,
+            entryPoint: this.config.entryPointAddress,
+            sender: entry.userOp.sender,
+            nonce: entry.userOp.nonce ?? 0n,
+            paymaster: null,
+            actualGasCost: 0n,
+            actualGasUsed: 0n,
+            success: false,
+            logs: [],
+            receipt: {
+              transactionHash: "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
+              transactionIndex: 0,
+              blockHash: "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
+              blockNumber: 0n,
+              from: eoa.address,
+              to: this.config.entryPointAddress,
+              cumulativeGasUsed: 0n,
+              gasUsed: 0n,
+              effectiveGasPrice: 0n,
+            },
+          },
+          expiresAt: Date.now() + RECEIPT_TTL_MS,
+        });
+      }
+
+      // Re-check nonce to determine if we should lock or recover
+      try {
+        await this.accountService.lockManager.initEOA(
+          eoa.address,
+          this.publicClient as PublicClient<Transport, Chain>,
+        );
+      } catch {
+        this.accountService.lockManager.lockEOA(eoa.address, "LOCKED_PENDING_UNKNOWN");
+      }
 
       return {
         submitted: false,
         userOpHashes,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMsg,
       };
     }
   }
