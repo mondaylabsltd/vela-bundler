@@ -17,7 +17,6 @@ import { validateUserOpFields, UserOpValidationError } from "../userop/validate.
 import { calcPreVerificationGas } from "../gas/preVerificationGas.ts";
 import {
   calcUserOpGasPrice,
-  checkUserOpProfitability,
   calcUserOpMaxGas,
   calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
@@ -188,32 +187,28 @@ async function handleSendUserOperation(
     );
   }
 
+  // Gas price range check: the user's intended bundler gas price (userOpMaxFee / 1.3)
+  // must be within 0.2x ~ 2x of the current on-chain gas price.
+  // This replaces the old profitability + cap checks — the bundler now uses the
+  // user-provided gas price to submit the tx, so the 30% margin is guaranteed.
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-  if (!checkUserOpProfitability({
-    userOpGasPrice,
-    outerTxEffectiveGasPrice: outerGas.effectiveGasPrice,
-    marginBps: config.minProfitMarginBps,
-  })) {
+  // Derive the bundler gas price the user intended: userOpGasPrice / 1.3
+  const intendedBundlerPrice = (userOpGasPrice * 10n) / 13n;
+  const minAllowedPrice = (outerGas.effectiveGasPrice * 2n) / 10n;  // 0.2x
+  const maxAllowedPrice = outerGas.effectiveGasPrice * 2n;           // 2.0x
+
+  if (intendedBundlerPrice < minAllowedPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      "UserOperation gas price too low for profitability requirements",
+      `Gas price too low: intended bundler price ${intendedBundlerPrice} < ` +
+      `minimum ${minAllowedPrice} (0.2× network rate ${outerGas.effectiveGasPrice})`,
     );
   }
-
-  // Cap: reject UserOps with excessive gas price to protect users from overpaying.
-  // EntryPoint charges sender at effectiveGasPrice = min(maxFee, baseFee+maxPriority).
-  // If this is much higher than the bundler's actual tx cost, the excess becomes
-  // pure profit — attracts MEV bots and overcharges users.
-  // Margin >50% means the UserOp is paying 1.5x+ the actual cost — reject it.
-  const MAX_MARGIN_BPS = 5000; // 50%
-  const maxAllowedPrice =
-    (outerGas.effectiveGasPrice * BigInt(10000 + MAX_MARGIN_BPS)) / 10000n;
-  if (userOpGasPrice > maxAllowedPrice) {
+  if (intendedBundlerPrice > maxAllowedPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `UserOperation gas price too high: ${userOpGasPrice} exceeds ` +
-      `${MAX_MARGIN_BPS / 100}% cap over network rate ${outerGas.effectiveGasPrice}. ` +
-      `Lower maxFeePerGas to at most ${maxAllowedPrice}.`,
+      `Gas price too high: intended bundler price ${intendedBundlerPrice} > ` +
+      `maximum ${maxAllowedPrice} (2× network rate ${outerGas.effectiveGasPrice})`,
     );
   }
 

@@ -30,7 +30,6 @@ import type {
 import { encodeHandleOps } from "../userop/encode.ts";
 import {
   calcUserOpGasPrice,
-  calcOuterTxGasPrice,
   checkBundleProfitability,
   calcUserOpMaxGas,
 } from "../gas/profitability.ts";
@@ -235,12 +234,23 @@ export class BundlerService {
 
     const gasPrices = await this.simulator.getGasPrices(rpcOverride);
     const baseFee = gasPrices.baseFee;
-    const outerGas = calcOuterTxGasPrice({
-      currentBaseFee: baseFee,
-      baseFeeMultiplier: this.config.baseFeeMultiplier,
-      bundlerTipGwei: this.config.bundlerTipGwei,
-      chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
-    });
+
+    // Derive outer tx gas price from the first UserOp's maxFeePerGas.
+    // The wallet sets userOpMaxFee = intendedBundlerPrice × 1.3, so:
+    //   intendedBundlerPrice = userOpMaxFee / 1.3
+    // The bundler uses this as the actual on-chain gas price, guaranteeing
+    // the 30% margin between what EntryPoint charges and what the bundler pays.
+    const firstUserOp = entries[0]!.userOp;
+    const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
+    const intendedGasPrice = (userOpEffective * 10n) / 13n;
+
+    // Use the user's intended price, but ensure it's at least baseFee
+    const effectivePrice = intendedGasPrice > baseFee ? intendedGasPrice : baseFee;
+    const outerGas = {
+      maxFeePerGas: effectivePrice + (gasPrices.suggestedMaxPriorityFeePerGas ?? 0n),
+      maxPriorityFeePerGas: gasPrices.suggestedMaxPriorityFeePerGas ?? 0n,
+      effectiveGasPrice: effectivePrice,
+    };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
     const validEntries: MempoolEntry[] = [];
