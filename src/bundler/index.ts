@@ -244,12 +244,12 @@ export class BundlerService {
     const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
     const intendedGasPrice = (userOpEffective * 10n) / 13n;
 
-    // Use the user's intended price, but ensure it's at least baseFee
-    const effectivePrice = intendedGasPrice > baseFee ? intendedGasPrice : baseFee;
+    // Use the user's intended price directly — if below baseFee, the tx
+    // waits until baseFee drops (slow but cheaper, which is what the user chose).
     const outerGas = {
-      maxFeePerGas: effectivePrice + (gasPrices.suggestedMaxPriorityFeePerGas ?? 0n),
-      maxPriorityFeePerGas: gasPrices.suggestedMaxPriorityFeePerGas ?? 0n,
-      effectiveGasPrice: effectivePrice,
+      maxFeePerGas: intendedGasPrice,
+      maxPriorityFeePerGas: 0n,
+      effectiveGasPrice: intendedGasPrice,
     };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
