@@ -506,28 +506,73 @@ export class BundlerService {
         ? getPublicClient(rpcOverride)
         : this.publicClient;
 
-      // Retry receipt polling up to 3 times with increasing timeout.
-      // Avoids locking the EOA just because the RPC is slow.
+      // Poll for receipt with dropped-tx detection.
+      // Between receipt polls, check if the tx is still in the mempool.
+      // If pendingNonce == latestNonce, the tx was dropped — fail fast.
       let receipt;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      const maxAttempts = 60; // 60 × 4s = 240s max
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          receipt = await receiptClient.waitForTransactionReceipt({
-            hash: txHash,
-            timeout: 120_000, // 2 min per attempt
-          });
-          break;
-        } catch (err) {
-          if (attempt < 2) {
-            console.warn(
-              `[Bundler] Receipt poll attempt ${attempt + 1} failed for ${txHash}, retrying...`,
-            );
-            await new Promise((r) => setTimeout(r, 5_000));
-          } else {
-            throw err;
+          receipt = await receiptClient.getTransactionReceipt({ hash: txHash });
+          if (receipt) break;
+        } catch {
+          // getTransactionReceipt returns null or throws if not found — continue polling
+        }
+
+        // Every 5 polls (~20s), check if the tx was dropped from mempool
+        if (attempt > 0 && attempt % 5 === 0) {
+          try {
+            const [latestNonce, pendingNonce] = await Promise.all([
+              receiptClient.getTransactionCount({ address: eoaAddress, blockTag: "latest" }),
+              receiptClient.getTransactionCount({ address: eoaAddress, blockTag: "pending" }),
+            ]);
+            if (pendingNonce <= latestNonce) {
+              // No pending tx — it was dropped from mempool
+              console.warn(
+                `[Bundler] Tx ${txHash} dropped from mempool (pending=${pendingNonce}, latest=${latestNonce}). Marking UserOps as failed.`,
+              );
+              // Store a failed receipt so wallet gets immediate feedback
+              for (const entry of entries) {
+                if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
+                  const oldest = this.receiptStore.keys().next().value;
+                  if (oldest !== undefined) this.receiptStore.delete(oldest);
+                }
+                this.receiptStore.set(entry.userOpHash, {
+                  receipt: {
+                    userOpHash: entry.userOpHash as `0x${string}`,
+                    entryPoint: this.config.entryPointAddress,
+                    sender: entry.userOp.sender,
+                    nonce: entry.userOp.nonce ?? 0n,
+                    paymaster: null,
+                    actualGasCost: 0n,
+                    actualGasUsed: 0n,
+                    success: false,
+                    logs: [],
+                    receipt: {
+                      transactionHash: txHash,
+                      transactionIndex: 0,
+                      blockHash: "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
+                      blockNumber: 0n,
+                      from: eoaAddress,
+                      to: this.config.entryPointAddress,
+                      cumulativeGasUsed: 0n,
+                      gasUsed: 0n,
+                      effectiveGasPrice: 0n,
+                    },
+                  },
+                  expiresAt: Date.now() + RECEIPT_TTL_MS,
+                });
+              }
+              return; // exit early — finally block releases reservation
+            }
+          } catch {
+            // Nonce check failed — continue polling for receipt
           }
         }
+
+        await new Promise((r) => setTimeout(r, 4_000));
       }
-      if (!receipt) throw new Error(`Receipt not found for ${txHash} after retries`);
+      if (!receipt) throw new Error(`Receipt not found for ${txHash} after polling`);
 
       const logs = parseEventLogs({
         abi: ENTRYPOINT_V07_ABI,
