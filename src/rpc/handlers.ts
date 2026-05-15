@@ -108,32 +108,26 @@ async function handleSendUserOperation(
   const safeAddress = userOp.sender;
   const eoa = await chain.accountService.deriveEOA(safeAddress);
 
-  // Check EOA nonce/lock state
+  // Check EOA nonce/lock state — always refresh from chain to auto-recover
+  // from dropped/confirmed txs (e.g. low gas price txs evicted from mempool).
   const eoaState = chain.accountService.lockManager.getState(eoa.address);
-  if (eoaState) {
-    if (eoaState.status === "LOCKED_PENDING_UNKNOWN") {
-      throw bundlerError(
-        RPC_ERROR_CODES.INVALID_USEROPERATION,
-        "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions.",
-      );
-    }
-    if (eoaState.status === "LOCKED_IN_MEMORY_PENDING") {
-      throw bundlerError(
-        RPC_ERROR_CODES.INVALID_USEROPERATION,
-        "Dedicated bundler EOA is currently processing a bundle. Retry later.",
-      );
-    }
-  } else {
-    const state = await chain.accountService.lockManager.initEOA(
-      eoa.address,
-      chain.accountService.getClient(),
+  if (eoaState?.status === "LOCKED_IN_MEMORY_PENDING") {
+    throw bundlerError(
+      RPC_ERROR_CODES.INVALID_USEROPERATION,
+      "Dedicated bundler EOA is currently processing a bundle. Retry later.",
     );
-    if (state.status === "LOCKED_PENDING_UNKNOWN") {
-      throw bundlerError(
-        RPC_ERROR_CODES.INVALID_USEROPERATION,
-        "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions.",
-      );
-    }
+  }
+  // For LOCKED_PENDING_UNKNOWN or first-time init: re-check chain nonce.
+  // If the pending tx was dropped or confirmed, initEOA will recover to ACTIVE.
+  const freshState = await chain.accountService.lockManager.initEOA(
+    eoa.address,
+    chain.accountService.getClient(),
+  );
+  if (freshState.status === "LOCKED_PENDING_UNKNOWN") {
+    throw bundlerError(
+      RPC_ERROR_CODES.INVALID_USEROPERATION,
+      "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions.",
+    );
   }
 
   // Check balance — use chain-aware gas pricing
