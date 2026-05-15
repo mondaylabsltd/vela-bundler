@@ -20,6 +20,7 @@ import {
   calcUserOpMaxGas,
   calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
+import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 
 /**
  * Dispatch an RPC method to its handler.
@@ -78,7 +79,15 @@ async function handleSendUserOperation(
   }
 
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
-  const rpcOverride = reqCtx.requestRpcUrl;
+  let rpcOverride = reqCtx.requestRpcUrl;
+
+  // If the user's RPC was previously blacklisted and we have a different
+  // chain default (Alchemy / public), skip the bad URL upfront.
+  // For dev networks where chain.rpcUrl === rpcOverride (no alternative), keep using it.
+  if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
+    console.warn(`[RPC] Skipping blacklisted user RPC ${rpcOverride}, using chain default ${chain.rpcUrl}`);
+    rpcOverride = undefined;
+  }
 
   const entryPoint = params[1] as string;
   if (entryPoint.toLowerCase() !== config.entryPointAddress.toLowerCase()) {
@@ -131,7 +140,19 @@ async function handleSendUserOperation(
   }
 
   // Check balance — use chain-aware gas pricing
-  const gasPrices = await chain.simulator.getGasPrices(rpcOverride);
+  let gasPrices;
+  try {
+    gasPrices = await chain.simulator.getGasPrices(rpcOverride);
+  } catch (err) {
+    if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
+      console.warn(`[RPC] getGasPrices failed on user RPC ${rpcOverride}, blacklisting and retrying with chain default ${chain.rpcUrl}`);
+      blacklistRpc(rpcOverride);
+      rpcOverride = undefined;
+      gasPrices = await chain.simulator.getGasPrices(undefined);
+    } else {
+      throw err;
+    }
+  }
   const baseFee = gasPrices.baseFee;
   const outerGas = calcOuterTxGasPrice({
     currentBaseFee: baseFee,
@@ -148,11 +169,29 @@ async function handleSendUserOperation(
     balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, rpcOverride);
     console.log(`[RPC] Balance result: spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
   } catch (err) {
-    console.error(`[RPC] Balance query failed for ${safeAddress}:`, err);
-    throw bundlerError(
-      RPC_ERROR_CODES.INVALID_USEROPERATION,
-      "Failed to query EOA balance — RPC temporarily unavailable",
-    );
+    // If user-provided RPC failed and chain has a different default, blacklist + retry
+    if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
+      console.warn(`[RPC] User RPC ${rpcOverride} failed, blacklisting and retrying with chain default (${chain.rpcUrl})`);
+      blacklistRpc(rpcOverride);
+      rpcOverride = undefined;
+      try {
+        balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, undefined);
+        console.log(`[RPC] Balance result (fallback): spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
+      } catch (retryErr) {
+        console.error(`[RPC] Balance query also failed on chain default RPC:`, retryErr);
+        throw bundlerError(
+          RPC_ERROR_CODES.INVALID_USEROPERATION,
+          "Failed to query EOA balance — RPC temporarily unavailable",
+        );
+      }
+    } else {
+      // No fallback available (dev network or already using chain default)
+      console.error(`[RPC] Balance query failed for ${safeAddress}:`, err);
+      throw bundlerError(
+        RPC_ERROR_CODES.INVALID_USEROPERATION,
+        "Failed to query EOA balance — RPC temporarily unavailable",
+      );
+    }
   }
   if (!balanceCheck.sufficient) {
     throw bundlerError(
@@ -251,6 +290,12 @@ async function handleEstimateUserOperationGas(
   }
 
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
+  let rpcOverride = reqCtx.requestRpcUrl;
+
+  if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
+    console.warn(`[RPC] Skipping blacklisted user RPC ${rpcOverride}, using chain default ${chain.rpcUrl}`);
+    rpcOverride = undefined;
+  }
 
   const entryPoint = params[1] as string;
   if (entryPoint.toLowerCase() !== config.entryPointAddress.toLowerCase()) {
@@ -267,7 +312,18 @@ async function handleEstimateUserOperationGas(
     throw invalidParams("Invalid UserOperation");
   }
 
-  const gasEstimate = await chain.simulator.estimateUserOpGas(userOp, reqCtx.requestRpcUrl);
+  let gasEstimate;
+  try {
+    gasEstimate = await chain.simulator.estimateUserOpGas(userOp, rpcOverride);
+  } catch (err) {
+    if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
+      console.warn(`[RPC] estimateGas failed on user RPC ${rpcOverride}, blacklisting and retrying with chain default ${chain.rpcUrl}`);
+      blacklistRpc(rpcOverride);
+      gasEstimate = await chain.simulator.estimateUserOpGas(userOp, undefined);
+    } else {
+      throw err;
+    }
+  }
 
   const result: Record<string, string> = {
     preVerificationGas: "0x" + gasEstimate.preVerificationGas.toString(16),

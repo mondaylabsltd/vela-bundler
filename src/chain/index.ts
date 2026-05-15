@@ -83,25 +83,26 @@ export class ChainRegistry {
     let publicRpcs: string[] = [];
     let chainInfo: ChainInfo | null = null;
 
-    if (requestRpcUrl) {
-      // User provided their own RPC — use it directly, skip slow registry resolution.
-      rpcUrl = requestRpcUrl;
-      // Still try to fetch chain metadata (name, features) but don't block on RPC health checks.
-      try {
-        const { fetchChainInfo } = await import("../config/chain-registry.ts");
-        chainInfo = await fetchChainInfo(chainId);
-      } catch {
-        // Metadata fetch failed — not critical, proceed without it.
-      }
-    } else {
-      // No user RPC — resolve from registry (includes health check).
-      // Pass Alchemy key for priority RPC selection.
-      try {
-        const resolved = await resolveChain(chainId, this.globalConfig.alchemyApiKey);
-        rpcUrl = resolved.rpcUrl;
-        publicRpcs = resolved.publicRpcs;
-        chainInfo = resolved.chain;
-      } catch (err) {
+    // Always resolve via registry (Alchemy preferred) for the chain's default RPC.
+    // The user-provided requestRpcUrl is only for per-request overrides, not for
+    // the chain's permanent default — otherwise Alchemy would never be used when
+    // the first request carries X-Rpc-Url.
+    try {
+      const resolved = await resolveChain(chainId, this.globalConfig.alchemyApiKey);
+      rpcUrl = resolved.rpcUrl;
+      publicRpcs = resolved.publicRpcs;
+      chainInfo = resolved.chain;
+    } catch (err) {
+      // Registry resolution failed — if user provided an RPC, use it as last resort.
+      if (requestRpcUrl) {
+        rpcUrl = requestRpcUrl;
+        try {
+          const { fetchChainInfo } = await import("../config/chain-registry.ts");
+          chainInfo = await fetchChainInfo(chainId);
+        } catch {
+          // Metadata fetch failed — not critical.
+        }
+      } else {
         throw err;
       }
     }

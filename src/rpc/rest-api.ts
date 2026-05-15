@@ -9,6 +9,7 @@
 import type { ChainRegistry } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
+import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 
 /**
  * Handle REST API routes. Returns a Response if matched, null otherwise.
@@ -71,8 +72,29 @@ async function handleGetAccount(
 
   try {
     const chain = await chainRegistry.getChain(chainId, requestRpcUrl);
-    const effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
-    const info = await chain.accountService.getAccountInfo(safeAddress, effectiveRpc);
+
+    // Skip blacklisted user RPC if chain has a different default (Alchemy / public).
+    // For dev networks where chain.rpcUrl === requestRpcUrl, keep using it.
+    let effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
+    if (requestRpcUrl && isRpcBlacklisted(requestRpcUrl) && hasFallback(requestRpcUrl, chain.rpcUrl)) {
+      console.warn(`[REST] Skipping blacklisted user RPC ${requestRpcUrl}, using chain default ${chain.rpcUrl}`);
+      effectiveRpc = chain.rpcUrl;
+    }
+
+    let info;
+    try {
+      info = await chain.accountService.getAccountInfo(safeAddress, effectiveRpc);
+    } catch (err) {
+      // User RPC failed — blacklist + retry with chain default if alternative exists
+      if (requestRpcUrl && effectiveRpc === requestRpcUrl && hasFallback(requestRpcUrl, chain.rpcUrl)) {
+        console.warn(`[REST] User RPC ${requestRpcUrl} failed, blacklisting and retrying with chain default (${chain.rpcUrl})`);
+        blacklistRpc(requestRpcUrl);
+        effectiveRpc = chain.rpcUrl;
+        info = await chain.accountService.getAccountInfo(safeAddress, effectiveRpc);
+      } else {
+        throw err;
+      }
+    }
 
     return jsonResponse(
       {

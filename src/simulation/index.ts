@@ -710,19 +710,25 @@ export function createSimulator(config: BundlerConfig) {
     suggestedMaxPriorityFeePerGas: bigint;
   }> {
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const GAS_PRICE_TIMEOUT_MS = RPC_TIMEOUT_MS; // 5s per fetch
+
+    function timedFetch(body: object): Promise<Response> {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), GAS_PRICE_TIMEOUT_MS);
+      return fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      }).finally(() => clearTimeout(timer));
+    }
 
     // Fetch baseFee and suggested priority fee in parallel
     const [blockRes, tipRes] = await Promise.allSettled([
-      fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: ["latest", false] }),
-      }).then((r) => r.json()),
-      fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_maxPriorityFeePerGas", params: [] }),
-      }).then((r) => r.json()),
+      timedFetch({ jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: ["latest", false] })
+        .then((r) => r.json()),
+      timedFetch({ jsonrpc: "2.0", id: 2, method: "eth_maxPriorityFeePerGas", params: [] })
+        .then((r) => r.json()),
     ]);
 
     let baseFee = 0n;
@@ -737,11 +743,7 @@ export function createSimulator(config: BundlerConfig) {
       // Fallback for chains that don't support eth_maxPriorityFeePerGas:
       // use eth_gasPrice - baseFee as the implied tip
       try {
-        const gasPriceRes = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "eth_gasPrice", params: [] }),
-        });
+        const gasPriceRes = await timedFetch({ jsonrpc: "2.0", id: 3, method: "eth_gasPrice", params: [] });
         const gasPriceJson = await gasPriceRes.json() as { result?: string };
         if (gasPriceJson.result) {
           const gasPrice = BigInt(gasPriceJson.result);
