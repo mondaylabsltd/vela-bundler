@@ -246,9 +246,12 @@ export class BundlerService {
 
     // Use the user's intended price directly — if below baseFee, the tx
     // waits until baseFee drops (slow but cheaper, which is what the user chose).
+    // Some chains (e.g. Polygon) enforce a minimum priority fee — use the
+    // chain's suggested tip to satisfy this requirement.
+    const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
     const outerGas = {
-      maxFeePerGas: intendedGasPrice,
-      maxPriorityFeePerGas: 0n,
+      maxFeePerGas: intendedGasPrice > tip ? intendedGasPrice : tip,
+      maxPriorityFeePerGas: tip,
       effectiveGasPrice: intendedGasPrice,
     };
 
