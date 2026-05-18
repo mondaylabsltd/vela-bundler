@@ -26,6 +26,7 @@ import { encodeHandleOps } from "../userop/encode.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient, resolveRpcUrl } from "../utils/rpc-client.ts";
 import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
+import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../gas/l2-data-fee.ts";
 
 /** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
 const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
@@ -85,6 +86,25 @@ export function createSimulator(config: BundlerConfig) {
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
     const ep = config.entryPointAddress;
 
+    // Retry once on temporary RPC errors (common on L2 public nodes with stateOverride)
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const result = await _doSimulateValidation(calldata, ep, rpcUrl);
+      if (result.valid || attempt >= MAX_ATTEMPTS) return result;
+      if (result.errorMessage?.includes("Temporary") || result.errorMessage?.includes("internal error")) {
+        console.warn(`[Simulator] simulateValidation temporary error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying...`);
+        continue;
+      }
+      return result;
+    }
+    return { valid: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: "Max retries exceeded" };
+  }
+
+  async function _doSimulateValidation(
+    calldata: `0x${string}`,
+    ep: `0x${string}`,
+    rpcUrl: string,
+  ): Promise<SimulationResult> {
     try {
       const controller = new AbortController();
       const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
@@ -190,6 +210,27 @@ export function createSimulator(config: BundlerConfig) {
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
     const ep = config.entryPointAddress;
 
+    // Retry once on temporary RPC errors (common on L2 public nodes with stateOverride)
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const result = await _doSimulateExecution(calldata, ep, rpcUrl);
+      if (result.success || attempt >= MAX_ATTEMPTS) return result;
+      // Only retry on temporary/internal RPC errors, not on definitive validation failures
+      if (result.errorMessage?.includes("Temporary") || result.errorMessage?.includes("internal error")) {
+        console.warn(`[Simulator] simulateHandleOp temporary error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying...`);
+        continue;
+      }
+      return result;
+    }
+    // Unreachable but satisfies TS
+    return { success: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: "Max retries exceeded" };
+  }
+
+  async function _doSimulateExecution(
+    calldata: `0x${string}`,
+    ep: `0x${string}`,
+    rpcUrl: string,
+  ): Promise<ExecutionSimulationResult> {
     try {
       const controller = new AbortController();
       const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
@@ -642,8 +683,36 @@ export function createSimulator(config: BundlerConfig) {
     const client = clientFor(rpcUrlOverride);
     const { calcPreVerificationGas } = await import("../gas/preVerificationGas.ts");
 
+    // For L2 rollups, estimate the L1 data fee component in gas units.
+    // - Arbitrum: NodeInterface.gasEstimateL1Component → gas units directly
+    // - OP Stack: GasPriceOracle.getL1Fee → wei, divided by gasPrice → gas units
+    let l2DataFeeGas: bigint | undefined;
+    if (isL2WithDataFee(config.chainId)) {
+      const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+      const packed = packUserOp(userOp);
+      const handleOpsCalldata = encodeHandleOps([packed], config.entryPointAddress);
+
+      if (isArbitrumChain(config.chainId)) {
+        l2DataFeeGas = await estimateArbitrumL1Gas(
+          config.entryPointAddress,
+          handleOpsCalldata,
+          rpcUrl,
+        );
+      } else if (isOpStackChain(config.chainId)) {
+        // OP Stack needs current gas price to convert wei → gas units
+        const { baseFee, suggestedMaxPriorityFeePerGas } = await getGasPrices(rpcUrlOverride);
+        const gasPrice = baseFee + suggestedMaxPriorityFeePerGas;
+        l2DataFeeGas = await estimateOpStackL1Gas(
+          handleOpsCalldata,
+          gasPrice,
+          rpcUrl,
+        );
+      }
+    }
+
     const preVerificationGas = calcPreVerificationGas(userOp, {
       expectedBundleSize: 1,
+      l2DataFeeGas,
     });
 
     const simResult = await simulateValidation(userOp, rpcUrlOverride);

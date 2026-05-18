@@ -127,9 +127,16 @@ export function calcOuterTxGasPrice(params: {
   // Old logic used max(config, chain) which caused the bundler to demand
   // higher gas than the chain needs (e.g. 1.5 gwei on BSC where 1 gwei suffices),
   // inflating costs and creating MEV extraction opportunities.
-  const maxPriorityFeePerGas = chainSuggestedTip && chainSuggestedTip > 0n
-    ? chainSuggestedTip
-    : configTip;
+  let maxPriorityFeePerGas: bigint;
+  if (chainSuggestedTip !== undefined) {
+    // Chain responded — trust its value even if zero.
+    // L2 sequencers (Arbitrum, OP Stack) legitimately return 0 because
+    // there is no MEV auction; a 0.5 gwei configTip would inflate the
+    // effective gas price by 25× on a chain with 0.02 gwei baseFee.
+    maxPriorityFeePerGas = chainSuggestedTip;
+  } else {
+    maxPriorityFeePerGas = configTip;
+  }
 
   const scaledBaseFee = (currentBaseFee * BigInt(Math.ceil(baseFeeMultiplier * 100))) / 100n;
   const maxFeePerGas = scaledBaseFee + maxPriorityFeePerGas;

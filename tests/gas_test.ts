@@ -12,6 +12,7 @@ import {
   calcUserOpMaxGas,
 } from "../src/gas/profitability.ts";
 import { calldataGasCost, countCalldataBytes } from "../src/utils/hex.ts";
+import { isArbitrumChain, isOpStackChain, isL2WithDataFee } from "../src/gas/l2-data-fee.ts";
 import type { UserOperation } from "../src/userop/types.ts";
 
 function makeUserOp(overrides: Partial<UserOperation> = {}): UserOperation {
@@ -103,6 +104,33 @@ Deno.test("calcPreVerificationGas - EIP-7702 auth adds gas", () => {
   });
 
   assertEquals(pvgWithAuth - pvgNoAuth, 50_000n); // 2 * 25000
+});
+
+Deno.test("calcPreVerificationGas - l2DataFeeGas is added to total", () => {
+  const userOp = makeUserOp();
+  const pvgWithout = calcPreVerificationGas(userOp, {
+    expectedBundleSize: 1,
+    slackPercent: 0,
+    minSlack: 0n,
+  });
+  const l2Fee = 500_000n;
+  const pvgWith = calcPreVerificationGas(userOp, {
+    expectedBundleSize: 1,
+    l2DataFeeGas: l2Fee,
+    slackPercent: 0,
+    minSlack: 0n,
+  });
+  assertEquals(pvgWith - pvgWithout, l2Fee);
+});
+
+Deno.test("calcPreVerificationGas - l2DataFeeGas zero/undefined has no effect", () => {
+  const userOp = makeUserOp();
+  const ctx = { expectedBundleSize: 1, slackPercent: 0, minSlack: 0n };
+  const pvgNone = calcPreVerificationGas(userOp, ctx);
+  const pvgZero = calcPreVerificationGas(userOp, { ...ctx, l2DataFeeGas: 0n });
+  const pvgUndef = calcPreVerificationGas(userOp, { ...ctx, l2DataFeeGas: undefined });
+  assertEquals(pvgNone, pvgZero);
+  assertEquals(pvgNone, pvgUndef);
 });
 
 Deno.test("calcPreVerificationGas - minimum slack applied", () => {
@@ -201,6 +229,33 @@ Deno.test("calcOuterTxGasPrice - computes EIP-1559 gas prices", () => {
   assertEquals(result.effectiveGasPrice, 10_000_000_000n + 1_500_000_000n);
 });
 
+Deno.test("calcOuterTxGasPrice - uses chain tip of 0 on L2s like Arbitrum", () => {
+  // Arbitrum: baseFee=0.02 gwei, eth_maxPriorityFeePerGas=0
+  // Should NOT fall back to configTip (0.5 gwei) — that would inflate cost 25×
+  const result = calcOuterTxGasPrice({
+    currentBaseFee: 20_000_000n, // 0.02 gwei
+    baseFeeMultiplier: 1.25,
+    bundlerTipGwei: 0.5,
+    chainSuggestedTip: 0n, // Chain explicitly returned 0
+  });
+
+  // Should use 0 tip, not 500_000_000 (configTip)
+  assertEquals(result.maxPriorityFeePerGas, 0n);
+  assertEquals(result.effectiveGasPrice, 20_000_000n); // baseFee only
+});
+
+Deno.test("calcOuterTxGasPrice - uses chain tip when non-zero", () => {
+  const result = calcOuterTxGasPrice({
+    currentBaseFee: 30_000_000_000n,
+    baseFeeMultiplier: 1.25,
+    bundlerTipGwei: 0.5,
+    chainSuggestedTip: 2_000_000_000n, // Chain says 2 gwei
+  });
+
+  assertEquals(result.maxPriorityFeePerGas, 2_000_000_000n);
+  assertEquals(result.effectiveGasPrice, 30_000_000_000n + 2_000_000_000n);
+});
+
 Deno.test("calcUserOpMaxGas - sums all gas fields", () => {
   const userOp = makeUserOp({
     preVerificationGas: 50_000n,
@@ -213,4 +268,31 @@ Deno.test("calcUserOpMaxGas - sums all gas fields", () => {
 
   const maxGas = calcUserOpMaxGas(userOp);
   assertEquals(maxGas, 50_000n + 100_000n + 200_000n + 50_000n + 30_000n);
+});
+
+// --- L2 chain detection ---
+
+Deno.test("isArbitrumChain - detects Arbitrum One and Sepolia", () => {
+  assert(isArbitrumChain(42161));
+  assert(isArbitrumChain(421614));
+  assert(!isArbitrumChain(1));
+  assert(!isArbitrumChain(10));
+});
+
+Deno.test("isOpStackChain - detects Optimism and Base", () => {
+  assert(isOpStackChain(10));
+  assert(isOpStackChain(8453));
+  assert(isOpStackChain(11155420));
+  assert(isOpStackChain(84532));
+  assert(!isOpStackChain(42161));
+  assert(!isOpStackChain(1));
+});
+
+Deno.test("isL2WithDataFee - covers both Arbitrum and OP Stack", () => {
+  assert(isL2WithDataFee(42161));
+  assert(isL2WithDataFee(10));
+  assert(isL2WithDataFee(8453));
+  assert(!isL2WithDataFee(1));
+  assert(!isL2WithDataFee(56));
+  assert(!isL2WithDataFee(137));
 });

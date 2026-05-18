@@ -4,6 +4,13 @@
 
 export { calcPreVerificationGas, type PreVerificationGasContext } from "./preVerificationGas.ts";
 export {
+  isL2WithDataFee,
+  isArbitrumChain,
+  isOpStackChain,
+  estimateArbitrumL1Gas,
+  estimateOpStackL1Gas,
+} from "./l2-data-fee.ts";
+export {
   calcUserOpGasPrice,
   calcExpectedRevenue,
   calcExpectedCost,
