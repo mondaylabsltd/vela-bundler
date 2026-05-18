@@ -31,6 +31,7 @@ import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas
 /** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
 const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
 
+
 export interface SimulationResult {
   valid: boolean;
   validationResult?: ValidationResultInfo;
