@@ -122,32 +122,33 @@ export class SponsorService {
       return { sponsored: false, reason: "nonce_exceeded" };
     }
 
-    // 4. WebAuthn public key check — must be a registered Vela user
+    // 4. User wallet balance check — Safe must hold ≥ 2× the sponsor amount.
+    //    Prevents empty wallets from draining the treasury.
+    const safeBalance = await client.getBalance({ address: safeAddress });
+    const gasPrice = await client.getGasPrice();
+    const serverEstimate = gasPrice * 600_000n * 2n;
+    let targetBalance = serverEstimate;
+    if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
+    const sponsorAmount = targetBalance > MAX_SPONSOR_AMOUNT ? MAX_SPONSOR_AMOUNT : targetBalance;
+    if (safeBalance < sponsorAmount * 2n) {
+      return { sponsored: false, reason: "wallet_balance_too_low" };
+    }
+
+    // 5. WebAuthn public key check — must be a registered Vela user
     const hasPasskey = await this.checkWebAuthnRegistration(safeAddress);
     if (!hasPasskey) {
       return { sponsored: false, reason: "no_passkey_registered" };
     }
 
-    // 5. Treasury balance check
+    // 6. Treasury balance check
     const treasuryAddress = this.config.treasuryAddress;
     const treasuryBalance = await client.getBalance({ address: treasuryAddress });
     if (treasuryBalance < TREASURY_FLOOR + MAX_SPONSOR_AMOUNT + TRANSFER_GAS * 1_000_000_000n) {
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
-    // 6. Calculate amount — server computes its own estimate, uses client hint
-    //    only if it's within a reasonable range. Always capped at MAX_SPONSOR_AMOUNT.
+    // 7. Calculate amount — reuse targetBalance from step 4, subtract existing relayer balance.
     const relayerBalance = await client.getBalance({ address: relayerAddress });
-    const gasPrice = await client.getGasPrice();
-    // Server estimate: 600k gas × gasPrice × 2x reserve
-    const serverEstimate = gasPrice * 600_000n * 2n;
-    // Use the higher of server estimate and client hint (client may know about
-    // L2 data fees etc.), but never exceed MAX_SPONSOR_AMOUNT
-    let targetBalance = serverEstimate;
-    if (clientHintWei && clientHintWei > targetBalance) {
-      // Client claims more is needed — trust it up to MAX_SPONSOR_AMOUNT
-      targetBalance = clientHintWei;
-    }
     let amount = targetBalance > relayerBalance ? targetBalance - relayerBalance : 0n;
     if (amount <= 0n) {
       return { sponsored: false, reason: "already_funded" };
