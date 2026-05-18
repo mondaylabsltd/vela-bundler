@@ -106,7 +106,7 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
     bundlingMode: env("BUNDLING_MODE", "auto") as "auto" | "manual",
     maxBundleSize: parseInt(env("MAX_BUNDLE_SIZE", "10")),
     maxBundleGas: BigInt(env("MAX_BUNDLE_GAS", "5000000")),
-    minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "1000000")),
+    minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "0")),
 
     minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "1000")),
     targetProfitMarginBps: parseInt(env("TARGET_PROFIT_MARGIN_BPS", "2000")),
