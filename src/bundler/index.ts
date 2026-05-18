@@ -223,15 +223,17 @@ export class BundlerService {
     const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
     const intendedGasPrice = (userOpEffective * 10n) / 16n;
 
-    // Use the user's intended price directly — if below baseFee, the tx
-    // waits until baseFee drops (slow but cheaper, which is what the user chose).
-    // Some chains (e.g. Polygon) enforce a minimum priority fee — use the
-    // chain's suggested tip to satisfy this requirement.
+    // Floor: some chains (Gnosis, etc.) enforce a minimum gas price that may be
+    // much higher than the user's intended price. Use eth_gasPrice as floor.
     const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
+    const chainFloor = gasPrices.chainGasPrice ?? 0n;
+    let outerMaxFee = intendedGasPrice;
+    if (outerMaxFee < tip) outerMaxFee = tip;
+    if (outerMaxFee < chainFloor) outerMaxFee = chainFloor;
     const outerGas = {
-      maxFeePerGas: intendedGasPrice > tip ? intendedGasPrice : tip,
-      maxPriorityFeePerGas: tip,
-      effectiveGasPrice: intendedGasPrice,
+      maxFeePerGas: outerMaxFee,
+      maxPriorityFeePerGas: tip > chainFloor ? tip : chainFloor,
+      effectiveGasPrice: intendedGasPrice > chainFloor ? intendedGasPrice : chainFloor,
     };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
