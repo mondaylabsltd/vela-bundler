@@ -83,12 +83,11 @@ export class SponsorService {
     const safeLower = safeAddress.toLowerCase();
     const relayerLower = relayerAddress.toLowerCase();
 
-    // 1. Rate limit
+    // 1. Rate limit — only blocks if a previous sponsorship SUCCEEDED recently
     const lastTime = this.lastAttempt.get(safeLower);
     if (lastTime && Date.now() - lastTime < RATE_LIMIT_COOLDOWN_MS) {
       return { sponsored: false, reason: "rate_limited" };
     }
-    this.lastAttempt.set(safeLower, Date.now());
 
     // 2. Concurrency guard
     if (this.pending.has(relayerLower)) {
@@ -97,7 +96,12 @@ export class SponsorService {
     this.pending.add(relayerLower);
 
     try {
-      return await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl, clientHintWei);
+      const result = await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl, clientHintWei);
+      // Only set cooldown on successful sponsorship — failed attempts can retry immediately
+      if (result.sponsored) {
+        this.lastAttempt.set(safeLower, Date.now());
+      }
+      return result;
     } finally {
       this.pending.delete(relayerLower);
     }
