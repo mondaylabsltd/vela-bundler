@@ -223,17 +223,23 @@ export class BundlerService {
     const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
     const intendedGasPrice = (userOpEffective * 10n) / 16n;
 
-    // Floor: some chains (Gnosis, etc.) enforce a minimum gas price that may be
-    // much higher than the user's intended price. Use eth_gasPrice as floor.
+    // The outer tx gas price should reflect the actual chain rate, not the
+    // user's intended price. The UserOp's inflated maxFeePerGas is for
+    // EntryPoint accounting (bundler profit margin). Using it for the outer
+    // tx wastes EOA balance and can cause "insufficient MaxFeePerGas for
+    // sender balance" on chains with very low gas (Gnosis: ~200 wei).
+    //
+    // Strategy: use chainGasPrice × 2 as maxFeePerGas (generous headroom for
+    // block-to-block fluctuation), with intendedGasPrice as absolute cap
+    // (never pay more than the user authorized).
     const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
-    const chainFloor = gasPrices.chainGasPrice ?? 0n;
-    let outerMaxFee = intendedGasPrice;
-    if (outerMaxFee < tip) outerMaxFee = tip;
-    if (outerMaxFee < chainFloor) outerMaxFee = chainFloor;
+    const chainRate = gasPrices.chainGasPrice > 0n ? gasPrices.chainGasPrice : (baseFee + tip);
+    const outerMaxFee = chainRate * 2n < intendedGasPrice ? chainRate * 2n : intendedGasPrice;
+    const outerTip = tip > 0n ? tip : chainRate / 10n;
     const outerGas = {
-      maxFeePerGas: outerMaxFee,
-      maxPriorityFeePerGas: tip > chainFloor ? tip : chainFloor,
-      effectiveGasPrice: intendedGasPrice > chainFloor ? intendedGasPrice : chainFloor,
+      maxFeePerGas: outerMaxFee > outerTip ? outerMaxFee : outerTip,
+      maxPriorityFeePerGas: outerTip,
+      effectiveGasPrice: chainRate,
     };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
