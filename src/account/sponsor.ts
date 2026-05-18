@@ -34,8 +34,8 @@ const TREASURY_FLOOR = 10_000_000_000_000_000n;
 /** Cooldown between sponsorship attempts for the same Safe address (5 min). */
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 
-/** Gas for a simple ETH transfer. */
-const TRANSFER_GAS = 21_000n;
+/** Fallback gas limit for ETH transfers (L2s like Arbitrum need more than 21k). */
+const TRANSFER_GAS_FALLBACK = 100_000n;
 
 /** Timeout for waiting on tx confirmation. */
 const CONFIRM_TIMEOUT_MS = 15_000;
@@ -143,7 +143,7 @@ export class SponsorService {
     // 6. Treasury balance check
     const treasuryAddress = this.config.treasuryAddress;
     const treasuryBalance = await client.getBalance({ address: treasuryAddress });
-    if (treasuryBalance < TREASURY_FLOOR + MAX_SPONSOR_AMOUNT + TRANSFER_GAS * 1_000_000_000n) {
+    if (treasuryBalance < TREASURY_FLOOR + MAX_SPONSOR_AMOUNT + TRANSFER_GAS_FALLBACK * 1_000_000_000n) {
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
@@ -174,13 +174,25 @@ export class SponsorService {
       `[Sponsor] ${treasuryAddress} → ${relayerAddress} (chain ${chainId}): ${amount} wei`,
     );
 
+    // Estimate gas — L2s like Arbitrum need more than 21k for simple transfers
+    let transferGas = TRANSFER_GAS_FALLBACK;
+    try {
+      const estimated = await client.estimateGas({
+        account: treasuryAddress,
+        to: relayerAddress,
+        value: amount,
+      });
+      transferGas = (estimated * 120n) / 100n; // 20% buffer
+      if (transferGas < 21_000n) transferGas = 21_000n;
+    } catch { /* use fallback */ }
+
     try {
       const txHash = await walletClient.sendTransaction({
         to: relayerAddress,
         value: amount,
         maxFeePerGas: maxFee,
         maxPriorityFeePerGas: tip,
-        gas: TRANSFER_GAS,
+        gas: transferGas,
         chain: null,
         account,
       });

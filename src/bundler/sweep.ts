@@ -16,7 +16,9 @@ import { privateKeyToAccount } from "viem/accounts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 
-const SWEEP_GAS = 21_000n;
+/** Fallback gas limit for simple ETH transfers. Arbitrum and other L2s may need
+ *  more than 21k due to L1 data fees counted in gas. */
+const SWEEP_GAS_FALLBACK = 100_000n;
 
 /** Fraction of balance to sweep: 25% (numerator / denominator). */
 const SWEEP_FRACTION_NUM = 25n;
@@ -71,7 +73,20 @@ export async function executeSweep(params: {
     }
 
     const gasPrice = baseFee + tip;
-    const sweepGasCost = SWEEP_GAS * gasPrice;
+
+    // Estimate gas for the transfer — L2s like Arbitrum need more than 21k
+    let sweepGas = SWEEP_GAS_FALLBACK;
+    try {
+      const estimated = await client.estimateGas({
+        account: eoaAddress,
+        to: treasuryAddress,
+        value: 1n, // minimal value for estimation
+      });
+      sweepGas = (estimated * 120n) / 100n; // 20% buffer
+      if (sweepGas < 21_000n) sweepGas = 21_000n;
+    } catch { /* use fallback */ }
+
+    const sweepGasCost = sweepGas * gasPrice;
 
     // 25% of current balance, minus gas cost for the sweep tx
     const sweepable = (balance * SWEEP_FRACTION_NUM) / SWEEP_FRACTION_DEN - sweepGasCost;
@@ -91,7 +106,7 @@ export async function executeSweep(params: {
       value: sweepable,
       maxFeePerGas: baseFee * 2n + tip,
       maxPriorityFeePerGas: tip,
-      gas: SWEEP_GAS,
+      gas: sweepGas,
       chain: null,
       account,
     });
