@@ -220,28 +220,19 @@ async function handleSendUserOperation(
     );
   }
 
-  // Gas price range check: the user's intended bundler gas price (userOpMaxFee / 1.6)
-  // must be within 0.2x ~ 2x of the current on-chain gas price.
-  // This replaces the old profitability + cap checks — the bundler now uses the
-  // user-provided gas price to submit the tx, so the 60% margin is guaranteed.
+  // Gas price sanity check: the user's intended bundler gas price must not be
+  // absurdly below the network rate. No upper bound — if the user overpays,
+  // that's their choice (and it helps on chains like Gnosis where the wallet's
+  // MIN_FEE floor may be much higher than the actual ~1 wei gas price).
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-  // Derive the bundler gas price the user intended: userOpGasPrice / 1.6
   const intendedBundlerPrice = (userOpGasPrice * 10n) / 16n;
   const minAllowedPrice = (outerGas.effectiveGasPrice * 2n) / 10n;  // 0.2x
-  const maxAllowedPrice = outerGas.effectiveGasPrice * 2n;           // 2.0x
 
   if (intendedBundlerPrice < minAllowedPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `Gas price too low: intended bundler price ${intendedBundlerPrice} < ` +
       `minimum ${minAllowedPrice} (0.2× network rate ${outerGas.effectiveGasPrice})`,
-    );
-  }
-  if (intendedBundlerPrice > maxAllowedPrice) {
-    throw bundlerError(
-      RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `Gas price too high: intended bundler price ${intendedBundlerPrice} > ` +
-      `maximum ${maxAllowedPrice} (2× network rate ${outerGas.effectiveGasPrice})`,
     );
   }
 
