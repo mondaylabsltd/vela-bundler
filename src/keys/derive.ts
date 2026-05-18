@@ -69,6 +69,52 @@ export async function deriveEOAPrivateKey(
   throw new Error("Failed to derive valid secp256k1 key after 256 attempts");
 }
 
+// ---------------------------------------------------------------------------
+// Treasury key derivation — same address on every chain
+// ---------------------------------------------------------------------------
+
+const TREASURY_INFO = "treasury";
+
+/**
+ * Derive the treasury private key from the operator secret.
+ * Uses a fixed info string (no chainId/safeAddress) so the treasury
+ * address is identical across all chains.
+ */
+export async function deriveTreasuryPrivateKey(
+  operatorSecret: string,
+): Promise<`0x${string}`> {
+  const ikm = hexToBytes(operatorSecret);
+  const salt = new TextEncoder().encode(DOMAIN_SEPARATOR);
+  const infoBytes = new TextEncoder().encode(TREASURY_INFO);
+
+  for (let counter = 0; counter < 256; counter++) {
+    const info = counter === 0
+      ? infoBytes
+      : new TextEncoder().encode(`${TREASURY_INFO}|counter=${counter}`);
+    const derived = await hkdfSha256(ikm, salt, info, 32);
+    const keyBigInt = bytesToBigInt(derived);
+    if (keyBigInt > 0n && keyBigInt < SECP256K1_N) {
+      return ("0x" + bytesToHex(derived)) as `0x${string}`;
+    }
+  }
+  throw new Error("Failed to derive valid treasury key after 256 attempts");
+}
+
+/**
+ * Derive the treasury address from the operator secret.
+ */
+export async function deriveTreasuryAddress(
+  operatorSecret: string,
+): Promise<`0x${string}`> {
+  const privateKey = await deriveTreasuryPrivateKey(operatorSecret);
+  const account = privateKeyToAccount(privateKey);
+  return account.address.toLowerCase() as `0x${string}`;
+}
+
+// ---------------------------------------------------------------------------
+// Per-user EOA address derivation
+// ---------------------------------------------------------------------------
+
 /**
  * Derive the address for a dedicated EOA.
  */

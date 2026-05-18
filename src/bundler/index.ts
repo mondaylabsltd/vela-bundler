@@ -18,7 +18,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
-import { shouldSweep, executeSweep } from "./sweep.ts";
+import { executeSweep } from "./sweep.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import type { Simulator } from "../simulation/index.ts";
 import { Mempool } from "../mempool/index.ts";
@@ -211,38 +211,17 @@ export class BundlerService {
     const rpcOverride = entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
     const effectiveRpc = rpcOverride ?? this.config.rpcUrl;
 
-    // --- Sweep check: before bundling, inside lock ---
-    const eoaState = this.accountService.lockManager.getState(eoa.address);
-    const currentNonce = eoaState?.latestNonce ?? 0;
-    if (
-      eoa.privateKey &&
-      shouldSweep(currentNonce, this.config.sweepInterval, this.config.treasuryAddress)
-    ) {
-      await executeSweep({
-        eoaAddress: eoa.address,
-        eoaPrivateKey: eoa.privateKey,
-        treasuryAddress: this.config.treasuryAddress!,
-        rpcUrl: effectiveRpc,
-        config: this.config,
-      });
-      // Re-init EOA state after sweep (nonce changed)
-      await this.accountService.lockManager.initEOA(
-        eoa.address,
-        getPublicClient(effectiveRpc),
-      );
-    }
-
     const gasPrices = await this.simulator.getGasPrices(rpcOverride);
     const baseFee = gasPrices.baseFee;
 
     // Derive outer tx gas price from the first UserOp's maxFeePerGas.
-    // The wallet sets userOpMaxFee = intendedBundlerPrice × 1.3, so:
-    //   intendedBundlerPrice = userOpMaxFee / 1.3
+    // The wallet sets userOpMaxFee = intendedBundlerPrice × 1.6, so:
+    //   intendedBundlerPrice = userOpMaxFee / 1.6
     // The bundler uses this as the actual on-chain gas price, guaranteeing
-    // the 30% margin between what EntryPoint charges and what the bundler pays.
+    // the 60% margin between what EntryPoint charges and what the bundler pays.
     const firstUserOp = entries[0]!.userOp;
     const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
-    const intendedGasPrice = (userOpEffective * 10n) / 13n;
+    const intendedGasPrice = (userOpEffective * 10n) / 16n;
 
     // Use the user's intended price directly — if below baseFee, the tx
     // waits until baseFee drops (slow but cheaper, which is what the user chose).
@@ -668,6 +647,28 @@ export class BundlerService {
           receipt: opReceipt,
           expiresAt: Date.now() + RECEIPT_TTL_MS,
         });
+      }
+      // Post-bundle sweep: transfer 25% of relayer balance to treasury.
+      // Runs after receipt is confirmed, inside the finally block would be too late
+      // (reservation is released there). Non-fatal — errors are logged and ignored.
+      if (receipt && receipt.status === "success" && this.config.treasuryAddress) {
+        try {
+          const eoaDerived = await this.accountService.deriveEOA(
+            entries[0]!.userOp.sender as `0x${string}`,
+          );
+          if (eoaDerived.privateKey) {
+            const sweepRpc = rpcOverride ?? this.config.rpcUrl;
+            await executeSweep({
+              eoaAddress,
+              eoaPrivateKey: eoaDerived.privateKey,
+              treasuryAddress: this.config.treasuryAddress,
+              rpcUrl: sweepRpc,
+              config: this.config,
+            });
+          }
+        } catch (err) {
+          console.warn(`[Bundler] Post-bundle sweep failed for ${eoaAddress}:`, err);
+        }
       }
     } finally {
       // Always release reservation after confirmation/failure

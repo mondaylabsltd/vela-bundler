@@ -16,15 +16,21 @@ import { loadConfig } from "./src/config/index.ts";
 import { LocalKeyManager } from "./src/keys/local.ts";
 import { ChainRegistry } from "./src/chain/index.ts";
 import { startRpcServer } from "./src/rpc/index.ts";
+import { deriveTreasuryAddress } from "./src/keys/derive.ts";
+import { SponsorService } from "./src/account/sponsor.ts";
 
-function main() {
-  const config = loadConfig();
+async function main() {
+  // Treasury address is always derived from OPERATOR_SECRET (same address on all chains).
+  const secret = Deno.env.get("OPERATOR_SECRET");
+  if (!secret) throw new Error("Missing required environment variable: OPERATOR_SECRET");
+  const treasuryAddress = await deriveTreasuryAddress(secret);
+  const config = loadConfig(treasuryAddress);
 
   console.log(`[Vela Bundler] Starting...`);
   console.log(`  EntryPoint:      ${config.entryPointAddress}`);
   console.log(`  Multi-chain:     yes (chainId per-request)`);
-  console.log(`  Treasury:        ${config.treasuryAddress}`);
-  console.log(`  Sweep interval:  every ${config.sweepInterval} bundles per EOA`);
+  console.log(`  Treasury:        ${config.treasuryAddress} (derived)`);
+  console.log(`  Sweep:           25% of relayer balance after each bundle`);
   console.log(`  Min Margin:      ${config.minProfitMarginBps} bps`);
   console.log(`  Balance Reserve: ${config.balanceReserveMultiplier}x`);
 
@@ -34,8 +40,9 @@ function main() {
   });
 
   const chainRegistry = new ChainRegistry(config, keyManager);
+  const sponsorService = new SponsorService(config);
 
-  startRpcServer(config, chainRegistry);
+  startRpcServer(config, chainRegistry, sponsorService);
 
   console.log(`[Vela Bundler] Ready — listening on ${config.host}:${config.port}`);
 }

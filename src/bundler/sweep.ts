@@ -1,22 +1,29 @@
 /**
- * Treasury sweep — periodically transfer excess balance from dedicated EOAs
- * to the operator's treasury address.
+ * Treasury sweep — after each bundle, transfer 25% of the relayer EOA's
+ * remaining balance to the treasury.
  *
- * Trigger: before bundling, when EOA's nonce is a multiple of sweepInterval.
- * Runs inside the bundle lock so nonce ordering is safe.
- * Failure is non-fatal — sweep is skipped, next trigger will retry.
+ * This keeps the treasury funded for sponsoring new users while leaving
+ * enough balance on the relayer for future transactions.
+ *
+ * Failure is non-fatal — sweep is skipped on error, next bundle will retry.
  */
 
 import {
   createWalletClient,
   http,
-  parseGwei,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import type { BundlerConfig } from "../config/index.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 
 const SWEEP_GAS = 21_000n;
+
+/** Fraction of balance to sweep: 25% (numerator / denominator). */
+const SWEEP_FRACTION_NUM = 25n;
+const SWEEP_FRACTION_DEN = 100n;
+
+/** Minimum sweepable amount — don't bother with dust. */
+const MIN_SWEEPABLE = 10_000n; // 10k wei
 
 export interface SweepResult {
   swept: boolean;
@@ -26,26 +33,9 @@ export interface SweepResult {
 }
 
 /**
- * Check if a sweep should be attempted for this EOA at the given nonce.
- */
-export function shouldSweep(
-  nonce: number,
-  sweepInterval: number,
-  treasuryAddress: `0x${string}` | null,
-): boolean {
-  if (!treasuryAddress) return false;
-  if (sweepInterval <= 0) return false;
-  if (nonce === 0) return false; // Don't sweep on first ever tx
-  return nonce % sweepInterval === 0;
-}
-
-/**
- * Execute a sweep: transfer excess balance to treasury.
+ * Execute a sweep: transfer 25% of the relayer EOA's balance to treasury.
  *
- * retainAmount = currentGasPrice × 10_000_000 (enough for ~10+ future bundles)
- * sweepable = balance - retainAmount - sweepGasCost
- *
- * Must be called inside bundle lock. Non-fatal on failure.
+ * Called after each successful bundle submission. Non-fatal on failure.
  */
 export async function executeSweep(params: {
   eoaAddress: `0x${string}`;
@@ -54,22 +44,20 @@ export async function executeSweep(params: {
   rpcUrl: string;
   config: BundlerConfig;
 }): Promise<SweepResult> {
-  const { eoaAddress, eoaPrivateKey, treasuryAddress, rpcUrl, config } = params;
+  const { eoaAddress, eoaPrivateKey, treasuryAddress, rpcUrl } = params;
 
   try {
     const client = getPublicClient(rpcUrl);
 
-    // Get current balance and gas price
     const [balance, block] = await Promise.all([
       client.getBalance({ address: eoaAddress }),
       client.getBlock({ blockTag: "latest" }),
     ]);
 
-    const baseFee = block.baseFeePerGas ?? parseGwei("1");
-    const configTip = BigInt(Math.ceil(config.bundlerTipGwei * 1e9));
+    const baseFee = block.baseFeePerGas ?? 1_000_000_000n;
 
-    // Query chain-suggested tip to respect chain minimums (Polygon, BSC, etc.)
-    let chainTip = 0n;
+    // Query chain-suggested tip
+    let tip = 0n;
     try {
       const tipRes = await fetch(rpcUrl, {
         method: "POST",
@@ -77,36 +65,21 @@ export async function executeSweep(params: {
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_maxPriorityFeePerGas", params: [] }),
       });
       const tipJson = await tipRes.json() as { result?: string };
-      if (tipJson.result) chainTip = BigInt(tipJson.result);
+      if (tipJson.result) tip = BigInt(tipJson.result);
     } catch {
-      // Fallback: use eth_gasPrice
-      try {
-        const gpRes = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_gasPrice", params: [] }),
-        });
-        const gpJson = await gpRes.json() as { result?: string };
-        if (gpJson.result) {
-          const gp = BigInt(gpJson.result);
-          chainTip = gp > baseFee ? gp - baseFee : gp;
-        }
-      } catch { /* use config default */ }
+      tip = baseFee / 10n || 1n; // 10% of baseFee as fallback
     }
 
-    const tip = chainTip > configTip ? chainTip : configTip;
     const gasPrice = baseFee + tip;
-
-    // Retain enough for future bundles: gasPrice × 10_000_000
-    const retainAmount = gasPrice * 10_000_000n;
     const sweepGasCost = SWEEP_GAS * gasPrice;
-    const sweepable = balance - retainAmount - sweepGasCost;
 
-    if (sweepable <= 0n) {
-      return { swept: false, error: "Balance below retain threshold" };
+    // 25% of current balance, minus gas cost for the sweep tx
+    const sweepable = (balance * SWEEP_FRACTION_NUM) / SWEEP_FRACTION_DEN - sweepGasCost;
+
+    if (sweepable <= MIN_SWEEPABLE) {
+      return { swept: false, error: "Sweepable amount too small" };
     }
 
-    // Send sweep transaction
     const account = privateKeyToAccount(eoaPrivateKey);
     const walletClient = createWalletClient({
       account,
@@ -116,7 +89,7 @@ export async function executeSweep(params: {
     const txHash = await walletClient.sendTransaction({
       to: treasuryAddress,
       value: sweepable,
-      maxFeePerGas: baseFee * 2n + tip, // generous to ensure inclusion
+      maxFeePerGas: baseFee * 2n + tip,
       maxPriorityFeePerGas: tip,
       gas: SWEEP_GAS,
       chain: null,
@@ -124,20 +97,18 @@ export async function executeSweep(params: {
     });
 
     console.log(
-      `[Sweep] ${eoaAddress} → ${treasuryAddress}: ${sweepable} wei (tx: ${txHash})`,
+      `[Sweep] ${eoaAddress} → ${treasuryAddress}: ${sweepable} wei (25% of ${balance}) tx: ${txHash}`,
     );
 
-    // Wait for confirmation (short timeout — don't block bundling too long)
+    // Wait for confirmation (short timeout — don't block too long)
     try {
       await client.waitForTransactionReceipt({ hash: txHash, timeout: 30_000 });
     } catch {
-      // Confirmation timeout is OK — tx is submitted, nonce is consumed
       console.warn(`[Sweep] Confirmation timeout for ${txHash}, continuing`);
     }
 
     return { swept: true, txHash, amount: sweepable };
   } catch (err) {
-    // Sweep failure is non-fatal
     console.warn(
       `[Sweep] Failed for ${eoaAddress}: ${err instanceof Error ? err.message : err}`,
     );

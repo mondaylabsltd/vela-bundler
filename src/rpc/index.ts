@@ -9,6 +9,7 @@ import type { BundlerConfig } from "../config/index.ts";
 import type { ChainRegistry, ChainServices } from "../chain/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import { handleRestApi } from "./rest-api.ts";
+import type { SponsorService } from "../account/sponsor.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import {
   parseError,
@@ -49,6 +50,7 @@ export interface RequestContext {
 export function startRpcServer(
   config: BundlerConfig,
   chainRegistry: ChainRegistry,
+  sponsorService?: SponsorService,
 ): Deno.HttpServer {
   const rateLimitConfig: RateLimitConfig = {
     rateLimitPerMinute: config.apiRateLimitPerMinute,
@@ -105,7 +107,7 @@ export function startRpcServer(
 
       // REST API (/v1/...)
       const restResponse = await handleRestApi(
-        req, url, chainRegistry, config, rateLimitConfig, requestRpcUrl,
+        req, url, chainRegistry, config, rateLimitConfig, requestRpcUrl, sponsorService,
       );
       if (restResponse) return restResponse;
 
@@ -164,6 +166,9 @@ export function startRpcServer(
 
   console.log(`[RPC] Server listening on ${config.host}:${config.port}`);
   console.log(`[RPC] REST API: GET /v1/account/:chainId/:safeAddress`);
+  if (sponsorService) {
+    console.log(`[RPC] REST API: POST /v1/sponsor/:chainId/:safeAddress`);
+  }
   return server;
 }
 

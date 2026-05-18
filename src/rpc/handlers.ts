@@ -220,13 +220,13 @@ async function handleSendUserOperation(
     );
   }
 
-  // Gas price range check: the user's intended bundler gas price (userOpMaxFee / 1.3)
+  // Gas price range check: the user's intended bundler gas price (userOpMaxFee / 1.6)
   // must be within 0.2x ~ 2x of the current on-chain gas price.
   // This replaces the old profitability + cap checks — the bundler now uses the
-  // user-provided gas price to submit the tx, so the 30% margin is guaranteed.
+  // user-provided gas price to submit the tx, so the 60% margin is guaranteed.
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-  // Derive the bundler gas price the user intended: userOpGasPrice / 1.3
-  const intendedBundlerPrice = (userOpGasPrice * 10n) / 13n;
+  // Derive the bundler gas price the user intended: userOpGasPrice / 1.6
+  const intendedBundlerPrice = (userOpGasPrice * 10n) / 16n;
   const minAllowedPrice = (outerGas.effectiveGasPrice * 2n) / 10n;  // 0.2x
   const maxAllowedPrice = outerGas.effectiveGasPrice * 2n;           // 2.0x
 

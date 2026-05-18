@@ -3,7 +3,7 @@
  */
 
 import { assertEquals, assert, assertNotEquals } from "@std/assert";
-import { deriveEOAPrivateKey, deriveEOAAddress } from "../src/keys/derive.ts";
+import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress } from "../src/keys/derive.ts";
 import { LocalKeyManager } from "../src/keys/local.ts";
 
 const TEST_SECRET =
@@ -173,4 +173,32 @@ Deno.test("LocalKeyManager - validates old secrets too", () => {
     threw = true;
   }
   assert(threw, "Should reject invalid old secret");
+});
+
+// --- Treasury derivation ---
+
+Deno.test("deriveTreasuryPrivateKey - deterministic", async () => {
+  const key1 = await deriveTreasuryPrivateKey(TEST_SECRET);
+  const key2 = await deriveTreasuryPrivateKey(TEST_SECRET);
+  assertEquals(key1, key2);
+});
+
+Deno.test("deriveTreasuryAddress - same secret produces same address", async () => {
+  const addr1 = await deriveTreasuryAddress(TEST_SECRET);
+  const addr2 = await deriveTreasuryAddress(TEST_SECRET);
+  assertEquals(addr1, addr2);
+  assert(addr1.startsWith("0x"));
+  assertEquals(addr1.length, 42);
+});
+
+Deno.test("deriveTreasuryAddress - different secret produces different address", async () => {
+  const addr1 = await deriveTreasuryAddress(TEST_SECRET);
+  const addr2 = await deriveTreasuryAddress(TEST_SECRET_2);
+  assertNotEquals(addr1, addr2);
+});
+
+Deno.test("deriveTreasuryAddress - different from per-user EOA", async () => {
+  const treasury = await deriveTreasuryAddress(TEST_SECRET);
+  const userEOA = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
+  assertNotEquals(treasury, userEOA);
 });

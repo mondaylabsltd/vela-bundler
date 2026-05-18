@@ -1,7 +1,8 @@
 /**
  * Bundler configuration.
  *
- * Only OPERATOR_SECRET and TREASURY_ADDRESS are required.
+ * Only OPERATOR_SECRET is required. TREASURY_ADDRESS is derived from
+ * OPERATOR_SECRET if not explicitly set.
  * Multi-chain: chainId comes per-request, not from config.
  * Per-chain services (RPC, mempool, simulator) are lazily created.
  */
@@ -48,6 +49,7 @@ export interface BundlerConfig {
   readonly operatorSecret: string;
   readonly oldOperatorSecrets: string[];
   readonly treasuryAddress: `0x${string}`;
+  /** @deprecated Use treasuryAddress (derived from OPERATOR_SECRET). */
   readonly sweepInterval: number;
   readonly apiRateLimitPerMinute: number;
   readonly balanceReserveMultiplier: number;
@@ -83,9 +85,8 @@ function envCsv(key: string): string[] {
  * Load global bundler configuration.
  * No chain-specific resolution at startup — that happens lazily per-request.
  */
-export function loadConfig(): BundlerConfig {
+export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
   const operatorSecret = env("OPERATOR_SECRET");
-  const treasuryAddress = envHex("TREASURY_ADDRESS");
 
   const eip1559Env = envOptional("USE_EIP1559");
   const useEip1559 = eip1559Env !== undefined ? eip1559Env === "true" : true;

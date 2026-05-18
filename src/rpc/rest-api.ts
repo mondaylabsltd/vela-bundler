@@ -10,6 +10,7 @@ import type { ChainRegistry } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/index.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
+import type { SponsorService } from "../account/sponsor.ts";
 
 /**
  * Handle REST API routes. Returns a Response if matched, null otherwise.
@@ -21,12 +22,13 @@ export async function handleRestApi(
   config: BundlerConfig,
   rateLimitConfig: RateLimitConfig,
   requestRpcUrl?: string,
+  sponsorService?: SponsorService,
 ): Promise<Response | null> {
   if (!url.pathname.startsWith("/v1/")) return null;
 
   const corsHeaders: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url, X-Chain-Id",
   };
 
@@ -48,6 +50,27 @@ export async function handleRestApi(
       chainRegistry,
       config,
       corsHeaders,
+      requestRpcUrl,
+    );
+  }
+
+  // GET /v1/treasury — return the treasury address (same on all chains)
+  if (url.pathname === "/v1/treasury" && req.method === "GET") {
+    return jsonResponse({ address: config.treasuryAddress }, 200, corsHeaders);
+  }
+
+  // POST /v1/sponsor/:chainId/:safeAddress
+  const sponsorMatch = url.pathname.match(
+    /^\/v1\/sponsor\/(\d+)\/(0x[0-9a-fA-F]{40})$/,
+  );
+  if (sponsorMatch && req.method === "POST" && sponsorService) {
+    return await handleSponsor(
+      parseInt(sponsorMatch[1]!),
+      sponsorMatch[2]!.toLowerCase() as `0x${string}`,
+      chainRegistry,
+      config,
+      corsHeaders,
+      sponsorService,
       requestRpcUrl,
     );
   }
@@ -117,6 +140,44 @@ async function handleGetAccount(
   } catch (err) {
     console.error(`[REST] Error for chain ${chainId} / ${safeAddress}:`, err);
     return jsonResponse({ error: "Internal error" }, 500, corsHeaders);
+  }
+}
+
+async function handleSponsor(
+  chainId: number,
+  safeAddress: `0x${string}`,
+  chainRegistry: ChainRegistry,
+  _config: BundlerConfig,
+  corsHeaders: Record<string, string>,
+  sponsorService: SponsorService,
+  requestRpcUrl?: string,
+): Promise<Response> {
+  if (!/^0x[0-9a-f]{40}$/.test(safeAddress)) {
+    return jsonResponse({ error: "Invalid safeAddress" }, 400, corsHeaders);
+  }
+
+  try {
+    const chain = await chainRegistry.getChain(chainId, requestRpcUrl);
+
+    let effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
+    if (requestRpcUrl && isRpcBlacklisted(requestRpcUrl) && hasFallback(requestRpcUrl, chain.rpcUrl)) {
+      effectiveRpc = chain.rpcUrl;
+    }
+
+    // Derive the relayer EOA address for this Safe
+    const eoa = await chain.accountService.deriveEOA(safeAddress);
+
+    const result = await sponsorService.sponsor(
+      chainId,
+      safeAddress,
+      eoa.address,
+      effectiveRpc,
+    );
+
+    return jsonResponse(result, 200, corsHeaders);
+  } catch (err) {
+    console.error(`[REST] Sponsor error for chain ${chainId} / ${safeAddress}:`, err);
+    return jsonResponse({ sponsored: false, reason: "internal_error" }, 500, corsHeaders);
   }
 }
 
