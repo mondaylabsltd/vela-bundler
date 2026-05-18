@@ -65,6 +65,23 @@ export function createSimulator(config: BundlerConfig) {
     return getPublicClient(url);
   }
 
+  /** Build a deduplicated RPC list: user RPC → chain default → publicRpcs. */
+  function buildRpcFallbackList(cfg: BundlerConfig, rpcUrlOverride?: string): string[] {
+    const seen = new Set<string>();
+    const list: string[] = [];
+    const add = (url?: string | null) => { if (url && !seen.has(url)) { seen.add(url); list.push(url); } };
+    add(rpcUrlOverride);      // user-provided RPC first
+    add(cfg.rpcUrl);           // chain default (Alchemy or registry)
+    for (const r of cfg.publicRpcs) add(r); // remaining public RPCs
+    return list;
+  }
+
+  /** Check if an error message indicates a transient RPC issue worth retrying on another node. */
+  function isTransientSimError(msg?: string): boolean {
+    if (!msg) return false;
+    return msg.includes("Temporary") || msg.includes("internal error") || msg.includes("RPC failed") || msg.includes("non-JSON");
+  }
+
   /**
    * Simulate validation of a single UserOperation.
    *
@@ -84,21 +101,24 @@ export function createSimulator(config: BundlerConfig) {
       args: [packed],
     });
 
-    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
     const ep = config.entryPointAddress;
 
-    // Retry once on temporary RPC errors (common on L2 public nodes with stateOverride)
-    const MAX_ATTEMPTS = 2;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Build RPC list: user RPC first (if provided), then chain default, then publicRpcs.
+    // stateOverride (EntryPointSimulations bytecode injection) is flaky on some providers,
+    // so we try multiple RPCs before giving up.
+    const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
+
+    for (let i = 0; i < rpcsToTry.length; i++) {
+      const rpcUrl = rpcsToTry[i]!;
       const result = await _doSimulateValidation(calldata, ep, rpcUrl);
-      if (result.valid || attempt >= MAX_ATTEMPTS) return result;
-      if (result.errorMessage?.includes("Temporary") || result.errorMessage?.includes("internal error")) {
-        console.warn(`[Simulator] simulateValidation temporary error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying...`);
+      if (result.valid) return result;
+      if (isTransientSimError(result.errorMessage)) {
+        console.warn(`[Simulator] simulateValidation failed on ${rpcUrl.slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
         continue;
       }
-      return result;
+      return result; // Definitive failure — don't retry
     }
-    return { valid: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: "Max retries exceeded" };
+    return { valid: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `Simulation failed on all ${rpcsToTry.length} RPCs` };
   }
 
   async function _doSimulateValidation(
@@ -208,23 +228,20 @@ export function createSimulator(config: BundlerConfig) {
       ],
     });
 
-    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
     const ep = config.entryPointAddress;
+    const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
 
-    // Retry once on temporary RPC errors (common on L2 public nodes with stateOverride)
-    const MAX_ATTEMPTS = 2;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    for (let i = 0; i < rpcsToTry.length; i++) {
+      const rpcUrl = rpcsToTry[i]!;
       const result = await _doSimulateExecution(calldata, ep, rpcUrl);
-      if (result.success || attempt >= MAX_ATTEMPTS) return result;
-      // Only retry on temporary/internal RPC errors, not on definitive validation failures
-      if (result.errorMessage?.includes("Temporary") || result.errorMessage?.includes("internal error")) {
-        console.warn(`[Simulator] simulateHandleOp temporary error (attempt ${attempt}/${MAX_ATTEMPTS}), retrying...`);
+      if (result.success) return result;
+      if (isTransientSimError(result.errorMessage)) {
+        console.warn(`[Simulator] simulateHandleOp failed on ${rpcUrl.slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
         continue;
       }
       return result;
     }
-    // Unreachable but satisfies TS
-    return { success: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: "Max retries exceeded" };
+    return { success: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `simulateHandleOp failed on all ${rpcsToTry.length} RPCs` };
   }
 
   async function _doSimulateExecution(
