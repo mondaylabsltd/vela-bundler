@@ -78,6 +78,7 @@ export class SponsorService {
     safeAddress: `0x${string}`,
     relayerAddress: `0x${string}`,
     rpcUrl: string,
+    clientHintWei?: bigint,
   ): Promise<SponsorResult> {
     const safeLower = safeAddress.toLowerCase();
     const relayerLower = relayerAddress.toLowerCase();
@@ -96,7 +97,7 @@ export class SponsorService {
     this.pending.add(relayerLower);
 
     try {
-      return await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl);
+      return await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl, clientHintWei);
     } finally {
       this.pending.delete(relayerLower);
     }
@@ -107,6 +108,7 @@ export class SponsorService {
     safeAddress: `0x${string}`,
     relayerAddress: `0x${string}`,
     rpcUrl: string,
+    clientHintWei?: bigint,
   ): Promise<SponsorResult> {
     const client = getPublicClient(rpcUrl);
 
@@ -129,18 +131,24 @@ export class SponsorService {
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
-    // 6. Calculate amount — cap at MAX_SPONSOR_AMOUNT
-    // Sponsor enough for a few UserOps, capped.
+    // 6. Calculate amount — server computes its own estimate, uses client hint
+    //    only if it's within a reasonable range. Always capped at MAX_SPONSOR_AMOUNT.
     const relayerBalance = await client.getBalance({ address: relayerAddress });
     const gasPrice = await client.getGasPrice();
-    // Target: enough for 600k gas × gasPrice × 2x reserve
-    const targetBalance = gasPrice * 600_000n * 2n;
+    // Server estimate: 600k gas × gasPrice × 2x reserve
+    const serverEstimate = gasPrice * 600_000n * 2n;
+    // Use the higher of server estimate and client hint (client may know about
+    // L2 data fees etc.), but never exceed MAX_SPONSOR_AMOUNT
+    let targetBalance = serverEstimate;
+    if (clientHintWei && clientHintWei > targetBalance) {
+      // Client claims more is needed — trust it up to MAX_SPONSOR_AMOUNT
+      targetBalance = clientHintWei;
+    }
     let amount = targetBalance > relayerBalance ? targetBalance - relayerBalance : 0n;
     if (amount <= 0n) {
       return { sponsored: false, reason: "already_funded" };
     }
     if (amount > MAX_SPONSOR_AMOUNT) amount = MAX_SPONSOR_AMOUNT;
-    // Minimum worthwhile amount: 10,000 wei
     if (amount < 10_000n) {
       return { sponsored: false, reason: "amount_too_small" };
     }

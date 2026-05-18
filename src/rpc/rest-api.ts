@@ -64,6 +64,13 @@ export async function handleRestApi(
     /^\/v1\/sponsor\/(\d+)\/(0x[0-9a-fA-F]{40})$/,
   );
   if (sponsorMatch && req.method === "POST" && sponsorService) {
+    // Parse optional requiredWei from request body
+    let requiredWei: bigint | undefined;
+    try {
+      const body = await req.json() as { requiredWei?: string };
+      if (body.requiredWei) requiredWei = BigInt(body.requiredWei);
+    } catch { /* no body or invalid JSON — use server-side calculation */ }
+
     return await handleSponsor(
       parseInt(sponsorMatch[1]!),
       sponsorMatch[2]!.toLowerCase() as `0x${string}`,
@@ -72,6 +79,7 @@ export async function handleRestApi(
       corsHeaders,
       sponsorService,
       requestRpcUrl,
+      requiredWei,
     );
   }
 
@@ -151,6 +159,7 @@ async function handleSponsor(
   corsHeaders: Record<string, string>,
   sponsorService: SponsorService,
   requestRpcUrl?: string,
+  requiredWei?: bigint,
 ): Promise<Response> {
   if (!/^0x[0-9a-f]{40}$/.test(safeAddress)) {
     return jsonResponse({ error: "Invalid safeAddress" }, 400, corsHeaders);
@@ -172,6 +181,7 @@ async function handleSponsor(
       safeAddress,
       eoa.address,
       effectiveRpc,
+      requiredWei,
     );
 
     return jsonResponse(result, 200, corsHeaders);
