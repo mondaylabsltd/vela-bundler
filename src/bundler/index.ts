@@ -460,6 +460,12 @@ export class BundlerService {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error("[Bundler] Failed to submit bundle:", errorMsg);
 
+      // Remove failed UserOps from mempool so the user can retry without
+      // hitting the "Replacement UserOp must have higher gas" error.
+      for (const checked of checkedEntries) {
+        this.mempool.remove(checked.entry.userOpHash);
+      }
+
       // Store failed receipts so wallet gets immediate feedback via
       // eth_getUserOperationReceipt instead of polling until timeout.
       for (const checked of checkedEntries) {
