@@ -78,15 +78,12 @@ export default {
     if (!activeChains) return;
 
     const chainIds = activeChains.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    for (const chainId of chainIds) {
-      try {
-        const doId = env.BUNDLER.idFromName(`chain-${chainId}`);
-        const stub = env.BUNDLER.get(doId);
-        await stub.fetch(new Request("https://do/health?chainId=" + chainId));
-      } catch {
-        // Non-fatal — DO may not be initialized yet
-      }
-    }
+    // Ping all DOs in parallel to minimize wall-clock time
+    await Promise.allSettled(chainIds.map(async (chainId) => {
+      const doId = env.BUNDLER.idFromName(`chain-${chainId}`);
+      const stub = env.BUNDLER.get(doId);
+      await stub.fetch(new Request("https://do/health?chainId=" + chainId));
+    }));
   },
 };
 

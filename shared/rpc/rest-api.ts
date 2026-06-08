@@ -140,7 +140,7 @@ async function handleGetAccount(
         latestNonce: info.latestNonce,
         pendingNonce: info.pendingNonce,
         status: info.status,
-        rpcUsed: effectiveRpc,
+        rpcUsed: effectiveRpc.replace(/\/[a-zA-Z0-9_-]{20,}(\/|$)/, "/***$1"),
       },
       200,
       corsHeaders,

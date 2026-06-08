@@ -3,6 +3,11 @@
  *
  * One instance per chain, accessed via env.BUNDLER.idFromName(`chain-${chainId}`).
  * Replaces ChainRegistry + setInterval with DO alarm-based scheduling.
+ *
+ * Key design decisions:
+ * - chainId is persisted in DO storage so alarms can re-initialize after eviction
+ * - processReceipt fire-and-forget is kept alive via state.waitUntil (not ctx.waitUntil)
+ * - ensureInitialized guards against cached rejections and chain mismatch
  */
 
 import type { Env } from "./types.ts";
@@ -19,7 +24,6 @@ import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
-import { handleRpcMethod } from "../shared/rpc/handlers.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import {
   processRequest,
@@ -45,11 +49,16 @@ const MAX_BATCH_SIZE = 20;
 /** Maximum request body size in bytes (256 KB). */
 const MAX_BODY_SIZE = 256 * 1024;
 
+/** DO storage key for persisting chainId across evictions. */
+const STORAGE_KEY_CHAIN_ID = "chainId";
+
+/** DO storage key for persisting lastDecayAt across evictions. */
+const STORAGE_KEY_LAST_DECAY = "lastDecayAt";
+
 /** Redact API keys from RPC URLs for safe logging. */
 function redactRpcUrl(url: string): string {
   try {
     const u = new URL(url);
-    // Redact path segments that look like API keys (32+ hex chars)
     u.pathname = u.pathname.replace(/\/[a-zA-Z0-9_-]{20,}$/, "/***");
     return u.toString();
   } catch {
@@ -59,7 +68,7 @@ function redactRpcUrl(url: string): string {
 
 /**
  * Minimal ChainRegistry-compatible adapter for a single chain's services.
- * Satisfies the interface expected by shared/rpc/handlers.ts and rest-api.ts.
+ * Satisfies ChainRegistryLike used by shared/rpc/handlers.ts and rest-api.ts.
  */
 class SingleChainAdapter implements ChainRegistryLike {
   constructor(private services: ChainServices) {}
@@ -73,10 +82,6 @@ class SingleChainAdapter implements ChainRegistryLike {
 
   getAll(): ChainServices[] {
     return [this.services];
-  }
-
-  has(chainId: number): boolean {
-    return chainId === this.services.chainId;
   }
 }
 
@@ -93,7 +98,7 @@ export class BundlerDO implements DurableObject {
   private initPromise: Promise<void> | null = null;
 
   // Health loop state
-  private lastDecayAt: number = Date.now();
+  private lastDecayAt: number = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -106,7 +111,15 @@ export class BundlerDO implements DurableObject {
 
     // Ensure services are initialized for this chain
     if (chainId > 0) {
-      await this.ensureInitialized(chainId);
+      try {
+        await this.ensureInitialized(chainId);
+      } catch (err) {
+        console.error(`[BundlerDO] Init failed for chain ${chainId}:`, err);
+        return Response.json(
+          { jsonrpc: "2.0", id: null, error: internalError("Chain initialization failed") },
+          { status: 503 },
+        );
+      }
     }
 
     try {
@@ -133,7 +146,22 @@ export class BundlerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
-    if (!this.chainServices) return;
+    // If chainServices is null (DO was evicted), try to re-initialize from stored chainId
+    if (!this.chainServices) {
+      const storedChainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+      if (storedChainId) {
+        try {
+          await this.ensureInitialized(storedChainId);
+        } catch (err) {
+          console.error(`[BundlerDO] Alarm re-init failed for chain ${storedChainId}:`, err);
+        }
+      }
+      // Re-schedule even if init failed — retry next cycle
+      if (!this.chainServices) {
+        await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+        return;
+      }
+    }
 
     // Auto-bundle
     try {
@@ -159,14 +187,31 @@ export class BundlerDO implements DurableObject {
   // ---------------------------------------------------------------------------
 
   private async ensureInitialized(chainId: number): Promise<void> {
+    // Already initialized for this chain
     if (this.chainServices && this.chainId === chainId) return;
+
+    // Already initialized for a DIFFERENT chain — reject (should never happen with correct routing)
+    if (this.chainServices && this.chainId !== chainId) {
+      throw new Error(`DO already initialized for chain ${this.chainId}, cannot serve chain ${chainId}`);
+    }
+
+    // Another request is already initializing — wait for it
     if (this.initPromise) {
       await this.initPromise;
+      // Verify the completed init was for the right chain
+      if (this.chainId !== chainId) {
+        throw new Error(`Chain mismatch after init: expected ${chainId}, got ${this.chainId}`);
+      }
       return;
     }
 
+    // Start initialization — clear on failure so next request retries
     this.chainId = chainId;
-    this.initPromise = this._init(chainId);
+    this.initPromise = this._init(chainId).catch((err) => {
+      this.initPromise = null;
+      this.chainId = 0;
+      throw err;
+    });
     await this.initPromise;
   }
 
@@ -225,6 +270,13 @@ export class BundlerDO implements DurableObject {
     };
     this.chainAdapter = new SingleChainAdapter(this.chainServices);
 
+    // Persist chainId so alarm can re-init after eviction
+    await this.state.storage.put(STORAGE_KEY_CHAIN_ID, chainId);
+
+    // Restore lastDecayAt from storage (survives eviction)
+    const storedDecay = await this.state.storage.get<number>(STORAGE_KEY_LAST_DECAY);
+    this.lastDecayAt = storedDecay ?? Date.now();
+
     console.log(
       `[BundlerDO] Initialized chain ${chainId} (${resolved.chain?.name ?? "unknown"}) — RPC: ${redactRpcUrl(effectiveRpc)}`,
     );
@@ -261,9 +313,9 @@ export class BundlerDO implements DurableObject {
     const limited = rateLimitGuard(request, rateLimitConfig);
     if (limited) return limited;
 
-    // Reject oversized request bodies
-    const contentLength = parseInt(request.headers.get("content-length") ?? "0");
-    if (contentLength > MAX_BODY_SIZE) {
+    // Read body as text first to enforce size limit (Content-Length can be spoofed/omitted)
+    const bodyText = await request.text();
+    if (bodyText.length > MAX_BODY_SIZE) {
       return Response.json(
         { jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large") },
         { status: 413, headers: corsHeaders },
@@ -285,7 +337,7 @@ export class BundlerDO implements DurableObject {
 
     let body: unknown;
     try {
-      body = await request.json();
+      body = JSON.parse(bodyText);
     } catch {
       return jsonResponse({ jsonrpc: "2.0", id: null, error: parseError() }, corsHeaders);
     }
@@ -416,6 +468,8 @@ export class BundlerDO implements DurableObject {
         console.error(`[BundlerDO:${this.chainId}] Reputation decay error:`, err);
       }
       this.lastDecayAt = now;
+      // Persist so decay timing survives eviction
+      await this.state.storage.put(STORAGE_KEY_LAST_DECAY, now);
     }
   }
 }
