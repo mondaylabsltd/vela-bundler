@@ -156,7 +156,7 @@ export async function uploadRelease(
   const isMac = Deno.build.os === "darwin";
   const tarArgs = ["-czf", "-", "-C", repoRoot];
   if (isMac) tarArgs.push("--no-mac-metadata");
-  tarArgs.push("shared", "deno", "deno.json", "deno.lock");
+  tarArgs.push("shared", "deno", "deno.json");
 
   const tarProc = new Deno.Command("tar", {
     args: tarArgs,

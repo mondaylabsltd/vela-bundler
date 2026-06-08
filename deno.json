@@ -1,7 +1,7 @@
 {
   "tasks": {
     "dev": "deno run --allow-net --allow-env --allow-read --env --watch deno/main.ts",
-    "start": "deno run --allow-net --allow-env --allow-read --env deno/main.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --env --no-lock deno/main.ts",
     "test": "deno test -A",
     "build": "deno run --allow-read --allow-write scripts/build-html.ts",
     "lint": "deno lint && deno check deno/main.ts",
