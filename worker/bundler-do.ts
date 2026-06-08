@@ -163,6 +163,13 @@ export class BundlerDO implements DurableObject {
       }
     }
 
+    // Check pending receipts from previous bundles (alarm-driven polling)
+    try {
+      await this.chainServices.bundler.checkPendingReceipts();
+    } catch (err) {
+      console.error(`[BundlerDO:${this.chainId}] Pending receipt check error:`, err);
+    }
+
     // Auto-bundle
     try {
       if (this.chainServices.mempool.size > 0) {

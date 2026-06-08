@@ -47,12 +47,29 @@ const RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 /** Max receipt store entries — prevents unbounded memory growth. */
 const RECEIPT_STORE_MAX = 10_000;
 
+/** Max polling attempts for a single pending receipt (60 × ~10s alarm = 10 min). */
+const PENDING_RECEIPT_MAX_CHECKS = 60;
+
+/** Metadata for a pending transaction that needs receipt confirmation. */
+interface PendingReceipt {
+  txHash: `0x${string}`;
+  entries: MempoolEntry[];
+  eoaAddress: `0x${string}`;
+  reservedAmount: bigint;
+  rpcOverride?: string;
+  submittedAt: number;
+  checkCount: number;
+}
+
 export class BundlerService {
   private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
   private autoBundleTimer?: ReturnType<typeof setInterval>;
   private receiptCleanupTimer?: ReturnType<typeof setInterval>;
   private currentBundlingMode: "auto" | "manual";
+  private readonly disableTimers: boolean;
+  /** Pending receipts tracked for alarm-driven polling (CF Worker mode). */
+  private pendingReceipts: PendingReceipt[] = [];
 
   constructor(
     private readonly config: BundlerConfig,
@@ -62,12 +79,13 @@ export class BundlerService {
     options?: { disableTimers?: boolean },
   ) {
     this.currentBundlingMode = config.bundlingMode;
+    this.disableTimers = options?.disableTimers ?? false;
     this.publicClient = createPublicClient({
       transport: http(config.rpcUrl),
     }) as PublicClient<Transport, Chain>;
     // Receipt cleanup runs regardless of bundling mode (every 10 min).
     // Disabled in CF Worker where DO alarm handles cleanup.
-    if (!options?.disableTimers) {
+    if (!this.disableTimers) {
       this.receiptCleanupTimer = setInterval(() => this.cleanExpiredReceipts(), 600_000);
     }
   }
@@ -428,39 +446,45 @@ export class BundlerService {
       // Lock EOA until receipt is confirmed to prevent double-spend
       this.accountService.lockManager.lockEOA(eoa.address, "LOCKED_PENDING_UNKNOWN");
 
-      // Process receipt in background — unlocks EOA on success
-      this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
-        .then(async () => {
-          // Re-init EOA to restore ACTIVE state with updated nonce.
-          // Retry up to 3 times with exponential backoff to avoid
-          // permanently locking the EOA due to transient RPC failures.
-          const client = rpcOverride ? getPublicClient(rpcOverride) : this.publicClient;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-              await this.accountService.lockManager.initEOA(eoa.address, client);
-              return; // success — EOA is now ACTIVE
-            } catch (err) {
-              const delay = 2_000 * (2 ** attempt); // 2s, 4s, 8s
-              console.warn(
-                `[Bundler] initEOA recovery attempt ${attempt + 1}/3 failed for ${eoa.address}: ${err instanceof Error ? err.message : err}. Retrying in ${delay}ms...`,
-              );
-              await new Promise((r) => setTimeout(r, delay));
-            }
-          }
-          // All retries failed — EOA stays locked, health loop will keep trying
-          console.error(
-            `[Bundler] Failed to recover EOA ${eoa.address} after 3 retries. ` +
-            `EOA remains LOCKED_PENDING_UNKNOWN — health loop will continue recovery attempts.`,
-          );
-        })
-        .catch((err) => {
-          console.error("[Bundler] Failed to process receipt:", err);
-          // Fail closed: keep locked if we can't confirm
-          this.accountService.lockManager.lockEOA(
-            eoa.address,
-            "LOCKED_PENDING_UNKNOWN",
-          );
+      if (this.disableTimers) {
+        // CF Worker mode: track pending receipt for alarm-driven polling.
+        // DO alarm calls checkPendingReceipts() each cycle — no fire-and-forget.
+        this.pendingReceipts.push({
+          txHash,
+          entries: submittedEntries,
+          eoaAddress: eoa.address,
+          reservedAmount: expectedCost,
+          rpcOverride,
+          submittedAt: Date.now(),
+          checkCount: 0,
         });
+      } else {
+        // Deno mode: process receipt in background — unlocks EOA on success
+        this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
+          .then(async () => {
+            const client = rpcOverride ? getPublicClient(rpcOverride) : this.publicClient;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                await this.accountService.lockManager.initEOA(eoa.address, client);
+                return;
+              } catch (err) {
+                const delay = 2_000 * (2 ** attempt);
+                console.warn(
+                  `[Bundler] initEOA recovery attempt ${attempt + 1}/3 failed for ${eoa.address}: ${err instanceof Error ? err.message : err}. Retrying in ${delay}ms...`,
+                );
+                await new Promise((r) => setTimeout(r, delay));
+              }
+            }
+            console.error(
+              `[Bundler] Failed to recover EOA ${eoa.address} after 3 retries. ` +
+              `EOA remains LOCKED_PENDING_UNKNOWN — health loop will continue recovery attempts.`,
+            );
+          })
+          .catch((err) => {
+            console.error("[Bundler] Failed to process receipt:", err);
+            this.accountService.lockManager.lockEOA(eoa.address, "LOCKED_PENDING_UNKNOWN");
+          });
+      }
 
       return { submitted: true, transactionHash: txHash, userOpHashes };
     } catch (err) {
@@ -688,6 +712,187 @@ export class BundlerService {
     } finally {
       // Always release reservation after confirmation/failure
       this.accountService.releaseBalance(eoaAddress, reservedAmount);
+    }
+  }
+
+  /**
+   * Check all pending receipts (alarm-driven mode for CF Workers).
+   * Called each alarm cycle (~10s). Each pending receipt gets one check attempt per cycle.
+   * After PENDING_RECEIPT_MAX_CHECKS failures, the receipt is abandoned and the EOA
+   * is left locked for the health loop to recover.
+   */
+  async checkPendingReceipts(): Promise<void> {
+    if (this.pendingReceipts.length === 0) return;
+
+    const remaining: PendingReceipt[] = [];
+
+    for (const pending of this.pendingReceipts) {
+      pending.checkCount++;
+
+      const receiptClient = pending.rpcOverride
+        ? getPublicClient(pending.rpcOverride)
+        : this.publicClient;
+
+      try {
+        const receipt = await receiptClient.getTransactionReceipt({ hash: pending.txHash });
+        if (receipt) {
+          // Receipt found — process it synchronously
+          this.storeReceiptLogs(receipt, pending.entries);
+
+          // Post-bundle sweep
+          if (receipt.status === "success" && this.config.treasuryAddress) {
+            try {
+              const eoaDerived = await this.accountService.deriveEOA(
+                pending.entries[0]!.userOp.sender as `0x${string}`,
+              );
+              if (eoaDerived.privateKey) {
+                await executeSweep({
+                  eoaAddress: pending.eoaAddress,
+                  eoaPrivateKey: eoaDerived.privateKey,
+                  treasuryAddress: this.config.treasuryAddress,
+                  rpcUrl: pending.rpcOverride ?? this.config.rpcUrl,
+                  config: this.config,
+                });
+              }
+            } catch (err) {
+              console.warn(`[Bundler] Post-bundle sweep failed for ${pending.eoaAddress}:`, err);
+            }
+          }
+
+          // Release reservation and recover EOA
+          this.accountService.releaseBalance(pending.eoaAddress, pending.reservedAmount);
+          try {
+            await this.accountService.lockManager.initEOA(pending.eoaAddress, receiptClient);
+          } catch {
+            // Health loop will recover
+          }
+          continue; // Don't add back to remaining
+        }
+      } catch {
+        // Receipt not found yet — check if tx was dropped
+      }
+
+      // Check if tx was dropped (every 3 checks)
+      if (pending.checkCount % 3 === 0) {
+        try {
+          const [latestNonce, pendingNonce] = await Promise.all([
+            receiptClient.getTransactionCount({ address: pending.eoaAddress, blockTag: "latest" }),
+            receiptClient.getTransactionCount({ address: pending.eoaAddress, blockTag: "pending" }),
+          ]);
+          if (pendingNonce <= latestNonce) {
+            // Tx was dropped — store failed receipts, release reservation
+            console.warn(`[Bundler] Tx ${pending.txHash} dropped (pending=${pendingNonce}, latest=${latestNonce})`);
+            this.storeFailedReceipts(pending.entries, pending.txHash, pending.eoaAddress);
+            this.accountService.releaseBalance(pending.eoaAddress, pending.reservedAmount);
+            try {
+              await this.accountService.lockManager.initEOA(pending.eoaAddress, receiptClient);
+            } catch {
+              // Health loop will recover
+            }
+            continue;
+          }
+        } catch {
+          // Nonce check failed — keep polling
+        }
+      }
+
+      // Give up after max checks
+      if (pending.checkCount >= PENDING_RECEIPT_MAX_CHECKS) {
+        console.error(`[Bundler] Giving up on receipt for ${pending.txHash} after ${pending.checkCount} checks`);
+        this.storeFailedReceipts(pending.entries, pending.txHash, pending.eoaAddress);
+        this.accountService.releaseBalance(pending.eoaAddress, pending.reservedAmount);
+        continue;
+      }
+
+      remaining.push(pending);
+    }
+
+    this.pendingReceipts = remaining;
+  }
+
+  /** Store event logs from a confirmed receipt into the receipt store. */
+  private storeReceiptLogs(receipt: { status: string; logs: readonly any[]; blockNumber: bigint; blockHash: `0x${string}`; transactionHash: `0x${string}`; transactionIndex: number; from: `0x${string}`; to: `0x${string}` | null; cumulativeGasUsed: bigint; gasUsed: bigint; effectiveGasPrice: bigint }, entries: MempoolEntry[]): void {
+    const logs = parseEventLogs({
+      abi: ENTRYPOINT_V07_ABI,
+      logs: receipt.logs as any,
+      eventName: "UserOperationEvent",
+    });
+
+    for (const log of logs) {
+      const userOpHash = log.args.userOpHash as `0x${string}`;
+      const entry = entries.find((e) => e.userOpHash === userOpHash);
+
+      const opReceipt: UserOperationReceipt = {
+        userOpHash,
+        entryPoint: this.config.entryPointAddress,
+        sender: log.args.sender as `0x${string}`,
+        nonce: entry?.userOp.nonce ?? 0n,
+        paymaster: (log.args.paymaster as `0x${string}`) || null,
+        actualGasCost: log.args.actualGasCost as bigint,
+        actualGasUsed: log.args.actualGasUsed as bigint,
+        success: log.args.success as boolean,
+        logs: receipt.logs.map((l: any, i: number) => ({
+          logIndex: l.logIndex ?? i,
+          address: l.address as `0x${string}`,
+          topics: l.topics as `0x${string}`[],
+          data: l.data as `0x${string}`,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+          transactionHash: receipt.transactionHash,
+        })),
+        receipt: {
+          transactionHash: receipt.transactionHash,
+          transactionIndex: receipt.transactionIndex,
+          blockHash: receipt.blockHash,
+          blockNumber: receipt.blockNumber,
+          from: receipt.from,
+          to: (receipt.to ?? this.config.entryPointAddress) as `0x${string}`,
+          cumulativeGasUsed: receipt.cumulativeGasUsed,
+          gasUsed: receipt.gasUsed,
+          effectiveGasPrice: receipt.effectiveGasPrice,
+        },
+      };
+
+      if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
+        const oldest = this.receiptStore.keys().next().value;
+        if (oldest !== undefined) this.receiptStore.delete(oldest);
+      }
+      this.receiptStore.set(userOpHash, { receipt: opReceipt, expiresAt: Date.now() + RECEIPT_TTL_MS });
+    }
+  }
+
+  /** Store failed receipt entries for user-facing feedback. */
+  private storeFailedReceipts(entries: MempoolEntry[], txHash: `0x${string}`, eoaAddress: `0x${string}`): void {
+    for (const entry of entries) {
+      if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
+        const oldest = this.receiptStore.keys().next().value;
+        if (oldest !== undefined) this.receiptStore.delete(oldest);
+      }
+      this.receiptStore.set(entry.userOpHash, {
+        receipt: {
+          userOpHash: entry.userOpHash as `0x${string}`,
+          entryPoint: this.config.entryPointAddress,
+          sender: entry.userOp.sender,
+          nonce: entry.userOp.nonce ?? 0n,
+          paymaster: null,
+          actualGasCost: 0n,
+          actualGasUsed: 0n,
+          success: false,
+          logs: [],
+          receipt: {
+            transactionHash: txHash,
+            transactionIndex: 0,
+            blockHash: "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
+            blockNumber: 0n,
+            from: eoaAddress,
+            to: this.config.entryPointAddress,
+            cumulativeGasUsed: 0n,
+            gasUsed: 0n,
+            effectiveGasPrice: 0n,
+          },
+        },
+        expiresAt: Date.now() + RECEIPT_TTL_MS,
+      });
     }
   }
 
