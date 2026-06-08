@@ -23,7 +23,7 @@ import type {
 import { packUserOp } from "../userop/pack.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 import { encodeHandleOps } from "../userop/encode.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient, resolveRpcUrl } from "../utils/rpc-client.ts";
 import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
 import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../gas/l2-data-fee.ts";

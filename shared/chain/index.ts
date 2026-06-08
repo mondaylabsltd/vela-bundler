@@ -13,7 +13,7 @@ import { Mempool } from "../mempool/index.ts";
 import { AccountService } from "../account/index.ts";
 import { BundlerService } from "../bundler/index.ts";
 import type { KeyManager } from "../keys/types.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import { resolveRpcUrl, getPublicClient } from "../utils/rpc-client.ts";
 
 export interface ChainServices {

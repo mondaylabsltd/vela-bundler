@@ -16,7 +16,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { deriveTreasuryPrivateKey } from "../keys/derive.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 
 // ---------------------------------------------------------------------------
 // Constants

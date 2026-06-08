@@ -1,0 +1,19 @@
+{
+  "private": true,
+  "name": "vela-bundler-worker",
+  "description": "Cloudflare Worker version of the Vela ERC-4337 bundler",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test:worker": "vitest run"
+  },
+  "dependencies": {
+    "viem": "^2.27.2"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.41",
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "vitest": "~2.1.0",
+    "wrangler": "^3.100.0"
+  }
+}

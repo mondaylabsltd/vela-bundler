@@ -8,11 +8,11 @@
  */
 
 import { assertEquals, assert, assertNotEquals } from "@std/assert";
-import { ReputationManager } from "../src/mempool/reputation.ts";
-import { rateLimitGuard } from "../src/auth/index.ts";
-import { getPublicClient } from "../src/utils/rpc-client.ts";
-import { RPC_TIMEOUT_MS } from "../src/utils/timeout.ts";
-import { parseValidationData, isValidTimeRange } from "../src/userop/validate.ts";
+import { ReputationManager } from "../shared/mempool/reputation.ts";
+import { rateLimitGuard } from "../shared/auth/index.ts";
+import { getPublicClient } from "../shared/utils/rpc-client.ts";
+import { RPC_TIMEOUT_MS } from "../shared/utils/timeout.ts";
+import { parseValidationData, isValidTimeRange } from "../shared/userop/validate.ts";
 
 // ---- RPC_TIMEOUT_MS shared constant ----
 

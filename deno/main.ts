@@ -12,12 +12,12 @@
  *   deno task test    — run tests
  */
 
-import { loadConfig } from "./src/config/index.ts";
-import { LocalKeyManager } from "./src/keys/local.ts";
-import { ChainRegistry } from "./src/chain/index.ts";
-import { startRpcServer } from "./src/rpc/index.ts";
-import { deriveTreasuryAddress } from "./src/keys/derive.ts";
-import { SponsorService } from "./src/account/sponsor.ts";
+import { loadConfig } from "./config.ts";
+import { LocalKeyManager } from "../shared/keys/local.ts";
+import { ChainRegistry } from "../shared/chain/index.ts";
+import { startRpcServer } from "./server.ts";
+import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { SponsorService } from "../shared/account/sponsor.ts";
 
 async function main() {
   // Treasury address is always derived from OPERATOR_SECRET (same address on all chains).

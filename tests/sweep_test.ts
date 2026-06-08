@@ -3,7 +3,7 @@
  */
 
 import { assertEquals, assert } from "@std/assert";
-import { shouldSweep } from "../src/bundler/sweep.ts";
+import { shouldSweep } from "../shared/bundler/sweep.ts";
 
 const TREASURY = "0xcccccccccccccccccccccccccccccccccccccccc" as const;
 

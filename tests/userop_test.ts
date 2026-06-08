@@ -3,16 +3,16 @@
  */
 
 import { assertEquals, assert, assertThrows } from "@std/assert";
-import { packUserOp, unpackUserOp } from "../src/userop/pack.ts";
-import { getUserOpHash } from "../src/userop/hash.ts";
+import { packUserOp, unpackUserOp } from "../shared/userop/pack.ts";
+import { getUserOpHash } from "../shared/userop/hash.ts";
 import {
   validateUserOpFields,
   parseValidationData,
   isValidTimeRange,
   UserOpValidationError,
-} from "../src/userop/validate.ts";
-import { normalizeUserOp } from "../src/userop/normalize.ts";
-import type { UserOperation } from "../src/userop/types.ts";
+} from "../shared/userop/validate.ts";
+import { normalizeUserOp } from "../shared/userop/normalize.ts";
+import type { UserOperation } from "../shared/userop/types.ts";
 
 const ENTRY_POINT = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as const;
 

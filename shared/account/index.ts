@@ -17,7 +17,7 @@ import {
 import type { KeyManager, DerivedEOA } from "../keys/types.ts";
 import { deriveEOAAddress } from "../keys/derive.ts";
 import { EOALockManager, type EOAStatus } from "./eoa-lock.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { withTimeout, RPC_TIMEOUT_MS } from "../utils/timeout.ts";
 

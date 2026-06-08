@@ -3,8 +3,8 @@
  * Multi-chain: chainId resolved from request (X-Chain-Id header or RPC params).
  */
 
-import type { RequestContext } from "./index.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { RequestContext } from "./process.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import type { ChainRegistry, ChainServices } from "../chain/index.ts";
 import {
   methodNotFound,

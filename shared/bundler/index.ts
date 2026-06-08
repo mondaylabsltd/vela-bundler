@@ -19,7 +19,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { executeSweep } from "./sweep.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import type { Simulator } from "../simulation/index.ts";
 import { Mempool } from "../mempool/index.ts";
 import type { AccountService } from "../account/index.ts";
@@ -59,13 +59,17 @@ export class BundlerService {
     private readonly mempool: Mempool,
     private readonly simulator: Simulator,
     private readonly accountService: AccountService,
+    options?: { disableTimers?: boolean },
   ) {
     this.currentBundlingMode = config.bundlingMode;
     this.publicClient = createPublicClient({
       transport: http(config.rpcUrl),
     }) as PublicClient<Transport, Chain>;
-    // Receipt cleanup runs regardless of bundling mode (every 10 min)
-    this.receiptCleanupTimer = setInterval(() => this.cleanExpiredReceipts(), 600_000);
+    // Receipt cleanup runs regardless of bundling mode (every 10 min).
+    // Disabled in CF Worker where DO alarm handles cleanup.
+    if (!options?.disableTimers) {
+      this.receiptCleanupTimer = setInterval(() => this.cleanExpiredReceipts(), 600_000);
+    }
   }
 
   /**
@@ -91,7 +95,7 @@ export class BundlerService {
     }, this.config.autoBundleIntervalMs);
   }
 
-  private cleanExpiredReceipts(): void {
+  cleanExpiredReceipts(): void {
     const now = Date.now();
     for (const [hash, entry] of this.receiptStore) {
       if (now > entry.expiresAt) this.receiptStore.delete(hash);

@@ -14,8 +14,8 @@ import {
   encodeFunctionResult,
   encodeFunctionData,
 } from "viem";
-import { ENTRYPOINT_V07_ABI, RPC_ERROR_CODES } from "../src/contracts/entrypoint.ts";
-import { parseValidationData, isValidTimeRange } from "../src/userop/validate.ts";
+import { ENTRYPOINT_V07_ABI, RPC_ERROR_CODES } from "../shared/contracts/entrypoint.ts";
+import { parseValidationData, isValidTimeRange } from "../shared/userop/validate.ts";
 
 // ---- Helpers: build encoded data for simulation result parsing ----
 

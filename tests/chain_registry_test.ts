@@ -8,7 +8,7 @@ import {
   filterPublicRpcUrls,
   chainSupportsEip1559,
   pickBestRpc,
-} from "../src/config/chain-registry.ts";
+} from "../shared/config/chain-registry.ts";
 
 // --- filterPublicRpcUrls ---
 

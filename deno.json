@@ -1,10 +1,11 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --allow-read --env --watch main.ts",
-    "start": "deno run --allow-net --allow-env --allow-read --env main.ts",
-    "test": "deno test --allow-net --allow-env --allow-read --allow-run -A",
+    "dev": "deno run --allow-net --allow-env --allow-read --env --watch deno/main.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --env deno/main.ts",
+    "test": "deno test -A",
     "build": "deno run --allow-read --allow-write scripts/build-html.ts",
-    "lint": "deno lint && deno check main.ts",
+    "lint": "deno lint && deno check deno/main.ts",
+    "generate-bytecode": "deno run --allow-read --allow-write scripts/generate-bytecode.ts",
     "deploy": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts",
     "deploy:status": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts status",
     "deploy:rollback": "deno run --allow-read --allow-write --allow-run=ssh,tar --allow-env=HOME,USER,XDG_CONFIG_HOME,TERM,NO_COLOR --allow-net scripts/deploy.ts rollback"
@@ -15,6 +16,7 @@
     "viem/chains": "npm:viem@2.27.2/chains",
     "viem/accounts": "npm:viem@2.27.2/accounts"
   },
+  "nodeModulesDir": "none",
   "compilerOptions": {
     "strict": true,
     "noUncheckedIndexedAccess": true

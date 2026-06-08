@@ -3,7 +3,7 @@
  */
 
 import { assertEquals, assert } from "@std/assert";
-import { EOALockManager } from "../src/account/eoa-lock.ts";
+import { EOALockManager } from "../shared/account/eoa-lock.ts";
 
 const EOA_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const EOA_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
@@ -189,7 +189,7 @@ Deno.test("pendingNonce == latestNonce means ACTIVE", () => {
 // --- Secret rotation ---
 
 Deno.test("old secrets produce different EOAs than current secret", async () => {
-  const { deriveEOAAddress } = await import("../src/keys/derive.ts");
+  const { deriveEOAAddress } = await import("../shared/keys/derive.ts");
   const secret1 = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
   const secret2 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const ep = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as const;

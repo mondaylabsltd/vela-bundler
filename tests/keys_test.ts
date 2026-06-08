@@ -3,8 +3,8 @@
  */
 
 import { assertEquals, assert, assertNotEquals } from "@std/assert";
-import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress } from "../src/keys/derive.ts";
-import { LocalKeyManager } from "../src/keys/local.ts";
+import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { LocalKeyManager } from "../shared/keys/local.ts";
 
 const TEST_SECRET =
   "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";

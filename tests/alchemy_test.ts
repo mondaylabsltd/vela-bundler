@@ -7,7 +7,7 @@ import {
   isAlchemySupported,
   buildAlchemyRpcUrl,
   getAlchemySupportedChainIds,
-} from "../src/config/alchemy.ts";
+} from "../shared/config/alchemy.ts";
 
 // ---- isAlchemySupported ----
 

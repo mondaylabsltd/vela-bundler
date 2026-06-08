@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "vela-bundler",
+  "main": "worker/index.ts",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // One BundlerDO instance per chain — accessed via env.BUNDLER.idFromName(`chain-${chainId}`)
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BUNDLER",
+        "class_name": "BundlerDO"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["BundlerDO"]
+    }
+  ],
+
+  // Backup cron trigger: ensures DO alarms stay alive even if no requests arrive
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
+}

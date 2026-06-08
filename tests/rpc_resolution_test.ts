@@ -3,7 +3,7 @@
  */
 
 import { assertEquals } from "@std/assert";
-import { resolveRpcUrl } from "../src/utils/rpc-client.ts";
+import { resolveRpcUrl } from "../shared/utils/rpc-client.ts";
 
 Deno.test("resolveRpcUrl - per-request override has highest priority", () => {
   const result = resolveRpcUrl(

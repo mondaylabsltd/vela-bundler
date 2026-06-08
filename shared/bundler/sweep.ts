@@ -13,7 +13,7 @@ import {
   http,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 
 /** Fallback gas limit for simple ETH transfers. Arbitrum and other L2s may need

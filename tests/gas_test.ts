@@ -3,17 +3,17 @@
  */
 
 import { assertEquals, assert } from "@std/assert";
-import { calcPreVerificationGas } from "../src/gas/preVerificationGas.ts";
+import { calcPreVerificationGas } from "../shared/gas/preVerificationGas.ts";
 import {
   calcUserOpGasPrice,
   checkBundleProfitability,
   checkUserOpProfitability,
   calcOuterTxGasPrice,
   calcUserOpMaxGas,
-} from "../src/gas/profitability.ts";
-import { calldataGasCost, countCalldataBytes } from "../src/utils/hex.ts";
-import { isArbitrumChain, isOpStackChain, isL2WithDataFee } from "../src/gas/l2-data-fee.ts";
-import type { UserOperation } from "../src/userop/types.ts";
+} from "../shared/gas/profitability.ts";
+import { calldataGasCost, countCalldataBytes } from "../shared/utils/hex.ts";
+import { isArbitrumChain, isOpStackChain, isL2WithDataFee } from "../shared/gas/l2-data-fee.ts";
+import type { UserOperation } from "../shared/userop/types.ts";
 
 function makeUserOp(overrides: Partial<UserOperation> = {}): UserOperation {
   return {

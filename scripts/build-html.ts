@@ -1,6 +1,6 @@
 #!/usr/bin/env -S deno run --allow-read --allow-write
 /**
- * Convert README.md to src/index.html for serving on "/".
+ * Convert README.md to deno/index.html for serving on "/".
  * Uses marked for markdown → HTML conversion + GitHub Markdown CSS.
  */
 import { marked } from "npm:marked@15";
@@ -39,6 +39,6 @@ const html = `<!DOCTYPE html>
 ${htmlBody}</body>
 </html>`;
 
-const outPath = new URL("../src/index.html", import.meta.url).pathname;
+const outPath = new URL("../deno/index.html", import.meta.url).pathname;
 await Deno.writeTextFile(outPath, html);
 console.log(`Generated ${outPath}`);

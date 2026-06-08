@@ -3,10 +3,10 @@
  */
 
 import { assertEquals, assert, assertThrows } from "@std/assert";
-import { Mempool } from "../src/mempool/index.ts";
-import { ReputationManager } from "../src/mempool/reputation.ts";
-import { UserOpValidationError } from "../src/userop/validate.ts";
-import type { UserOperation } from "../src/userop/types.ts";
+import { Mempool } from "../shared/mempool/index.ts";
+import { ReputationManager } from "../shared/mempool/reputation.ts";
+import { UserOpValidationError } from "../shared/userop/validate.ts";
+import type { UserOperation } from "../shared/userop/types.ts";
 
 const ENTRY_POINT = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as const;
 

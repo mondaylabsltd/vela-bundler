@@ -7,7 +7,7 @@
  */
 
 import type { ChainRegistry } from "../chain/index.ts";
-import type { BundlerConfig } from "../config/index.ts";
+import type { BundlerConfig } from "../config/types.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 import type { SponsorService } from "../account/sponsor.ts";

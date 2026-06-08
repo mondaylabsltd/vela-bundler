@@ -5,9 +5,9 @@
  *   deno run --allow-net scripts/test-l2-fee.ts
  */
 
-import { estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../src/gas/l2-data-fee.ts";
-import { packUserOp } from "../src/userop/pack.ts";
-import { encodeHandleOps } from "../src/userop/encode.ts";
+import { estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../shared/gas/l2-data-fee.ts";
+import { packUserOp } from "../shared/userop/pack.ts";
+import { encodeHandleOps } from "../shared/userop/encode.ts";
 
 // Use the REAL UserOp from the user's failed Arbitrum transaction
 const realUserOp = {
