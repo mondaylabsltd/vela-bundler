@@ -16,6 +16,7 @@
     "viem/chains": "npm:viem@2.27.2/chains",
     "viem/accounts": "npm:viem@2.27.2/accounts"
   },
+  "lock": false,
   "nodeModulesDir": "none",
   "compilerOptions": {
     "strict": true,
