@@ -127,7 +127,7 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
     treasuryAddress,
     sweepInterval: parseInt(env("SWEEP_INTERVAL", "30")),
     apiRateLimitPerMinute: parseInt(env("API_RATE_LIMIT_PER_MINUTE", "60")),
-    balanceReserveMultiplier: parseInt(env("BALANCE_RESERVE_MULTIPLIER", "2")),
+    balanceReserveMultiplier: parseFloat(env("BALANCE_RESERVE_MULTIPLIER", "1.5")),
     alchemyApiKey: envOptional("ALCHEMY_API_KEY") ?? null,
   };
 }

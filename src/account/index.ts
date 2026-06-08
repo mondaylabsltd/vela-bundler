@@ -156,7 +156,9 @@ export class AccountService {
       ? onchainBalance - reservedBalance
       : 0n;
 
-    const requiredBalance = expectedCost * BigInt(this.balanceReserveMultiplier);
+    // Support fractional multipliers (e.g. 1.5x) by scaling: cost × (multiplier × 10) / 10
+    const scaledMultiplier = BigInt(Math.round(this.balanceReserveMultiplier * 10));
+    const requiredBalance = (expectedCost * scaledMultiplier) / 10n;
     return {
       sufficient: spendableBalance >= requiredBalance,
       spendableBalance,
