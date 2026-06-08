@@ -129,12 +129,11 @@ export class SponsorService {
     //    Prevents empty wallets from draining the treasury.
     const safeBalance = await client.getBalance({ address: safeAddress });
     const gasPrice = await client.getGasPrice();
-    const maxSponsorAmount = MAX_SPONSOR_GAS * gasPrice;
+    const gasBased = MAX_SPONSOR_GAS * gasPrice;
+    const maxSponsorAmount = gasBased > MIN_SPONSOR_BALANCE ? gasBased : MIN_SPONSOR_BALANCE;
     const serverEstimate = gasPrice * 600_000n * 2n;
     let targetBalance = serverEstimate;
     if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
-    // Ensure target is at least MIN_SPONSOR_BALANCE so the wallet client's
-    // funding check (MIN_BALANCE_WEI = 0.0001) passes after sponsorship.
     if (targetBalance < MIN_SPONSOR_BALANCE) targetBalance = MIN_SPONSOR_BALANCE;
     const sponsorAmount = targetBalance > maxSponsorAmount ? maxSponsorAmount : targetBalance;
     if (safeBalance < sponsorAmount * 2n) {
