@@ -5,7 +5,7 @@
 
 import type { RequestContext } from "./process.ts";
 import type { BundlerConfig } from "../config/types.ts";
-import type { ChainRegistry, ChainServices } from "../chain/index.ts";
+import type { ChainRegistryLike, ChainServices } from "../chain/index.ts";
 import {
   methodNotFound,
   invalidParams,
@@ -29,7 +29,7 @@ export async function handleRpcMethod(
   method: string,
   params: unknown[],
   config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<unknown> {
   switch (method) {
@@ -52,7 +52,7 @@ export async function handleRpcMethod(
 
 async function resolveChain(
   chainId: number,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<ChainServices> {
   try {
@@ -71,7 +71,7 @@ async function resolveChain(
 async function handleSendUserOperation(
   params: unknown[],
   config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<`0x${string}`> {
   if (!params[0] || !params[1]) {
@@ -277,7 +277,7 @@ async function handleSendUserOperation(
 async function handleEstimateUserOperationGas(
   params: unknown[],
   config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<Record<string, string>> {
   if (!params[0] || !params[1]) {
@@ -337,7 +337,7 @@ async function handleEstimateUserOperationGas(
 function handleGetUserOperationByHash(
   params: unknown[],
   config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;
@@ -380,7 +380,7 @@ function handleGetUserOperationByHash(
 function handleGetUserOperationReceipt(
   params: unknown[],
   _config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Record<string, unknown> | null {
   const hash = params[0] as string;

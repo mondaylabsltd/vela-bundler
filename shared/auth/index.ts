@@ -20,6 +20,11 @@ let lastPruneAt = 0;
  * to "unknown" (Deno.serve does not expose remote address via Request).
  */
 function extractClientIp(req: Request): string {
+  // CF-Connecting-IP is set by Cloudflare's edge and cannot be spoofed by clients.
+  // Prefer it when running on CF Workers.
+  const cfIp = req.headers.get("cf-connecting-ip");
+  if (cfIp) return cfIp;
+
   const xff = req.headers.get("x-forwarded-for");
   if (xff) {
     // Rightmost IP = appended by the closest trusted proxy

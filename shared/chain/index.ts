@@ -27,6 +27,15 @@ export interface ChainServices {
   bundler: BundlerService;
 }
 
+/**
+ * Minimal interface for chain service resolution.
+ * Both ChainRegistry (Deno) and SingleChainAdapter (CF Worker) implement this.
+ */
+export interface ChainRegistryLike {
+  getChain(chainId: number, requestRpcUrl?: string): Promise<ChainServices>;
+  getAll(): ChainServices[];
+}
+
 function makeChainConfig(
   globalConfig: BundlerConfig,
   chainId: number,

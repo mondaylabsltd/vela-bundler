@@ -30,7 +30,7 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     maxProfitMarginBps: parseInt(env.MAX_PROFIT_MARGIN_BPS ?? "15000"),
     walletGasMarkup: 1 + parseInt(env.WALLET_GAS_MARGIN_PERCENT ?? "50") / 100,
 
-    useEip1559: true,
+    useEip1559: (env.USE_EIP1559 ?? "true") === "true",
     baseFeeMultiplier: parseFloat(env.BASE_FEE_MULTIPLIER ?? "1.25"),
     bundlerTipGwei: parseFloat(env.BUNDLER_TIP_GWEI ?? "0.5"),
 

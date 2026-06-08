@@ -16,7 +16,7 @@ import { BundlerService } from "../shared/bundler/index.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
-import type { ChainServices } from "../shared/chain/index.ts";
+import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRpcMethod } from "../shared/rpc/handlers.ts";
@@ -39,11 +39,29 @@ const ALARM_INTERVAL_MS = 10_000;
 /** Reputation decay interval — 1 hour (in ms). */
 const REPUTATION_DECAY_INTERVAL_MS = 60 * 60 * 1000;
 
+/** Maximum batch RPC request size to prevent abuse. */
+const MAX_BATCH_SIZE = 20;
+
+/** Maximum request body size in bytes (256 KB). */
+const MAX_BODY_SIZE = 256 * 1024;
+
+/** Redact API keys from RPC URLs for safe logging. */
+function redactRpcUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    // Redact path segments that look like API keys (32+ hex chars)
+    u.pathname = u.pathname.replace(/\/[a-zA-Z0-9_-]{20,}$/, "/***");
+    return u.toString();
+  } catch {
+    return url.replace(/[a-zA-Z0-9_-]{20,}/g, "***");
+  }
+}
+
 /**
  * Minimal ChainRegistry-compatible adapter for a single chain's services.
  * Satisfies the interface expected by shared/rpc/handlers.ts and rest-api.ts.
  */
-class SingleChainAdapter {
+class SingleChainAdapter implements ChainRegistryLike {
   constructor(private services: ChainServices) {}
 
   async getChain(chainId: number, _requestRpcUrl?: string): Promise<ChainServices> {
@@ -208,7 +226,7 @@ export class BundlerDO implements DurableObject {
     this.chainAdapter = new SingleChainAdapter(this.chainServices);
 
     console.log(
-      `[BundlerDO] Initialized chain ${chainId} (${resolved.chain?.name ?? "unknown"}) — RPC: ${effectiveRpc}`,
+      `[BundlerDO] Initialized chain ${chainId} (${resolved.chain?.name ?? "unknown"}) — RPC: ${redactRpcUrl(effectiveRpc)}`,
     );
 
     // Schedule first alarm if none exists
@@ -230,6 +248,28 @@ export class BundlerDO implements DurableObject {
       );
     }
 
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
+    };
+
+    // Rate limit using CF-Connecting-IP (cannot be spoofed by clients)
+    const rateLimitConfig: RateLimitConfig = {
+      rateLimitPerMinute: this.config.apiRateLimitPerMinute,
+    };
+    const limited = rateLimitGuard(request, rateLimitConfig);
+    if (limited) return limited;
+
+    // Reject oversized request bodies
+    const contentLength = parseInt(request.headers.get("content-length") ?? "0");
+    if (contentLength > MAX_BODY_SIZE) {
+      return Response.json(
+        { jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large") },
+        { status: 413, headers: corsHeaders },
+      );
+    }
+
     const rawRpcUrl = request.headers.get("x-rpc-url") ?? undefined;
     let requestRpcUrl: string | undefined;
     if (rawRpcUrl) {
@@ -243,12 +283,6 @@ export class BundlerDO implements DurableObject {
       requestRpcUrl = rawRpcUrl;
     }
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
-    };
-
     let body: unknown;
     try {
       body = await request.json();
@@ -259,6 +293,12 @@ export class BundlerDO implements DurableObject {
     const reqCtx: RequestContext = { requestRpcUrl, chainId };
 
     if (Array.isArray(body)) {
+      if (body.length > MAX_BATCH_SIZE) {
+        return Response.json(
+          { jsonrpc: "2.0", id: null, error: invalidRequest(`Batch too large (max ${MAX_BATCH_SIZE})`) },
+          { status: 400, headers: corsHeaders },
+        );
+      }
       const results = await Promise.allSettled(
         body.map((item) => processRequest(item, this.config!, this.chainAdapter!, reqCtx)),
       );
@@ -298,7 +338,7 @@ export class BundlerDO implements DurableObject {
     const response = await handleRestApi(
       request,
       fakeUrl,
-      this.chainAdapter as unknown as import("../shared/chain/index.ts").ChainRegistry,
+      this.chainAdapter,
       this.config,
       rateLimitConfig,
       requestRpcUrl,

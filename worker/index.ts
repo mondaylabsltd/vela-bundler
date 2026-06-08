@@ -70,10 +70,23 @@ export default {
     );
   },
 
-  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     // Backup cron trigger — DO alarms are self-sustaining once started,
     // but this ensures they recover if the runtime evicts a DO.
-    // Active DOs will be woken by their own alarms; this is a no-op safety net.
+    // Ping all known active chains to restart their alarm cycle.
+    const activeChains = env.ACTIVE_CHAINS ?? "";
+    if (!activeChains) return;
+
+    const chainIds = activeChains.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    for (const chainId of chainIds) {
+      try {
+        const doId = env.BUNDLER.idFromName(`chain-${chainId}`);
+        const stub = env.BUNDLER.get(doId);
+        await stub.fetch(new Request("https://do/health?chainId=" + chainId));
+      } catch {
+        // Non-fatal — DO may not be initialized yet
+      }
+    }
   },
 };
 

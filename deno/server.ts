@@ -134,6 +134,12 @@ export function startRpcServer(
       const reqCtx: RequestContext = { requestRpcUrl, chainId };
 
       if (Array.isArray(body)) {
+        if (body.length > 20) {
+          return Response.json(
+            { jsonrpc: "2.0", id: null, error: invalidRequest("Batch too large (max 20)") },
+            { status: 400, headers: corsHeaders },
+          );
+        }
         const results = await Promise.allSettled(
           body.map((item) => processRequest(item, config, chainRegistry, reqCtx)),
         );

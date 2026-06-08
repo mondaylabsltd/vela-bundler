@@ -6,7 +6,7 @@
  *   — Supports X-Rpc-Url header for per-request RPC override.
  */
 
-import type { ChainRegistry } from "../chain/index.ts";
+import type { ChainRegistryLike } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
@@ -18,7 +18,7 @@ import type { SponsorService } from "../account/sponsor.ts";
 export async function handleRestApi(
   req: Request,
   url: URL,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   config: BundlerConfig,
   rateLimitConfig: RateLimitConfig,
   requestRpcUrl?: string,
@@ -92,7 +92,7 @@ export async function handleRestApi(
 async function handleGetAccount(
   chainId: number,
   safeAddress: `0x${string}`,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   _config: BundlerConfig,
   corsHeaders: Record<string, string>,
   requestRpcUrl?: string,
@@ -154,7 +154,7 @@ async function handleGetAccount(
 async function handleSponsor(
   chainId: number,
   safeAddress: `0x${string}`,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   _config: BundlerConfig,
   corsHeaders: Record<string, string>,
   sponsorService: SponsorService,

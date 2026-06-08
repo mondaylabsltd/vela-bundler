@@ -6,7 +6,7 @@
  */
 
 import type { BundlerConfig } from "../config/types.ts";
-import type { ChainRegistry } from "../chain/index.ts";
+import type { ChainRegistryLike } from "../chain/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import {
   parseError,
@@ -38,7 +38,7 @@ export interface RequestContext {
 export async function processRequest(
   body: unknown,
   config: BundlerConfig,
-  chainRegistry: ChainRegistry,
+  chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<JsonRpcResponse> {
   if (!body || typeof body !== "object") {
