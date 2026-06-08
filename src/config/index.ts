@@ -40,6 +40,10 @@ export interface BundlerConfig {
   /** Maximum allowed margin. Rejects UserOps that overpay beyond this, protecting users. */
   readonly maxProfitMarginBps: number;
 
+  /** Wallet's gas markup multiplier. Bundler derives outerGasPrice = userOpGasPrice / walletGasMarkup.
+   *  Must match BUNDLER_MARGIN on the wallet side. Default 2.5 → 150% margin. */
+  readonly walletGasMarkup: number;
+
   readonly useEip1559: boolean;
   readonly baseFeeMultiplier: number;
   readonly bundlerTipGwei: number;
@@ -110,6 +114,7 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
 
     minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "1000")),
     maxProfitMarginBps: parseInt(env("MAX_PROFIT_MARGIN_BPS", "15000")),
+    walletGasMarkup: parseFloat(env("WALLET_GAS_MARKUP", "2.5")),
 
     useEip1559,
     baseFeeMultiplier: parseFloat(env("BASE_FEE_MULTIPLIER", "1.25")),

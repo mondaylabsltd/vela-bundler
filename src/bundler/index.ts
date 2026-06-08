@@ -31,7 +31,6 @@ import { encodeHandleOps } from "../userop/encode.ts";
 import {
   calcUserOpGasPrice,
   checkBundleProfitability,
-  calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 
@@ -214,15 +213,23 @@ export class BundlerService {
     const gasPrices = await this.simulator.getGasPrices(rpcOverride);
     const baseFee = gasPrices.baseFee;
 
-    // Use the chain's actual gas price for the outer tx.
-    // Profit margin = userOpGasPrice / outerGasPrice - 1,
-    // controlled entirely by the wallet's gas markup over chain rate.
-    const outerGas = calcOuterTxGasPrice({
-      currentBaseFee: baseFee,
-      baseFeeMultiplier: this.config.baseFeeMultiplier,
-      bundlerTipGwei: this.config.bundlerTipGwei,
-      chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
-    });
+    // Derive outer tx gas price from the UserOp's maxFeePerGas.
+    // Wallet sets: maxFeePerGas = gasPrice × speedTier × WALLET_GAS_MARKUP
+    // Bundler reverses: outerGasPrice = userOpGasPrice / WALLET_GAS_MARKUP = gasPrice × speedTier
+    // Margin = WALLET_GAS_MARKUP - 1 (constant, independent of tier).
+    // Speed tier is preserved: higher tier → higher outer gas → faster inclusion.
+    const firstUserOp = entries[0]!.userOp;
+    const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
+    const markupScaled = BigInt(Math.round(this.config.walletGasMarkup * 100));
+    const intendedGasPrice = (userOpEffective * 100n) / markupScaled;
+
+    // Use chain's suggested tip as floor (some chains enforce minimum priority fee)
+    const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
+    const outerGas = {
+      maxFeePerGas: intendedGasPrice > tip ? intendedGasPrice : tip,
+      maxPriorityFeePerGas: tip,
+      effectiveGasPrice: intendedGasPrice,
+    };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
     const validEntries: MempoolEntry[] = [];
@@ -307,10 +314,8 @@ export class BundlerService {
     // Profitability check.
     // Revenue = estimatedGas × userOpGasPrice (what EntryPoint charges).
     // Cost    = estimatedGas × outerGasPrice   (what bundler pays on-chain).
-    // Margin  = userOpGasPrice / outerGasPrice - 1.
-    const firstUserOp = checkedEntries[0]!.entry.userOp;
-    const userOpGasPrice = calcUserOpGasPrice(firstUserOp, baseFee);
-    const actualGasCosts = [bundleSim.estimatedGas! * userOpGasPrice];
+    // Margin  = WALLET_GAS_MARKUP - 1 (constant).
+    const actualGasCosts = [bundleSim.estimatedGas! * userOpEffective];
 
     const profitResult = checkBundleProfitability({
       actualGasCosts,
