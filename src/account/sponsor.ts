@@ -25,8 +25,8 @@ import type { BundlerConfig } from "../config/index.ts";
 /** Max relayer EOA nonce to qualify for sponsorship. */
 const MAX_SPONSOR_NONCE = 3;
 
-/** Max amount to sponsor per transfer (0.001 ETH). */
-const MAX_SPONSOR_AMOUNT = 1_000_000_000_000_000n;
+/** Gas units used to calculate the max sponsor amount per transfer. */
+const MAX_SPONSOR_GAS = 5_000_000n;
 
 /** Minimum treasury balance to keep (0.01 ETH). Won't sponsor below this. */
 const TREASURY_FLOOR = 10_000_000_000_000_000n;
@@ -126,10 +126,11 @@ export class SponsorService {
     //    Prevents empty wallets from draining the treasury.
     const safeBalance = await client.getBalance({ address: safeAddress });
     const gasPrice = await client.getGasPrice();
+    const maxSponsorAmount = MAX_SPONSOR_GAS * gasPrice;
     const serverEstimate = gasPrice * 600_000n * 2n;
     let targetBalance = serverEstimate;
     if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
-    const sponsorAmount = targetBalance > MAX_SPONSOR_AMOUNT ? MAX_SPONSOR_AMOUNT : targetBalance;
+    const sponsorAmount = targetBalance > maxSponsorAmount ? maxSponsorAmount : targetBalance;
     if (safeBalance < sponsorAmount * 2n) {
       return { sponsored: false, reason: "wallet_balance_too_low" };
     }
@@ -143,7 +144,7 @@ export class SponsorService {
     // 6. Treasury balance check
     const treasuryAddress = this.config.treasuryAddress;
     const treasuryBalance = await client.getBalance({ address: treasuryAddress });
-    if (treasuryBalance < TREASURY_FLOOR + MAX_SPONSOR_AMOUNT + TRANSFER_GAS_FALLBACK * 1_000_000_000n) {
+    if (treasuryBalance < TREASURY_FLOOR + maxSponsorAmount + TRANSFER_GAS_FALLBACK * gasPrice) {
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
@@ -153,7 +154,7 @@ export class SponsorService {
     if (amount <= 0n) {
       return { sponsored: false, reason: "already_funded" };
     }
-    if (amount > MAX_SPONSOR_AMOUNT) amount = MAX_SPONSOR_AMOUNT;
+    if (amount > maxSponsorAmount) amount = maxSponsorAmount;
     if (amount < 10_000n) {
       return { sponsored: false, reason: "amount_too_small" };
     }
