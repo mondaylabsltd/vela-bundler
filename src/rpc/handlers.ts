@@ -19,7 +19,6 @@ import {
   calcUserOpGasPrice,
   calcUserOpMaxGas,
   calcOuterTxGasPrice,
-  checkUserOpProfitability,
 } from "../gas/profitability.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 
@@ -221,33 +220,22 @@ async function handleSendUserOperation(
     );
   }
 
-  // Gas price check: userOp margin must be within [min, max] band.
-  // - Below min → reject (unprofitable for bundler)
-  // - Above max → reject (protect user from overpaying)
+  // Gas price margin check.
+  // Derive the intended outer gas price the same way the bundler does:
+  //   outerGasPrice = userOpGasPrice / walletGasMarkup
+  // Margin = walletGasMarkup - 1 (constant, independent of speed tier).
+  // Speed tier scales both the user cost and the outer gas price equally.
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-  if (!checkUserOpProfitability({
-    userOpGasPrice,
-    outerTxEffectiveGasPrice: outerGas.effectiveGasPrice,
-    marginBps: config.minProfitMarginBps,
-  })) {
+  const markupScaled = BigInt(Math.round(config.walletGasMarkup * 100));
+  const derivedOuterPrice = (userOpGasPrice * 100n) / markupScaled;
+
+  // Sanity check: derived outer price must not be absurdly below chain rate
+  if (derivedOuterPrice < outerGas.effectiveGasPrice / 2n) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `Gas price too low: userOp effective price ${userOpGasPrice} < ` +
-      `required for ${config.minProfitMarginBps}bps margin over chain rate ${outerGas.effectiveGasPrice}`,
+      `Gas price too low: derived outer price ${derivedOuterPrice} < ` +
+      `50% of chain rate ${outerGas.effectiveGasPrice}`,
     );
-  }
-
-  // Upper bound: reject if margin exceeds MAX_PROFIT_MARGIN_BPS (user protection).
-  if (outerGas.effectiveGasPrice > 0n) {
-    const maxAllowedPrice = (outerGas.effectiveGasPrice * BigInt(10000 + config.maxProfitMarginBps)) / 10000n;
-    if (userOpGasPrice > maxAllowedPrice) {
-      throw bundlerError(
-        RPC_ERROR_CODES.INVALID_USEROPERATION,
-        `Gas price too high: userOp effective price ${userOpGasPrice} > ` +
-        `max allowed ${maxAllowedPrice} (${config.maxProfitMarginBps}bps over chain rate ${outerGas.effectiveGasPrice}). ` +
-        `Reduce wallet gas markup to protect against overpaying.`,
-      );
-    }
   }
 
   // Simulate validation
