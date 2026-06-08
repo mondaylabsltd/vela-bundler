@@ -198,10 +198,11 @@ export function createSimulator(config: BundlerConfig) {
 
       return parseRevertData(revertData);
     } catch (err: unknown) {
+      console.warn(`[Simulator] simulateValidation RPC failed:`, err instanceof Error ? err.message : err);
       return {
         valid: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `Simulation RPC failed: ${err instanceof Error ? err.message : String(err)}`,
+        errorMessage: `Simulation RPC failed`,
       };
     }
   }
@@ -310,10 +311,11 @@ export function createSimulator(config: BundlerConfig) {
         errorMessage: `simulateHandleOp reverted with no data: ${json.error?.message ?? "unknown"}`,
       };
     } catch (err: unknown) {
+      console.warn(`[Simulator] simulateHandleOp RPC failed:`, err instanceof Error ? err.message : err);
       return {
         success: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `simulateHandleOp RPC failed: ${err instanceof Error ? err.message : String(err)}`,
+        errorMessage: `simulateHandleOp RPC failed`,
       };
     }
   }
@@ -357,7 +359,7 @@ export function createSimulator(config: BundlerConfig) {
       return {
         success: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `Failed to decode ExecutionResult return: ${err instanceof Error ? err.message : String(err)}`,
+        errorMessage: `Failed to decode ExecutionResult`,
       };
     }
   }
@@ -500,7 +502,7 @@ export function createSimulator(config: BundlerConfig) {
       return {
         valid: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `Failed to decode ValidationResult: ${err instanceof Error ? err.message : String(err)}`,
+        errorMessage: `Failed to decode ValidationResult`,
       };
     }
   }

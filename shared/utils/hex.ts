@@ -39,16 +39,6 @@ export function packUint128(high: bigint, low: bigint): `0x${string}` {
 }
 
 /**
- * Unpack a bytes32 into two uint128 values.
- */
-export function unpackUint128(packed: `0x${string}`): [bigint, bigint] {
-  const raw = packed.slice(2).padStart(64, "0");
-  const high = BigInt("0x" + raw.slice(0, 32));
-  const low = BigInt("0x" + raw.slice(32, 64));
-  return [high, low];
-}
-
-/**
  * Count zero and non-zero bytes in a hex string.
  */
 export function countCalldataBytes(hex: `0x${string}`): { zeroBytes: number; nonZeroBytes: number } {

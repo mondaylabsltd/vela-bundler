@@ -29,14 +29,44 @@ export function validateRpcUrl(url: string): string | null {
 
   const hostname = parsed.hostname.toLowerCase();
 
-  // Block cloud metadata endpoints
-  if (hostname === "169.254.169.254" || hostname === "metadata.google.internal") {
-    return "Blocked hostname";
+  // Block loopback addresses (IPv4/IPv6 variants)
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "[::1]" ||
+    hostname === "0.0.0.0" ||
+    hostname.startsWith("127.")
+  ) {
+    return "Loopback addresses are not allowed";
   }
 
-  // Block loopback
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]") {
-    return "Loopback addresses are not allowed";
+  // Block cloud metadata endpoints
+  if (
+    hostname === "169.254.169.254" ||
+    hostname === "metadata.google.internal" ||
+    hostname === "168.63.129.16" ||          // Azure IMDS
+    hostname.endsWith(".internal")
+  ) {
+    return "Blocked metadata endpoint";
+  }
+
+  // Block private/reserved IPv4 ranges (RFC1918, RFC3927 link-local)
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
+    const parts = hostname.split(".").map(Number);
+    if (
+      parts[0] === 10 ||                                          // 10.0.0.0/8
+      (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31) || // 172.16.0.0/12
+      (parts[0] === 192 && parts[1] === 168) ||                   // 192.168.0.0/16
+      (parts[0] === 169 && parts[1] === 254)                      // 169.254.0.0/16 link-local
+    ) {
+      return "Private network addresses are not allowed";
+    }
+  }
+
+  // Block URLs with credentials (user:pass@host)
+  if (parsed.username || parsed.password) {
+    return "URLs with credentials are not allowed";
   }
 
   return null;

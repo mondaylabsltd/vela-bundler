@@ -123,9 +123,23 @@ export function startRpcServer(
       }
 
       const chainId = parseInt(pathChainId[1]!);
+      if (isNaN(chainId) || chainId <= 0) {
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("Invalid chainId") }),
+          { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } },
+        );
+      }
 
       let body: unknown;
       try {
+        // Enforce 256KB body size limit to prevent OOM from oversized payloads
+        const contentLength = req.headers.get("content-length");
+        if (contentLength && parseInt(contentLength) > 256 * 1024) {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large (max 256KB)") }),
+            { status: 413, headers: { "Content-Type": "application/json", ...corsHeaders } },
+          );
+        }
         body = await req.json();
       } catch {
         return jsonResponse({ jsonrpc: "2.0", id: null, error: parseError() }, corsHeaders);

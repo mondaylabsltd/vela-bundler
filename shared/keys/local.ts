@@ -52,26 +52,6 @@ export class LocalKeyManager implements KeyManager {
     };
   }
 
-  /**
-   * Derive an EOA using an old secret (for sweep queries).
-   */
-  async deriveEOAWithSecret(
-    secret: string,
-    params: KeyDerivationParams,
-  ): Promise<DerivedEOA> {
-    const privateKey = await deriveEOAPrivateKey(
-      secret,
-      params.chainId,
-      params.entryPoint,
-      params.safeAddress,
-    );
-    const account = privateKeyToAccount(privateKey);
-    return {
-      address: account.address.toLowerCase() as `0x${string}`,
-      privateKey,
-    };
-  }
-
   getOldSecrets(): string[] {
     return [...this.oldSecrets];
   }

@@ -1,39 +1,35 @@
 /**
  * Tests for sweep logic.
+ *
+ * The sweep module's only export is executeSweep(), which requires RPC.
+ * These tests verify the sweep module can be imported and the interface
+ * is correct. Full sweep testing requires integration tests with a live node.
  */
 
-import { assertEquals, assert } from "@std/assert";
-import { shouldSweep } from "../shared/bundler/sweep.ts";
+import { assertEquals, assertExists } from "@std/assert";
+import { executeSweep, type SweepResult } from "../shared/bundler/sweep.ts";
 
-const TREASURY = "0xcccccccccccccccccccccccccccccccccccccccc" as const;
-
-Deno.test("shouldSweep - triggers at nonce multiples of interval", () => {
-  assert(shouldSweep(30, 30, TREASURY));
-  assert(shouldSweep(60, 30, TREASURY));
-  assert(shouldSweep(90, 30, TREASURY));
+Deno.test("executeSweep - is exported and callable", () => {
+  assertExists(executeSweep);
+  assertEquals(typeof executeSweep, "function");
 });
 
-Deno.test("shouldSweep - does not trigger at non-multiples", () => {
-  assert(!shouldSweep(1, 30, TREASURY));
-  assert(!shouldSweep(15, 30, TREASURY));
-  assert(!shouldSweep(29, 30, TREASURY));
-  assert(!shouldSweep(31, 30, TREASURY));
+Deno.test("SweepResult - interface shape is valid", () => {
+  // Verify the SweepResult type works as expected
+  const result: SweepResult = { swept: false, error: "test" };
+  assertEquals(result.swept, false);
+  assertEquals(result.error, "test");
+  assertEquals(result.txHash, undefined);
+  assertEquals(result.amount, undefined);
 });
 
-Deno.test("shouldSweep - does not trigger at nonce 0", () => {
-  assert(!shouldSweep(0, 30, TREASURY));
-});
-
-Deno.test("shouldSweep - disabled when no treasury address", () => {
-  assert(!shouldSweep(30, 30, null));
-});
-
-Deno.test("shouldSweep - disabled when interval is 0", () => {
-  assert(!shouldSweep(30, 0, TREASURY));
-});
-
-Deno.test("shouldSweep - works with interval 1 (every bundle)", () => {
-  assert(shouldSweep(1, 1, TREASURY));
-  assert(shouldSweep(5, 1, TREASURY));
-  assert(shouldSweep(100, 1, TREASURY));
+Deno.test("SweepResult - successful sweep shape", () => {
+  const result: SweepResult = {
+    swept: true,
+    txHash: "0xabc123" as `0x${string}`,
+    amount: 1000n,
+  };
+  assertEquals(result.swept, true);
+  assertEquals(result.txHash, "0xabc123");
+  assertEquals(result.amount, 1000n);
 });

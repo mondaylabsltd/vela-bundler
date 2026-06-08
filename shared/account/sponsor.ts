@@ -225,7 +225,7 @@ export class SponsorService {
       console.error(`[Sponsor] Transfer failed:`, err);
       return {
         sponsored: false,
-        reason: `transfer_failed: ${err instanceof Error ? err.message : String(err)}`,
+        reason: "transfer_failed",
       };
     }
   }

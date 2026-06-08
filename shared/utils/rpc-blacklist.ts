@@ -10,6 +10,7 @@
  */
 
 const BLACKLIST_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+const BLACKLIST_MAX_SIZE = 200;
 
 /** url → expiry timestamp (ms) */
 const blacklist = new Map<string, number>();
@@ -18,6 +19,18 @@ const blacklist = new Map<string, number>();
  * Add a URL to the blacklist for 10 minutes.
  */
 export function blacklistRpc(url: string): void {
+  // Evict expired entries if at capacity to prevent unbounded growth
+  if (blacklist.size >= BLACKLIST_MAX_SIZE) {
+    const now = Date.now();
+    for (const [key, expiry] of blacklist) {
+      if (now > expiry) blacklist.delete(key);
+    }
+    // If still at capacity after pruning, evict oldest
+    if (blacklist.size >= BLACKLIST_MAX_SIZE) {
+      const oldest = blacklist.keys().next().value;
+      if (oldest !== undefined) blacklist.delete(oldest);
+    }
+  }
   blacklist.set(url, Date.now() + BLACKLIST_DURATION_MS);
   console.warn(`[RPC Blacklist] Blacklisted ${url} for 10 minutes`);
 }
