@@ -31,7 +31,7 @@ import { encodeHandleOps } from "../userop/encode.ts";
 import {
   calcUserOpGasPrice,
   checkBundleProfitability,
-  calcUserOpMaxGas,
+  calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 
@@ -214,25 +214,15 @@ export class BundlerService {
     const gasPrices = await this.simulator.getGasPrices(rpcOverride);
     const baseFee = gasPrices.baseFee;
 
-    // Derive outer tx gas price from the first UserOp's maxFeePerGas.
-    // The wallet sets userOpMaxFee = intendedBundlerPrice × 1.6, so:
-    //   intendedBundlerPrice = userOpMaxFee / 1.6
-    // The bundler uses this as the actual on-chain gas price, guaranteeing
-    // the 60% margin between what EntryPoint charges and what the bundler pays.
-    const firstUserOp = entries[0]!.userOp;
-    const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
-    const intendedGasPrice = (userOpEffective * 10n) / 16n;
-
-    // Use the user's intended price for the outer tx. The wallet sets
-    // userOpMaxFee = intendedBundlerPrice × 1.6, so intendedGasPrice is
-    // what the bundler should actually pay on-chain (with 60% margin baked in).
-    // Some chains enforce a minimum fee — use chain's suggested tip as floor.
-    const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
-    const outerGas = {
-      maxFeePerGas: intendedGasPrice > tip ? intendedGasPrice : tip,
-      maxPriorityFeePerGas: tip,
-      effectiveGasPrice: intendedGasPrice,
-    };
+    // Use the chain's actual gas price for the outer tx.
+    // Profit margin = userOpGasPrice / outerGasPrice - 1,
+    // controlled entirely by the wallet's gas markup over chain rate.
+    const outerGas = calcOuterTxGasPrice({
+      currentBaseFee: baseFee,
+      baseFeeMultiplier: this.config.baseFeeMultiplier,
+      bundlerTipGwei: this.config.bundlerTipGwei,
+      chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
+    });
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
     const validEntries: MempoolEntry[] = [];
@@ -314,11 +304,13 @@ export class BundlerService {
       };
     }
 
-    // Profitability check
-    const actualGasCosts = checkedEntries.map((checked) => {
-      const opGasPrice = calcUserOpGasPrice(checked.entry.userOp, baseFee);
-      return calcUserOpMaxGas(checked.entry.userOp) * opGasPrice;
-    });
+    // Profitability check.
+    // Revenue = estimatedGas × userOpGasPrice (what EntryPoint charges).
+    // Cost    = estimatedGas × outerGasPrice   (what bundler pays on-chain).
+    // Margin  = userOpGasPrice / outerGasPrice - 1.
+    const firstUserOp = checkedEntries[0]!.entry.userOp;
+    const userOpGasPrice = calcUserOpGasPrice(firstUserOp, baseFee);
+    const actualGasCosts = [bundleSim.estimatedGas! * userOpGasPrice];
 
     const profitResult = checkBundleProfitability({
       actualGasCosts,
@@ -332,6 +324,14 @@ export class BundlerService {
         submitted: false,
         userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
         error: `Unprofitable: ${profitResult.marginBps}bps < ${this.config.minProfitMarginBps}bps`,
+      };
+    }
+
+    if (profitResult.marginBps > this.config.maxProfitMarginBps) {
+      return {
+        submitted: false,
+        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+        error: `Margin too high: ${profitResult.marginBps}bps > ${this.config.maxProfitMarginBps}bps (user overpaying)`,
       };
     }
 

@@ -37,8 +37,8 @@ export interface BundlerConfig {
   readonly minPriorityFeePerGas: bigint;
 
   readonly minProfitMarginBps: number;
-  readonly targetProfitMarginBps: number;
-  readonly highRiskMarginBps: number;
+  /** Maximum allowed margin. Rejects UserOps that overpay beyond this, protecting users. */
+  readonly maxProfitMarginBps: number;
 
   readonly useEip1559: boolean;
   readonly baseFeeMultiplier: number;
@@ -109,8 +109,7 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
     minPriorityFeePerGas: BigInt(env("MIN_PRIORITY_FEE_PER_GAS", "0")),
 
     minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "1000")),
-    targetProfitMarginBps: parseInt(env("TARGET_PROFIT_MARGIN_BPS", "2000")),
-    highRiskMarginBps: parseInt(env("HIGH_RISK_MARGIN_BPS", "3000")),
+    maxProfitMarginBps: parseInt(env("MAX_PROFIT_MARGIN_BPS", "15000")),
 
     useEip1559,
     baseFeeMultiplier: parseFloat(env("BASE_FEE_MULTIPLIER", "1.25")),

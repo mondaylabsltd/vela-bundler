@@ -270,6 +270,246 @@ Deno.test("calcUserOpMaxGas - sums all gas fields", () => {
   assertEquals(maxGas, 50_000n + 100_000n + 200_000n + 50_000n + 30_000n);
 });
 
+// --- Margin formula: margin = userOpGasPrice / outerGasPrice - 1 ---
+// After the fix, revenue and cost both use estimatedGas, so gas quantity
+// cancels out. Margin is purely the gas PRICE ratio.
+
+Deno.test("margin formula: 0% margin when userOp price == chain price", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n; // 10 gwei
+  const userOpGasPrice = 10_000_000_000n; // 10 gwei (no markup)
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 0,
+  });
+
+  assert(result.profitable);
+  assertEquals(result.marginBps, 0);
+});
+
+Deno.test("margin formula: 10% margin with 1.1x wallet markup", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n; // 10 gwei
+  const walletMarkup = 1.1;
+  const userOpGasPrice = BigInt(Math.round(Number(chainGasPrice) * walletMarkup));
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000, // 10%
+  });
+
+  assert(result.profitable);
+  assertEquals(result.marginBps, 1000); // 10% = 1000 bps
+});
+
+Deno.test("margin formula: 60% margin with 1.6x wallet markup", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 16_000_000_000n; // 1.6x
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000,
+  });
+
+  assert(result.profitable);
+  assertEquals(result.marginBps, 6000); // 60%
+});
+
+Deno.test("margin formula: 150% margin with 2.5x wallet markup", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 25_000_000_000n; // 2.5x
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000,
+  });
+
+  assert(result.profitable);
+  assertEquals(result.marginBps, 15000); // 150%
+});
+
+Deno.test("margin formula: margin is independent of gas quantity", () => {
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 16_000_000_000n; // 1.6x → 60% margin
+
+  // Small bundle
+  const r1 = checkBundleProfitability({
+    actualGasCosts: [100_000n * userOpGasPrice],
+    estimatedHandleOpsGas: 100_000n,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 0,
+  });
+
+  // Large bundle
+  const r2 = checkBundleProfitability({
+    actualGasCosts: [5_000_000n * userOpGasPrice],
+    estimatedHandleOpsGas: 5_000_000n,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 0,
+  });
+
+  assertEquals(r1.marginBps, 6000);
+  assertEquals(r2.marginBps, 6000);
+  assertEquals(r1.marginBps, r2.marginBps);
+});
+
+Deno.test("margin formula: old bug — maxGas inflates margin", () => {
+  // Demonstrates why using maxGas (gas limits) instead of estimatedGas is wrong.
+  const estimatedGas = 200_000n;
+  const maxGas = 360_000n; // typical: limits are ~1.8x actual
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 16_000_000_000n; // 1.6x markup
+
+  // WRONG (old): revenue = maxGas × userOpPrice, cost = estimatedGas × (userOpPrice/1.6)
+  const oldIntendedPrice = (userOpGasPrice * 10n) / 16n;
+  const oldResult = checkBundleProfitability({
+    actualGasCosts: [maxGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: oldIntendedPrice,
+    minProfitMarginBps: 0,
+  });
+
+  // CORRECT (new): revenue = estimatedGas × userOpPrice, cost = estimatedGas × chainPrice
+  const newResult = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 0,
+  });
+
+  // Old formula: (360k/200k) × 1.6 - 1 = 188%
+  assert(oldResult.marginBps > 18000, `old margin should be ~188%, got ${oldResult.marginBps}`);
+
+  // New formula: 1.6 - 1 = 60%
+  assertEquals(newResult.marginBps, 6000);
+});
+
+Deno.test("checkUserOpProfitability — controls acceptance at submit time", () => {
+  const chainGasPrice = 10_000_000_000n;
+
+  // Wallet markup 1.6x, min margin 10% → accept
+  assert(checkUserOpProfitability({
+    userOpGasPrice: 16_000_000_000n,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    marginBps: 1000,
+  }));
+
+  // Wallet markup 1.0x (no markup), min margin 10% → reject
+  assert(!checkUserOpProfitability({
+    userOpGasPrice: 10_000_000_000n,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    marginBps: 1000,
+  }));
+
+  // Wallet markup 1.0x, min margin 0% → accept (just covers gas)
+  assert(checkUserOpProfitability({
+    userOpGasPrice: 10_000_000_000n,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    marginBps: 0,
+  }));
+});
+
+// --- Margin bounds: [MIN_PROFIT_MARGIN_BPS, MAX_PROFIT_MARGIN_BPS] ---
+// Bundler controls actual margin via MIN. MAX protects users from overpaying.
+// Wallet sets gas price within this band.
+
+Deno.test("margin bounds: reject below MIN_PROFIT_MARGIN_BPS", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 10_500_000_000n; // 1.05x → 5% margin
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000, // require 10%
+  });
+
+  assert(!result.profitable, "5% margin should fail 10% minimum");
+  assertEquals(result.marginBps, 500);
+});
+
+Deno.test("margin bounds: accept at exactly MIN_PROFIT_MARGIN_BPS", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 11_000_000_000n; // 1.1x → 10% margin
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000, // require 10%
+  });
+
+  assert(result.profitable, "10% margin should pass 10% minimum");
+  assertEquals(result.marginBps, 1000);
+});
+
+Deno.test("margin bounds: detect margin exceeding MAX for rejection", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 30_000_000_000n; // 3.0x → 200% margin
+  const maxProfitMarginBps = 15000; // max 150%
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000,
+  });
+
+  // Bundle is "profitable" (above min), but margin exceeds max → bundler should reject
+  assert(result.profitable);
+  assert(result.marginBps > maxProfitMarginBps,
+    `${result.marginBps}bps should exceed max ${maxProfitMarginBps}bps`);
+});
+
+Deno.test("margin bounds: accept at exactly MAX_PROFIT_MARGIN_BPS", () => {
+  const estimatedGas = 200_000n;
+  const chainGasPrice = 10_000_000_000n;
+  const userOpGasPrice = 25_000_000_000n; // 2.5x → 150% margin
+  const maxProfitMarginBps = 15000; // max 150%
+
+  const result = checkBundleProfitability({
+    actualGasCosts: [estimatedGas * userOpGasPrice],
+    estimatedHandleOpsGas: estimatedGas,
+    outerTxEffectiveGasPrice: chainGasPrice,
+    minProfitMarginBps: 1000,
+  });
+
+  assert(result.profitable);
+  assertEquals(result.marginBps, maxProfitMarginBps);
+});
+
+Deno.test("margin bounds: upper bound check via checkUserOpProfitability", () => {
+  const chainGasPrice = 10_000_000_000n;
+  const maxMarginBps = 15000; // 150%
+
+  // 3.0x markup → 200% margin, exceeds 150% max
+  const maxAllowed = (chainGasPrice * BigInt(10000 + maxMarginBps)) / 10000n;
+  const overpaying = 30_000_000_000n;
+  assert(overpaying > maxAllowed, "3.0x should exceed max allowed price");
+
+  // 2.2x markup → 120% margin, within 150% max
+  const reasonable = 22_000_000_000n;
+  assert(reasonable <= maxAllowed, "2.2x should be within max allowed price");
+
+  // 2.5x markup → exactly 150% margin, at boundary
+  const atBoundary = 25_000_000_000n;
+  assertEquals(atBoundary, maxAllowed);
+});
+
 // --- L2 chain detection ---
 
 Deno.test("isArbitrumChain - detects Arbitrum One and Sepolia", () => {
