@@ -70,20 +70,10 @@ export default {
     );
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
-    // Backup cron trigger — DO alarms are self-sustaining once started,
-    // but this ensures they recover if the runtime evicts a DO.
-    // Ping all known active chains to restart their alarm cycle.
-    const activeChains = env.ACTIVE_CHAINS ?? "";
-    if (!activeChains) return;
-
-    const chainIds = activeChains.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    // Ping all DOs in parallel to minimize wall-clock time
-    await Promise.allSettled(chainIds.map(async (chainId) => {
-      const doId = env.BUNDLER.idFromName(`chain-${chainId}`);
-      const stub = env.BUNDLER.get(doId);
-      await stub.fetch(new Request("https://do/health?chainId=" + chainId));
-    }));
+  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
+    // No-op. DO alarms are persisted by Cloudflare and survive eviction,
+    // so no external cron is needed to keep them alive. Once a chain's DO
+    // is initialized by the first request, its alarm chain is self-sustaining.
   },
 };
 

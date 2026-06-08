@@ -24,7 +24,7 @@ npx wrangler secret put ALCHEMY_API_KEY    # optional
 npm run deploy
 ```
 
-Optional: set `ACTIVE_CHAINS` (e.g. `"1,137,42161"`) so the cron trigger keeps DO alarms alive.
+Any EVM chain is supported automatically — the first request for a chain creates its Durable Object.
 
 ## How It Works
 
@@ -94,11 +94,7 @@ npm run test:worker        # Run worker tests (vitest + miniflare)
 - `OPERATOR_SECRET` — required
 - `ALCHEMY_API_KEY` — optional, for preferred RPCs
 
-**Environment variables** (set in `wrangler.jsonc` or dashboard):
-- `ACTIVE_CHAINS` — comma-separated chain IDs for cron keep-alive (e.g. `"1,137,42161"`)
-- All config variables from the table below work as CF Worker env vars
-
-**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`). The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`.
+**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. DO alarms persist across eviction — no cron or pre-configuration needed.
 
 ## Key Derivation
 
@@ -192,7 +188,6 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 | `MAX_PROFIT_MARGIN_BPS` | `15000` | Maximum margin cap |
 | `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
 | `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve multiplier |
-| `ACTIVE_CHAINS` | — | CF Worker only: chain IDs for cron keep-alive |
 
 ## Known Limitations
 

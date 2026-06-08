@@ -12,8 +12,6 @@ export interface Env {
   OLD_OPERATOR_SECRETS?: string;
   /** Alchemy API key — preferred RPCs for supported chains. */
   ALCHEMY_API_KEY?: string;
-  /** Comma-separated chain IDs to ping via cron (e.g. "1,137,42161"). */
-  ACTIVE_CHAINS?: string;
 
   // Optional config overrides (all have defaults)
   USE_EIP1559?: string;

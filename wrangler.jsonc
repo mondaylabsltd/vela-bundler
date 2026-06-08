@@ -22,10 +22,7 @@
     }
   ],
 
-  // Backup cron trigger: ensures DO alarms stay alive even if no requests arrive
-  "triggers": {
-    "crons": ["* * * * *"]
-  },
+  // No cron needed — DO alarms persist across eviction and are self-sustaining.
 
   "observability": {
     "enabled": true,
