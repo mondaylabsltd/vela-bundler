@@ -229,12 +229,14 @@ async function handleSendUserOperation(
   const markupScaled = BigInt(Math.round(config.walletGasMarkup * 100));
   const derivedOuterPrice = (userOpGasPrice * 100n) / markupScaled;
 
-  // Sanity check: derived outer price must not be absurdly below chain rate
-  if (derivedOuterPrice < outerGas.effectiveGasPrice / 2n) {
+  // Sanity check: derived outer price must not be absurdly below chain rate.
+  // Use 5x tolerance — on cheap-gas chains (Gnosis, ~0.001 Gwei) the gas price
+  // fluctuates by 2-3x between blocks, making a 50% threshold too strict.
+  if (derivedOuterPrice * 5n < outerGas.effectiveGasPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `Gas price too low: derived outer price ${derivedOuterPrice} < ` +
-      `50% of chain rate ${outerGas.effectiveGasPrice}`,
+      `20% of chain rate ${outerGas.effectiveGasPrice}`,
     );
   }
 
