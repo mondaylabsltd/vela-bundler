@@ -77,7 +77,7 @@ export class Mempool {
       // Replacement: validate fee increase
       const existing = this.entries.get(existingHash);
       if (existing) {
-        this.validateReplacement(existing.userOp, userOp);
+        this.validateReplacement(existing.userOp, userOp, existingHash);
         // Remove old entry
         this.removeEntry(existingHash);
       }
@@ -85,9 +85,10 @@ export class Mempool {
       // New op from this sender — check limits
       const senderOps = this.bySender.get(senderKey);
       if (senderOps && senderOps.size >= 1) {
-        // Only allow multiple if staked (simplified check)
+        // Include existing hash so the wallet can poll for its receipt
+        const pendingHash = senderOps.values().next().value;
         throw new UserOpValidationError(
-          "Already have a pending UserOperation from this sender",
+          `Already have a pending UserOperation from this sender [existingHash:${pendingHash}]`,
           RPC_ERROR_CODES.INVALID_USEROPERATION,
         );
       }
@@ -251,11 +252,13 @@ export class Mempool {
     }
   }
 
-  private validateReplacement(existing: UserOperation, replacement: UserOperation): void {
+  private validateReplacement(existing: UserOperation, replacement: UserOperation, existingHash: `0x${string}`): void {
+    const hashTag = ` [existingHash:${existingHash}]`;
+
     // maxPriorityFeePerGas must increase
     if (replacement.maxPriorityFeePerGas <= existing.maxPriorityFeePerGas) {
       throw new UserOpValidationError(
-        "Replacement UserOp must have higher maxPriorityFeePerGas",
+        `Replacement UserOp must have higher maxPriorityFeePerGas${hashTag}`,
         RPC_ERROR_CODES.INVALID_USEROPERATION,
       );
     }
@@ -265,7 +268,7 @@ export class Mempool {
     // maxFeePerGas must increase by at least the same delta
     if (replacement.maxFeePerGas < existing.maxFeePerGas + priorityDelta) {
       throw new UserOpValidationError(
-        "Replacement UserOp maxFeePerGas must increase by at least the same delta as maxPriorityFeePerGas",
+        `Replacement UserOp maxFeePerGas must increase by at least the same delta as maxPriorityFeePerGas${hashTag}`,
         RPC_ERROR_CODES.INVALID_USEROPERATION,
       );
     }
@@ -275,7 +278,7 @@ export class Mempool {
       (existing.maxPriorityFeePerGas * MIN_REPLACEMENT_FEE_INCREASE_PERCENT) / 100n;
     if (priorityDelta < minPriorityIncrease) {
       throw new UserOpValidationError(
-        "Replacement UserOp must increase fees by at least 10%",
+        `Replacement UserOp must increase fees by at least 10%${hashTag}`,
         RPC_ERROR_CODES.INVALID_USEROPERATION,
       );
     }

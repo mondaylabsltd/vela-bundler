@@ -191,7 +191,7 @@ The bundler enforces a **10–50% margin band** to balance profitability with us
 
 **Outer gas pricing** prefers the chain's suggested tip (`eth_maxPriorityFeePerGas` or derived from `eth_gasPrice`) over the configured `BUNDLER_TIP_GWEI`. This prevents the bundler from demanding higher gas than the network requires (e.g., 1.5 Gwei config tip on BSC where the chain only needs 1 Gwei).
 
-**Client-side**: Vela Wallet sets `maxFeePerGas = gasPrice × 1.6`, keeping the UserOp gas price ~60% above the chain rate — within the bundler's accepted band.
+**Client-side**: Vela Wallet sets `maxFeePerGas = gasPrice × speedTier × 1.5`, keeping the UserOp gas price ~50% above the bundler's outer gas price — within the bundler's accepted band.
 
 ## Known Limitations
 
