@@ -79,7 +79,7 @@ export function createSimulator(config: BundlerConfig) {
   /** Check if an error message indicates a transient RPC issue worth retrying on another node. */
   function isTransientSimError(msg?: string): boolean {
     if (!msg) return false;
-    return msg.includes("Temporary") || msg.includes("internal error") || msg.includes("RPC failed") || msg.includes("non-JSON");
+    return msg.includes("Temporary") || msg.includes("internal error") || msg.includes("RPC failed") || msg.includes("non-JSON") || msg.includes("Can't route");
   }
 
   /**
