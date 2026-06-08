@@ -1,20 +1,30 @@
 # Vela Bundler
 
-Private prepaid ERC-4337 / ERC-7769 bundler for EntryPoint v0.7, built with Deno 2 + TypeScript.
+ERC-4337 / ERC-7769 multi-chain bundler for EntryPoint v0.7.
 
 Supports any EVM network listed at [ethereum-data.awesometools.dev](https://ethereum-data.awesometools.dev/).
 
+Two deployment targets: **Deno** (self-hosted) and **Cloudflare Workers** (edge).
+
 ## Quick Start
 
-```bash
-# Only two required env vars:
-export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
-export TREASURY_ADDRESS=0x...  # Where excess EOA balance is swept
+### Deno (self-hosted)
 
+```bash
+export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
 deno task start
 ```
 
-Everything else has sensible defaults (Ethereum mainnet, auto RPC, port 3300).
+### Cloudflare Workers
+
+```bash
+npm install
+npx wrangler secret put OPERATOR_SECRET
+npx wrangler secret put ALCHEMY_API_KEY    # optional
+npm run deploy
+```
+
+Optional: set `ACTIVE_CHAINS` (e.g. `"1,137,42161"`) so the cron trigger keeps DO alarms alive.
 
 ## How It Works
 
@@ -22,15 +32,15 @@ Everything else has sensible defaults (Ethereum mainnet, auto RPC, port 3300).
 2. Users deposit native tokens to their dedicated EOA.
 3. The bundler submits `handleOps` when the EOA has sufficient balance.
 4. Each bundle contains ops from **one safeAddress only**, signed by its dedicated EOA.
-5. Every 30 bundles, excess balance is swept to the treasury.
+5. Excess balance is periodically swept to the treasury.
 
 No database — all state is derived or in-memory.
 
 ## Architecture
 
 ```
-src/
-├── config/          Configuration + chain registry + Alchemy RPC support
+shared/              Platform-agnostic logic (used by both runtimes)
+├── config/          Configuration types + chain registry + Alchemy
 ├── keys/            Deterministic key derivation (HKDF-SHA256)
 ├── account/         Per-EOA balance, reservations, lock management
 ├── auth/            Rate limiting
@@ -41,9 +51,54 @@ src/
 ├── mempool/         In-memory mempool with reputation tracking
 ├── bundler/         Bundle building, submission, treasury sweep
 ├── chain/           Per-chain service registry (lazy init + health loop)
-├── rpc/             JSON-RPC (ERC-7769) + REST API
+├── rpc/             JSON-RPC handlers + REST API + request processing
 └── utils/           Hex utilities, RPC client factory
+
+deno/                Deno runtime
+├── main.ts          Entry point
+├── config.ts        Env-based config (Deno.env)
+└── server.ts        HTTP server (Deno.serve)
+
+worker/              Cloudflare Workers runtime
+├── index.ts         Fetch handler — routes by chainId to DO
+├── bundler-do.ts    BundlerDO — one Durable Object per chain
+├── config.ts        Env-based config (CF bindings)
+└── types.ts         Env interface
 ```
+
+## Deployment
+
+### Deno
+
+```bash
+deno task dev              # Dev with watch mode
+deno task start            # Production
+deno task test             # Run tests
+deno task deploy           # Interactive SSH deploy to remote server
+deno task deploy status    # Check remote status
+deno task deploy rollback  # Rollback to previous release
+```
+
+Uses systemd on the remote server. See `deploy/systemd/vela-bundler.service`.
+
+### Cloudflare Workers
+
+```bash
+npm install
+npm run dev                # Local dev (wrangler dev)
+npm run deploy             # Deploy to Cloudflare
+npm run test:worker        # Run worker tests (vitest + miniflare)
+```
+
+**Secrets** (set via `npx wrangler secret put`):
+- `OPERATOR_SECRET` — required
+- `ALCHEMY_API_KEY` — optional, for preferred RPCs
+
+**Environment variables** (set in `wrangler.jsonc` or dashboard):
+- `ACTIVE_CHAINS` — comma-separated chain IDs for cron keep-alive (e.g. `"1,137,42161"`)
+- All config variables from the table below work as CF Worker env vars
+
+**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`). The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`.
 
 ## Key Derivation
 
@@ -56,10 +111,7 @@ HKDF-SHA256(
 ) → secp256k1 private key → Ethereum address
 ```
 
-- HKDF-SHA256 with domain separation.
-- Inputs canonicalized (lowercase, decimal chainId).
-- Invalid keys auto-retry with counter.
-- `KeyManager` interface for future KMS/HSM/MPC.
+Treasury address is also derived from `operatorSecret` (same on all chains).
 
 ## RPC URL Priority
 
@@ -69,36 +121,9 @@ HKDF-SHA256(
 | 2 | Alchemy RPC | If `ALCHEMY_API_KEY` set + chain supported |
 | 3 | Chain registry | Public RPCs, health-checked |
 
-Per-request RPCs flow through the entire chain: simulation, submission, balance queries.
+## API
 
-## REST API
-
-### GET /v1/account/:chainId/:safeAddress
-
-No authentication. Rate limited per IP. Supports `X-Rpc-Url` header.
-
-```json
-{
-  "chainId": 1,
-  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-  "safeAddress": "0x...",
-  "activeDepositAddress": "0x...",
-  "oldDepositAddresses": [],
-  "onchainBalance": "0x...",
-  "reservedBalance": "0x0",
-  "spendableBalance": "0x...",
-  "latestNonce": 0,
-  "pendingNonce": 0,
-  "status": "ACTIVE",
-  "rpcUsed": "https://..."
-}
-```
-
-**Status:** `ACTIVE` | `INSUFFICIENT_BALANCE` | `LOCKED_PENDING_UNKNOWN` | `LOCKED_IN_MEMORY_PENDING`
-
-## JSON-RPC Methods
-
-Endpoint: `POST /:chainId` (e.g., `POST /1`, `POST /137`, `POST /42161`).
+### JSON-RPC: `POST /:chainId`
 
 | Method | Description |
 |--------|-------------|
@@ -109,11 +134,18 @@ Endpoint: `POST /:chainId` (e.g., `POST /1`, `POST /137`, `POST /42161`).
 | `eth_supportedEntryPoints` | List EntryPoints |
 | `eth_chainId` | Chain ID |
 
-All methods support `X-Rpc-Url` header.
+All methods support `X-Rpc-Url` header. Batch requests capped at 20.
 
-## Health Endpoint
+### REST API
 
-`GET /health` or `GET /api/health`
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/account/:chainId/:safeAddress` | GET | Account info (balance, nonce, status) |
+| `/v1/treasury` | GET | Treasury address |
+| `/v1/sponsor/:chainId/:safeAddress` | POST | Request gas sponsorship |
+| `/health` | GET | Service health + stats |
+
+### Health Endpoint
 
 ```json
 {
@@ -126,45 +158,25 @@ All methods support `X-Rpc-Url` header.
 }
 ```
 
-**Status:** `ok` when no locked EOAs, `degraded` when any EOA is locked.
-
-## Treasury Sweep
-
-Excess EOA balance is automatically swept to `TREASURY_ADDRESS`:
-
-- **Trigger:** before bundling, when `nonce % SWEEP_INTERVAL === 0`
-- **Retain:** `currentGasPrice × 10M gas` (enough for future bundles)
-- **Runs inside bundle lock** — no nonce conflicts
-- **Non-fatal:** failure skips, retries next trigger
+On CF Workers, global `/health` returns minimal info. Per-chain health available via the DO.
 
 ## Secret Rotation
 
-No `keyVersion`. Rotation = change `OPERATOR_SECRET`, put old one in `OLD_OPERATOR_SECRETS`.
-
-- New secret → new EOAs for all users
-- Old secret → old EOAs still derivable for balance queries + sweep
-- Sweep clears old EOAs → remove old secret from config
-
-## Binding Rules
-
-- Dedicated EOA only serves its bound safeAddress
-- One safeAddress per bundle
-- Signer = beneficiary = dedicated EOA
-- Only `handleOps` calldata to configured EntryPoint
+1. Generate new `OPERATOR_SECRET`
+2. Put old one in `OLD_OPERATOR_SECRETS` (comma-separated)
+3. New secret → new EOAs; old secret → old EOAs still derivable for sweep
+4. Remove old secret once old EOAs are drained
 
 ## Configuration
 
-Only `OPERATOR_SECRET` and `TREASURY_ADDRESS` are required. See [.env.example](.env.example).
-
-Chain ID is per-request (via URL path), not a global config.
+Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPERATOR_SECRET` | — | **Required.** 32+ byte hex secret |
-| `TREASURY_ADDRESS` | — | **Required.** Sweep destination |
-| `PORT` | `3300` | Server port |
-| `HOST` | `0.0.0.0` | Server bind address |
-| `ENTRY_POINT_ADDRESS` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7 address |
+| `PORT` | `3300` | Server port (Deno only) |
+| `HOST` | `0.0.0.0` | Server bind address (Deno only) |
+| `ENTRY_POINT_ADDRESS` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7 |
 | `BUNDLING_MODE` | `auto` | `auto` or `manual` |
 | `MAX_BUNDLE_SIZE` | `10` | Max UserOps per bundle |
 | `MAX_BUNDLE_GAS` | `5000000` | Max gas per bundle |
@@ -174,33 +186,21 @@ Chain ID is per-request (via URL path), not a global config.
 | `ALCHEMY_API_KEY` | — | Alchemy API key for preferred RPCs |
 | `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
 | `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |
-| `BUNDLER_TIP_GWEI` | `0.5` | Fallback priority fee tip (Gwei). Chain's suggested tip is preferred when available. |
-| `MIN_PRIORITY_FEE_PER_GAS` | `1000000` | Minimum priority fee (wei, 0.001 Gwei). Low to support cheap L2s. |
-| `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum profitability (10%). UserOps below this are rejected. |
-| `TARGET_PROFIT_MARGIN_BPS` | `2000` | Target margin (20%). |
-| `HIGH_RISK_MARGIN_BPS` | `3000` | High-risk margin (30%). |
+| `BUNDLER_TIP_GWEI` | `0.5` | Fallback priority fee (Gwei) |
+| `MIN_PRIORITY_FEE_PER_GAS` | `1000000` | Minimum priority fee (wei) |
+| `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum margin (10%) |
+| `MAX_PROFIT_MARGIN_BPS` | `15000` | Maximum margin cap |
 | `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
-| `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve requirement multiplier |
-
-## Gas Pricing & Margin Control
-
-The bundler enforces a **10–50% margin band** to balance profitability with user protection:
-
-- **Floor (10%)**: UserOps with `effectiveGasPrice < outerGasPrice × 1.1` are rejected as unprofitable.
-- **Cap (50%)**: UserOps with `effectiveGasPrice > outerGasPrice × 1.5` are rejected to protect users from overpaying. This also eliminates MEV extraction incentive — at 30% margin the profit is too small for MEV bots to front-run.
-
-**Outer gas pricing** prefers the chain's suggested tip (`eth_maxPriorityFeePerGas` or derived from `eth_gasPrice`) over the configured `BUNDLER_TIP_GWEI`. This prevents the bundler from demanding higher gas than the network requires (e.g., 1.5 Gwei config tip on BSC where the chain only needs 1 Gwei).
-
-**Client-side**: Vela Wallet sets `maxFeePerGas = gasPrice × speedTier × 1.5`, keeping the UserOp gas price ~50% above the bundler's outer gas price — within the bundler's accepted band.
+| `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve multiplier |
+| `ACTIVE_CHAINS` | — | CF Worker only: chain IDs for cron keep-alive |
 
 ## Known Limitations
 
-- **No database** — no billing history, profit reports. In-memory state lost on restart.
-- **Single instance** — no distributed locking.
+- **No database** — in-memory state lost on restart.
+- **Single instance** per deployment (Deno). CF Workers scale via Durable Objects.
 - **No opcode tracing** — ERC-7562 not implemented.
 - **No aggregator support.**
-- **Reorg risk** — profitability checks apply to normal execution only.
-- **Conservative restart** — unknown pending nonce locks the EOA.
+- **Conservative restart** — unknown pending nonce locks the EOA until health loop recovers it.
 
 ## License
 
