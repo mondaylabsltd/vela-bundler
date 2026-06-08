@@ -28,6 +28,9 @@ const MAX_SPONSOR_NONCE = 3;
 /** Gas units used to calculate the max sponsor amount per transfer. */
 const MAX_SPONSOR_GAS = 5_000_000n;
 
+/** Minimum sponsor target balance (0.0001 ETH) — matches wallet client MIN_BALANCE_WEI. */
+const MIN_SPONSOR_BALANCE = 100_000_000_000_000n;
+
 /** Minimum treasury balance to keep (0.01 ETH). Won't sponsor below this. */
 const TREASURY_FLOOR = 10_000_000_000_000_000n;
 
@@ -130,6 +133,9 @@ export class SponsorService {
     const serverEstimate = gasPrice * 600_000n * 2n;
     let targetBalance = serverEstimate;
     if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
+    // Ensure target is at least MIN_SPONSOR_BALANCE so the wallet client's
+    // funding check (MIN_BALANCE_WEI = 0.0001) passes after sponsorship.
+    if (targetBalance < MIN_SPONSOR_BALANCE) targetBalance = MIN_SPONSOR_BALANCE;
     const sponsorAmount = targetBalance > maxSponsorAmount ? maxSponsorAmount : targetBalance;
     if (safeBalance < sponsorAmount * 2n) {
       return { sponsored: false, reason: "wallet_balance_too_low" };
