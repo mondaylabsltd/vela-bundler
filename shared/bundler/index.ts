@@ -245,12 +245,18 @@ export class BundlerService {
     const markupScaled = BigInt(Math.round(this.config.walletGasMarkup * 100));
     const intendedGasPrice = (userOpEffective * 100n) / markupScaled;
 
-    // Use chain's suggested tip as floor (some chains enforce minimum priority fee)
-    const tip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
+    // Put the whole intended premium into the priority fee so a higher-tier op
+    // (higher intendedGasPrice) genuinely gets faster inclusion — not just more
+    // base-fee headroom. Floor at the chain's suggested tip (some chains enforce a
+    // minimum priority fee). This also makes effectiveGasPrice the price actually
+    // paid (baseFee + priorityFee), so the reported margin matches reality.
+    const chainTip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
+    let priorityFee = intendedGasPrice > baseFee ? intendedGasPrice - baseFee : 0n;
+    if (priorityFee < chainTip) priorityFee = chainTip;
     const outerGas = {
-      maxFeePerGas: intendedGasPrice > tip ? intendedGasPrice : tip,
-      maxPriorityFeePerGas: tip,
-      effectiveGasPrice: intendedGasPrice,
+      maxFeePerGas: intendedGasPrice > baseFee + priorityFee ? intendedGasPrice : baseFee + priorityFee,
+      maxPriorityFeePerGas: priorityFee,
+      effectiveGasPrice: baseFee + priorityFee,
     };
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress

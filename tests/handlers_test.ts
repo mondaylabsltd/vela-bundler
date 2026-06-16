@@ -102,13 +102,17 @@ function mockReceipt(userOpHash: `0x${string}`): UserOperationReceipt {
 function mockChainRegistry(opts?: {
   receipt?: UserOperationReceipt;
   mempoolEntry?: MempoolEntry;
+  gasPrices?: { baseFee: bigint; suggestedMaxPriorityFeePerGas: bigint; chainGasPrice: bigint };
 }): ChainRegistryLike {
   const chains: ChainServices[] = [{
     chainId: 1,
     chainInfo: null,
     rpcUrl: "https://rpc.example.com",
     publicRpcs: [],
-    simulator: {} as any,
+    simulator: {
+      getGasPrices: async () =>
+        opts?.gasPrices ?? { baseFee: 0n, suggestedMaxPriorityFeePerGas: 0n, chainGasPrice: 0n },
+    } as any,
     mempool: {
       get(hash: string) {
         if (opts?.mempoolEntry && opts.mempoolEntry.userOpHash === hash) {
@@ -136,6 +140,37 @@ function mockChainRegistry(opts?: {
 }
 
 // --- Tests ---
+
+Deno.test("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost with split", async () => {
+  const config = mockConfig({ walletGasMarkup: 2.0 }); // relayer fee = network fee (~2×)
+  const registry = mockChainRegistry({
+    gasPrices: {
+      baseFee: 10_000_000_000n, // 10 gwei
+      suggestedMaxPriorityFeePerGas: 1_000_000_000n, // 1 gwei tip
+      chainGasPrice: 11_000_000_000n, // 11 gwei floor
+    },
+  });
+
+  const result = (await handleRpcMethod(
+    "pimlico_getUserOperationGasPrice", [], config, registry, mockReqCtx(),
+  )) as Record<string, Record<string, string>>;
+
+  // standard: tip×1.5 = 1.5 gwei → networkPrice = max(11.5, 11) = 11.5 gwei
+  //           userPrice = 11.5 × 2 = 23 gwei
+  assertEquals(BigInt(result.standard!.networkFeePerGas), 11_500_000_000n);
+  assertEquals(BigInt(result.standard!.maxFeePerGas), 23_000_000_000n);
+  // maxPriorityFeePerGas == maxFeePerGas so the EntryPoint charges exactly userPrice
+  assertEquals(result.standard!.maxPriorityFeePerGas, result.standard!.maxFeePerGas);
+  // network + relayer == total (relayer fee ≈ network fee at 2×)
+  assertEquals(
+    BigInt(result.standard!.networkFeePerGas) + BigInt(result.standard!.relayerFeePerGas),
+    BigInt(result.standard!.maxFeePerGas),
+  );
+
+  // Tiers strictly increase by speed: fast > standard > slow.
+  assert(BigInt(result.fast!.maxFeePerGas) > BigInt(result.standard!.maxFeePerGas));
+  assert(BigInt(result.standard!.maxFeePerGas) > BigInt(result.slow!.maxFeePerGas));
+});
 
 Deno.test("handleRpcMethod - eth_supportedEntryPoints returns config entry point", async () => {
   const config = mockConfig();

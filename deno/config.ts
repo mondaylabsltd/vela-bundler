@@ -58,7 +58,10 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
 
     minProfitMarginBps: parseInt(env("MIN_PROFIT_MARGIN_BPS", "1000")),
     maxProfitMarginBps: parseInt(env("MAX_PROFIT_MARGIN_BPS", "15000")),
-    walletGasMarkup: 1 + parseInt(env("WALLET_GAS_MARGIN_PERCENT", "50")) / 100,
+    // Relayer fee = walletGasMarkup × on-chain cost. Default 100% → user pays ~2×
+    // the network fee (one part to the chain, one to the relayer). Single source of
+    // truth for the price; quoted via pimlico_getUserOperationGasPrice.
+    walletGasMarkup: 1 + parseInt(env("WALLET_GAS_MARGIN_PERCENT", "100")) / 100,
 
     useEip1559,
     baseFeeMultiplier: parseFloat(env("BASE_FEE_MULTIPLIER", "1.25")),

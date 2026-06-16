@@ -45,6 +45,8 @@ export async function handleRpcMethod(
       return [config.entryPointAddress];
     case "eth_chainId":
       return "0x" + reqCtx.chainId.toString(16);
+    case "pimlico_getUserOperationGasPrice":
+      return await handleGetUserOperationGasPrice(config, chainRegistry, reqCtx);
     default:
       throw methodNotFound(method);
   }
@@ -332,6 +334,69 @@ async function handleEstimateUserOperationGas(
   }
 
   return result;
+}
+
+/**
+ * pimlico_getUserOperationGasPrice — the bundler is the single source of truth for
+ * the gas price. It quotes three speed tiers; the wallet uses the quote verbatim
+ * and shows it (it never marks the price up on its own).
+ *
+ * Pricing policy (one knob, `config.walletGasMarkup`, default 2.0):
+ *   networkPrice = max(baseFee + tip×tierMul, eth_gasPrice)   // real on-chain cost
+ *   userPrice    = networkPrice × walletGasMarkup             // what the user pays
+ *   relayerFee   = userPrice − networkPrice                   // Vela's cut (≈ networkPrice at 2×)
+ *
+ * `maxPriorityFeePerGas == maxFeePerGas` so the EntryPoint charges exactly
+ * `userPrice` per gas (no on-chain price refund below it). Tiers scale only the
+ * priority tip, i.e. inclusion speed; the markup is constant across tiers.
+ *
+ * The extra `networkFeePerGas` / `relayerFeePerGas` fields are a Vela extension
+ * that lets the wallet render an honest "network vs relayer" split. Standard
+ * clients ignore them.
+ */
+async function handleGetUserOperationGasPrice(
+  config: BundlerConfig,
+  chainRegistry: ChainRegistryLike,
+  reqCtx: RequestContext,
+): Promise<Record<string, Record<string, string>>> {
+  const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
+
+  let rpcOverride = reqCtx.requestRpcUrl;
+  if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
+    rpcOverride = undefined;
+  }
+
+  const { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice } =
+    await chain.simulator.getGasPrices(rpcOverride);
+
+  // walletGasMarkup is a float (e.g. 2.0); scale to bps for integer math.
+  const markupBps = BigInt(Math.round(config.walletGasMarkup * 10000));
+
+  // Speed tiers scale the priority tip only (as a percentage). Faster tier →
+  // higher tip → faster inclusion; the relayer markup stays the same.
+  function quote(tipMulPercent: number): Record<string, string> {
+    const tip = (suggestedMaxPriorityFeePerGas * BigInt(tipMulPercent)) / 100n;
+    // Real on-chain cost at this speed, floored at eth_gasPrice so legacy /
+    // minimum-gas-price chains (BSC, Polygon) are never under-priced.
+    let networkPrice = baseFee + tip;
+    if (chainGasPrice > networkPrice) networkPrice = chainGasPrice;
+
+    const userPrice = (networkPrice * markupBps) / 10000n;
+    const relayerPrice = userPrice > networkPrice ? userPrice - networkPrice : 0n;
+
+    return {
+      maxFeePerGas: "0x" + userPrice.toString(16),
+      maxPriorityFeePerGas: "0x" + userPrice.toString(16),
+      networkFeePerGas: "0x" + networkPrice.toString(16),
+      relayerFeePerGas: "0x" + relayerPrice.toString(16),
+    };
+  }
+
+  return {
+    slow: quote(100), // tip × 1.0
+    standard: quote(150), // tip × 1.5
+    fast: quote(200), // tip × 2.0
+  };
 }
 
 function handleGetUserOperationByHash(
