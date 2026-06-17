@@ -23,7 +23,7 @@ import type { BundlerConfig } from "../config/types.ts";
 // ---------------------------------------------------------------------------
 
 /** Max relayer EOA nonce to qualify for sponsorship. */
-const MAX_SPONSOR_NONCE = 3;
+const MAX_SPONSOR_NONCE = 6;
 
 /** Gas units used to calculate the max sponsor amount per transfer. */
 const MAX_SPONSOR_GAS = 5_000_000n;
@@ -172,8 +172,18 @@ export class SponsorService {
       transport: http(rpcUrl),
     });
 
+    // Priority fee — query the chain's suggested tip instead of hardcoding
+    // gasPrice/10. Chains like BSC enforce a minimum gas tip cap (e.g. 0.05 gwei);
+    // a hardcoded fraction is rejected with "transaction gas price below minimum".
+    let tip: bigint;
+    try {
+      tip = await client.estimateMaxPriorityFeePerGas();
+    } catch {
+      tip = gasPrice; // fallback: use the full gas price as the tip
+    }
+    if (tip <= 0n) tip = gasPrice;
+    tip = (tip * 110n) / 100n; // 10% headroom to clear the chain minimum
     const baseFee = gasPrice; // approximate
-    const tip = gasPrice / 10n || 1n; // 10% tip
     const maxFee = baseFee * 2n + tip;
 
     console.log(

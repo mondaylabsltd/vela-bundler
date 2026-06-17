@@ -50,6 +50,11 @@ const RECEIPT_STORE_MAX = 10_000;
 /** Max polling attempts for a single pending receipt (60 × ~10s alarm = 10 min). */
 const PENDING_RECEIPT_MAX_CHECKS = 60;
 
+/** Post-bundle treasury sweep toggle. Temporarily disabled — we no longer skim
+ *  25% of the relayer balance to the treasury after every bundle. Flip back to
+ *  `true` to re-enable. */
+const SWEEP_ENABLED = false;
+
 /** Metadata for a pending transaction that needs receipt confirmation. */
 interface PendingReceipt {
   txHash: `0x${string}`;
@@ -696,7 +701,7 @@ export class BundlerService {
       // Post-bundle sweep: transfer 25% of relayer balance to treasury.
       // Runs after receipt is confirmed, inside the finally block would be too late
       // (reservation is released there). Non-fatal — errors are logged and ignored.
-      if (receipt && receipt.status === "success" && this.config.treasuryAddress) {
+      if (SWEEP_ENABLED && receipt && receipt.status === "success" && this.config.treasuryAddress) {
         try {
           const eoaDerived = await this.accountService.deriveEOA(
             entries[0]!.userOp.sender as `0x${string}`,
@@ -746,7 +751,7 @@ export class BundlerService {
           this.storeReceiptLogs(receipt, pending.entries);
 
           // Post-bundle sweep
-          if (receipt.status === "success" && this.config.treasuryAddress) {
+          if (SWEEP_ENABLED && receipt.status === "success" && this.config.treasuryAddress) {
             try {
               const eoaDerived = await this.accountService.deriveEOA(
                 pending.entries[0]!.userOp.sender as `0x${string}`,
