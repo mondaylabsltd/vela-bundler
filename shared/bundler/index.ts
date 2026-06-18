@@ -33,6 +33,13 @@ import {
   checkBundleProfitability,
 } from "../gas/profitability.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
+import {
+  isTempoChain,
+  resolveFeeToken,
+  tempoCostInFeeToken,
+  parseTempoReimbursement,
+  submitTempoBundle,
+} from "../tempo.ts";
 
 export interface BundleResult {
   submitted: boolean;
@@ -233,8 +240,13 @@ export class BundlerService {
     eoa: { address: `0x${string}`; privateKey?: `0x${string}` },
     entries: MempoolEntry[],
   ): Promise<BundleResult> {
-    // Use user-provided RPC if any entry has one (all ops for same sender share the same RPC)
-    const rpcOverride = entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
+    // Use user-provided RPC if any entry has one (all ops for same sender share the same RPC).
+    // Tempo's public RPCs (rpc.tempo.xyz) are flaky and time out on getTransactionCount,
+    // breaking nonce/state management and blocking submission — use the bundler's own
+    // configured (Alchemy) RPC there instead of the wallet-supplied one.
+    const rpcOverride = isTempoChain(this.config.chainId)
+      ? undefined
+      : entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
     const effectiveRpc = rpcOverride ?? this.config.rpcUrl;
 
     const gasPrices = await this.simulator.getGasPrices(rpcOverride);
@@ -344,54 +356,85 @@ export class BundlerService {
       };
     }
 
-    // Profitability check.
-    // Revenue = estimatedGas × userOpGasPrice (what EntryPoint charges).
-    // Cost    = estimatedGas × outerGasPrice   (what bundler pays on-chain).
-    // Margin  = WALLET_GAS_MARKUP - 1 (constant).
-    const actualGasCosts = [bundleSim.estimatedGas! * userOpEffective];
+    const tempo = isTempoChain(this.config.chainId);
 
-    const profitResult = checkBundleProfitability({
-      actualGasCosts,
-      estimatedHandleOpsGas: bundleSim.estimatedGas!,
-      outerTxEffectiveGasPrice: outerGas.effectiveGasPrice,
-      minProfitMarginBps: this.config.minProfitMarginBps,
-    });
-
-    if (!profitResult.profitable) {
-      return {
-        submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
-        error: `Unprofitable: ${profitResult.marginBps}bps < ${this.config.minProfitMarginBps}bps`,
-      };
-    }
-
-    if (profitResult.marginBps > this.config.maxProfitMarginBps) {
-      return {
-        submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
-        error: `Margin too high: ${profitResult.marginBps}bps > ${this.config.maxProfitMarginBps}bps (user overpaying)`,
-      };
-    }
-
-    // Balance check before submission
+    // expectedCost is the native outer-tx cost (used for native balance reserve).
+    // On Tempo it's meaningless (no native coin) and unused.
     const expectedCost = bundleSim.estimatedGas! * outerGas.effectiveGasPrice;
-    let balanceCheck;
-    try {
-      balanceCheck = await this.accountService.checkBalance(safeAddress, expectedCost, rpcOverride);
-    } catch (err) {
-      console.error(`[Bundler] Balance check failed for ${safeAddress}:`, err);
-      return {
-        submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
-        error: "Balance check RPC failed",
-      };
-    }
-    if (!balanceCheck.sufficient) {
-      return {
-        submitted: false,
-        userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
-        error: `Insufficient balance: ${balanceCheck.spendableBalance} < ${balanceCheck.requiredBalance}`,
-      };
+
+    if (tempo) {
+      // Tempo: the bundler is repaid by a stablecoin transfer batched into the UserOp,
+      // not by EntryPoint (maxFee=0 → refund 0). Verify that in-band reimbursement
+      // covers our outer-0x76 cost in fee-token units. Native profitability/balance
+      // checks don't apply.
+      const feeToken = resolveFeeToken(checkedEntries[0]!.entry.userOp.feeToken);
+      const costInFeeToken = tempoCostInFeeToken(bundleSim.estimatedGas!, baseFee);
+      let reimbursed = 0n;
+      for (const e of checkedEntries) {
+        // Reimbursement is paid in the SENT token (any USD stablecoin the Safe holds),
+        // not necessarily the 0x76 fee token — match any TIP-20 transfer to the EOA.
+        reimbursed += parseTempoReimbursement(e.entry.userOp.callData, beneficiary);
+      }
+      console.log(
+        `[Bundler][Tempo] reimbursed=${reimbursed} cost=${costInFeeToken} feeToken=${feeToken} estimatedGas=${bundleSim.estimatedGas} (${checkedEntries.length} ops)`,
+      );
+      if (reimbursed < costInFeeToken) {
+        console.warn(`[Bundler][Tempo] REJECT — reimbursement ${reimbursed} < cost ${costInFeeToken}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `Tempo reimbursement too low: ${reimbursed} < cost ${costInFeeToken} in ${feeToken}`,
+        };
+      }
+    } else {
+      // Profitability check.
+      // Revenue = estimatedGas × userOpGasPrice (what EntryPoint charges).
+      // Cost    = estimatedGas × outerGasPrice   (what bundler pays on-chain).
+      // Margin  = WALLET_GAS_MARKUP - 1 (constant).
+      const actualGasCosts = [bundleSim.estimatedGas! * userOpEffective];
+
+      const profitResult = checkBundleProfitability({
+        actualGasCosts,
+        estimatedHandleOpsGas: bundleSim.estimatedGas!,
+        outerTxEffectiveGasPrice: outerGas.effectiveGasPrice,
+        minProfitMarginBps: this.config.minProfitMarginBps,
+      });
+
+      if (!profitResult.profitable) {
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `Unprofitable: ${profitResult.marginBps}bps < ${this.config.minProfitMarginBps}bps`,
+        };
+      }
+
+      if (profitResult.marginBps > this.config.maxProfitMarginBps) {
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `Margin too high: ${profitResult.marginBps}bps > ${this.config.maxProfitMarginBps}bps (user overpaying)`,
+        };
+      }
+
+      // Balance check before submission
+      let balanceCheck;
+      try {
+        balanceCheck = await this.accountService.checkBalance(safeAddress, expectedCost, rpcOverride);
+      } catch (err) {
+        console.error(`[Bundler] Balance check failed for ${safeAddress}:`, err);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: "Balance check RPC failed",
+        };
+      }
+      if (!balanceCheck.sufficient) {
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `Insufficient balance: ${balanceCheck.spendableBalance} < ${balanceCheck.requiredBalance}`,
+        };
+      }
     }
 
     // Final time-range re-check right before submission to guard against expiry
@@ -418,8 +461,8 @@ export class BundlerService {
       }
     }
 
-    // Reserve balance atomically
-    this.accountService.reserveBalance(eoa.address, expectedCost);
+    // Reserve balance atomically (native only — Tempo settles in stablecoin in-band).
+    if (!tempo) this.accountService.reserveBalance(eoa.address, expectedCost);
 
     // Submit using the dedicated EOA as signer, via user's RPC if provided
     const account = privateKeyToAccount(eoa.privateKey!);
@@ -432,15 +475,31 @@ export class BundlerService {
     const calldata = encodeHandleOps(packedOps, beneficiary);
     const userOpHashes = checkedEntries.map((e) => e.entry.userOpHash);
 
+    console.log(
+      `[Bundler] Submitting bundle for ${safeAddress} via ${tempo ? "Tempo 0x76" : "EIP-1559"} (eoa=${eoa.address}, rpc=${submitRpcUrl})`,
+    );
+
     try {
-      const txHash = await walletClient.sendTransaction({
-        to: this.config.entryPointAddress,
-        data: calldata,
-        maxFeePerGas: outerGas.maxFeePerGas,
-        maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
-        chain: null,
-        account,
-      });
+      // Tempo: submit handleOps inside a native 0x76 tx paying gas in the stablecoin.
+      // Every other chain: standard EIP-1559 handleOps from the dedicated EOA.
+      const txHash = tempo
+        ? await submitTempoBundle({
+            chainId: this.config.chainId,
+            privateKey: eoa.privateKey!,
+            rpcUrl: submitRpcUrl,
+            entryPoint: this.config.entryPointAddress,
+            packedOps,
+            beneficiary,
+            feeToken: resolveFeeToken(checkedEntries[0]!.entry.userOp.feeToken),
+          })
+        : await walletClient.sendTransaction({
+            to: this.config.entryPointAddress,
+            data: calldata,
+            maxFeePerGas: outerGas.maxFeePerGas,
+            maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
+            chain: null,
+            account,
+          });
 
       console.log(
         `[Bundler] Bundle submitted for ${safeAddress}: ${txHash} ` +

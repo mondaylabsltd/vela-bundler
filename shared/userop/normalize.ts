@@ -32,6 +32,8 @@ export function normalizeUserOp(raw: any): UserOperation {
     paymasterData: optionalHex(raw.paymasterData),
     signature: requireHex(raw.signature, "signature"),
     eip7702Auth: raw.eip7702Auth ?? undefined,
+    // Vela extension (Tempo): the stablecoin to charge for the outer 0x76 gas.
+    feeToken: optionalAddress(raw.feeToken),
   };
 }
 

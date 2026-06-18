@@ -14,6 +14,7 @@ import {
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
 import { validateUserOpFields, UserOpValidationError } from "../userop/validate.ts";
+import { isTempoChain } from "../tempo.ts";
 import { calcPreVerificationGas } from "../gas/preVerificationGas.ts";
 import {
   calcUserOpGasPrice,
@@ -81,7 +82,8 @@ async function handleSendUserOperation(
   }
 
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
-  let rpcOverride = reqCtx.requestRpcUrl;
+  // Tempo public RPCs are flaky (timeouts) — use the bundler's configured (Alchemy) RPC.
+  let rpcOverride = isTempoChain(reqCtx.chainId) ? undefined : reqCtx.requestRpcUrl;
 
   // If the user's RPC was previously blacklisted and we have a different
   // chain default (Alchemy / public), skip the bad URL upfront.
@@ -107,7 +109,8 @@ async function handleSendUserOperation(
   }
 
   try {
-    validateUserOpFields(userOp);
+    // Tempo requires maxFeePerGas = 0 (no native coin; gas paid in a stablecoin 0x76).
+    validateUserOpFields(userOp, isTempoChain(reqCtx.chainId));
   } catch (err) {
     if (err instanceof UserOpValidationError) {
       throw bundlerError(err.code, err.message);
@@ -140,6 +143,11 @@ async function handleSendUserOperation(
       "EOA_HAS_UNKNOWN_PENDING_TX: dedicated bundler EOA has unknown pending transactions.",
     );
   }
+
+  // Tempo settles gas in a stablecoin via the bundler's 0x76 (see shared/tempo.ts), so
+  // the native balance / priority-fee floor / gas-price-margin checks below don't apply
+  // (maxFeePerGas = 0 there is required, not a misconfiguration).
+  const tempo = isTempoChain(reqCtx.chainId);
 
   // Check balance — use chain-aware gas pricing
   let gasPrices;
@@ -198,7 +206,7 @@ async function handleSendUserOperation(
   if (!balanceCheck.sufficient) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
-      `Insufficient balance on dedicated bundler EOA. ` +
+      `Insufficient ${tempo ? 'pathUSD' : 'native'} balance on dedicated bundler gas account. ` +
       `Spendable: ${balanceCheck.spendableBalance}, required: ${balanceCheck.requiredBalance}. ` +
       `Deposit to: ${eoa.address}`,
     );
@@ -215,7 +223,7 @@ async function handleSendUserOperation(
     );
   }
 
-  if (userOp.maxPriorityFeePerGas < config.minPriorityFeePerGas) {
+  if (!tempo && userOp.maxPriorityFeePerGas < config.minPriorityFeePerGas) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `maxPriorityFeePerGas too low: ${userOp.maxPriorityFeePerGas} < minimum ${config.minPriorityFeePerGas}`,
@@ -234,7 +242,7 @@ async function handleSendUserOperation(
   // Sanity check: derived outer price must not be absurdly below chain rate.
   // Use 5x tolerance — on cheap-gas chains (Gnosis, ~0.001 Gwei) the gas price
   // fluctuates by 2-3x between blocks, making a 50% threshold too strict.
-  if (derivedOuterPrice * 5n < outerGas.effectiveGasPrice) {
+  if (!tempo && derivedOuterPrice * 5n < outerGas.effectiveGasPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `Gas price too low: derived outer price ${derivedOuterPrice} < ` +
@@ -287,7 +295,8 @@ async function handleEstimateUserOperationGas(
   }
 
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
-  let rpcOverride = reqCtx.requestRpcUrl;
+  // Tempo public RPCs are flaky (timeouts) — use the bundler's configured (Alchemy) RPC.
+  let rpcOverride = isTempoChain(reqCtx.chainId) ? undefined : reqCtx.requestRpcUrl;
 
   if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
     console.warn(`[RPC] Skipping blacklisted user RPC ${rpcOverride}, using chain default ${chain.rpcUrl}`);

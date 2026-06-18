@@ -16,10 +16,19 @@ export class UserOpValidationError extends Error {
   }
 }
 
+/** Tempo's Safe deploy (initCode) is far more expensive to meter than EVM chains —
+ *  ~3.9M gas — so it needs a higher verification-gas ceiling than the default 2M. */
+export const TEMPO_MAX_VERIFICATION_GAS = 8_000_000n;
+
 /**
  * Validate field-level constraints on a UserOperation before simulation.
+ *
+ * @param tempo  Tempo chain: maxFeePerGas = 0 is REQUIRED (no native coin — EntryPoint's
+ *   native accounting must be a no-op; the bundler's outer 0x76 pays gas in a stablecoin),
+ *   and the verification-gas ceiling is raised for the expensive Safe deploy. See
+ *   shared/tempo.ts.
  */
-export function validateUserOpFields(userOp: UserOperation): void {
+export function validateUserOpFields(userOp: UserOperation, tempo = false): void {
   // sender must be a valid address
   if (!userOp.sender || !/^0x[0-9a-fA-F]{40}$/.test(userOp.sender)) {
     throw new UserOpValidationError("invalid sender address");
@@ -46,15 +55,16 @@ export function validateUserOpFields(userOp: UserOperation): void {
     throw new UserOpValidationError("preVerificationGas must be > 0");
   }
 
-  // MAX_VERIFICATION_GAS enforcement
-  if (userOp.verificationGasLimit > MAX_VERIFICATION_GAS) {
+  // MAX_VERIFICATION_GAS enforcement (raised on Tempo for the costly Safe deploy)
+  const maxVerificationGas = tempo ? TEMPO_MAX_VERIFICATION_GAS : MAX_VERIFICATION_GAS;
+  if (userOp.verificationGasLimit > maxVerificationGas) {
     throw new UserOpValidationError(
-      `verificationGasLimit exceeds MAX_VERIFICATION_GAS (${MAX_VERIFICATION_GAS})`,
+      `verificationGasLimit exceeds max (${maxVerificationGas})`,
     );
   }
 
   // Fee fields
-  if (userOp.maxFeePerGas <= 0n) {
+  if (!tempo && userOp.maxFeePerGas <= 0n) {
     throw new UserOpValidationError("maxFeePerGas must be > 0");
   }
   if (userOp.maxPriorityFeePerGas < 0n) {
