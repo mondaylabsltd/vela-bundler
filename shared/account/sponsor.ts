@@ -17,6 +17,13 @@ import { privateKeyToAccount } from "viem/accounts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { deriveTreasuryPrivateKey } from "../keys/derive.ts";
 import type { BundlerConfig } from "../config/types.ts";
+import {
+  isTempoChain,
+  tempoPathUsdBalance,
+  sponsorTempoPathUsd,
+  TEMPO_SPONSOR_TARGET,
+  TEMPO_TREASURY_FLOOR,
+} from "../tempo.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -123,6 +130,16 @@ export class SponsorService {
     const nonce = await client.getTransactionCount({ address: relayerAddress });
     if (nonce > MAX_SPONSOR_NONCE) {
       return { sponsored: false, reason: "nonce_exceeded" };
+    }
+
+    // Tempo has no native coin — sponsor a pathUSD float to the gas account via a 0x76
+    // (the native balance/gas math below doesn't apply). Same passkey gate.
+    if (isTempoChain(chainId)) {
+      const hasPasskey = await this.checkWebAuthnRegistration(safeAddress);
+      if (!hasPasskey) {
+        return { sponsored: false, reason: "no_passkey_registered" };
+      }
+      return await this._doSponsorTempo(chainId, relayerAddress, rpcUrl);
     }
 
     // 4. User wallet balance check — Safe must hold ≥ 2× the sponsor amount.
@@ -238,6 +255,44 @@ export class SponsorService {
         reason: "transfer_failed",
       };
     }
+  }
+
+  /**
+   * Tempo sponsorship: top the gas account up to a fixed pathUSD float via a 0x76
+   * transfer from the treasury. No native coin, so amounts are in pathUSD (6-dec);
+   * the float self-replenishes from each tx's batched reimbursement.
+   */
+  private async _doSponsorTempo(
+    chainId: number,
+    relayerAddress: `0x${string}`,
+    rpcUrl: string,
+  ): Promise<SponsorResult> {
+    const client = getPublicClient(rpcUrl);
+
+    const relayerBalance = await tempoPathUsdBalance(client, relayerAddress);
+    if (relayerBalance >= TEMPO_SPONSOR_TARGET) {
+      return { sponsored: false, reason: "already_funded" };
+    }
+    const amount = TEMPO_SPONSOR_TARGET - relayerBalance;
+
+    const treasuryBalance = await tempoPathUsdBalance(client, this.config.treasuryAddress);
+    if (treasuryBalance < amount + TEMPO_TREASURY_FLOOR) {
+      return { sponsored: false, reason: "treasury_depleted" };
+    }
+
+    const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
+    console.log(
+      `[Sponsor][Tempo] treasury → ${relayerAddress} (chain ${chainId}): ${amount} pathUSD units`,
+    );
+    const txHash = await sponsorTempoPathUsd({
+      chainId,
+      privateKey: treasuryPrivateKey,
+      rpcUrl,
+      to: relayerAddress,
+      amount,
+    });
+    console.log(`[Sponsor][Tempo] Confirmed: ${txHash}`);
+    return { sponsored: true, txHash, amount: "0x" + amount.toString(16) };
   }
 
   /**

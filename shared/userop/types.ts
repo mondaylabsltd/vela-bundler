@@ -23,6 +23,11 @@ export interface UserOperation {
   signature: `0x${string}`;
   // EIP-7702 authorization list if present
   eip7702Auth?: Eip7702Authorization[];
+  /**
+   * Tempo only (Vela extension): the USD stablecoin the bundler charges for the outer
+   * 0x76 transaction gas. Not part of the PackedUserOperation — see shared/tempo.ts.
+   */
+  feeToken?: `0x${string}` | null;
 }
 
 export interface Eip7702Authorization {

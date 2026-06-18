@@ -41,7 +41,7 @@ export class Mempool {
   /** Map from sender to set of userOpHashes. */
   private bySender: Map<string, Set<string>> = new Map();
   /** Map from sender+nonce to userOpHash for replacement tracking. */
-  private bySenderNonce: Map<string, string> = new Map();
+  private bySenderNonce: Map<string, `0x${string}`> = new Map();
   /** Paymaster deposit reservations: paymaster -> total reserved gas cost. */
   private paymasterReservations: Map<string, bigint> = new Map();
 

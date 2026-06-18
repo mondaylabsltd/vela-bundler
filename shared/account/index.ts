@@ -10,6 +10,7 @@
 import {
   createPublicClient,
   http,
+  parseAbi,
   type PublicClient,
   type Transport,
   type Chain,
@@ -20,6 +21,9 @@ import { EOALockManager, type EOAStatus } from "./eoa-lock.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { withTimeout, RPC_TIMEOUT_MS } from "../utils/timeout.ts";
+import { isTempoChain, TEMPO_DEFAULT_FEE_TOKEN } from "../tempo.ts";
+
+const ERC20_BALANCE_ABI = parseAbi(["function balanceOf(address) view returns (uint256)"]);
 
 export { EOALockManager, type EOAStatus, type EOAState } from "./eoa-lock.ts";
 
@@ -150,6 +154,26 @@ export class AccountService {
     rpcUrlOverride?: string,
   ): Promise<{ sufficient: boolean; spendableBalance: bigint; requiredBalance: bigint }> {
     const eoa = await this.deriveEOA(safeAddress);
+
+    // Tempo has no native coin: the gas account fronts the outer-0x76 gas in pathUSD
+    // (a prefund — proven required: a 0-balance account can't submit). Check its pathUSD
+    // balance against the cost converted to pathUSD units (attodollars / 1e12).
+    if (isTempoChain(this.config.chainId)) {
+      const client = rpcUrlOverride ? getPublicClient(rpcUrlOverride) : this.client;
+      const balance = await withTimeout(
+        client.readContract({
+          address: TEMPO_DEFAULT_FEE_TOKEN,
+          abi: ERC20_BALANCE_ABI,
+          functionName: "balanceOf",
+          args: [eoa.address],
+        }) as Promise<bigint>,
+        RPC_TIMEOUT_MS,
+        "pathUSD balanceOf",
+      );
+      const requiredBalance = expectedCost / 10n ** 12n || 1n;
+      return { sufficient: balance >= requiredBalance, spendableBalance: balance, requiredBalance };
+    }
+
     const onchainBalance = await this.getOnchainBalance(eoa.address, rpcUrlOverride);
     const reservedBalance = this.lockManager.getReservedBalance(eoa.address);
     const spendableBalance = onchainBalance > reservedBalance
