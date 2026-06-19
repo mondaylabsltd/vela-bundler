@@ -53,6 +53,14 @@ export const TEMPO_FEE_TOKEN_DECIMALS = 6;
 /** Tempo's protocol base fee fallback: 20e9 attodollars (USD×1e-18) per gas. */
 export const TEMPO_BASE_FEE_ATTO = 20_000_000_000n;
 
+/**
+ * Added to the simulated handleOps gas when pricing the bundler's cost. The 0x76 tx
+ * carries base-tx + fee-settlement overhead beyond what an `eth_simulateV1` of handleOps
+ * reports, so we bump the cost basis up to stay conservative — the bundler must never
+ * accept a reimbursement below its real on-chain outlay.
+ */
+export const TEMPO_COST_BUFFER_GAS = 80_000n;
+
 /** Resolve & checksum the fee token, falling back to pathUSD. */
 export function resolveFeeToken(feeToken?: string | null): `0x${string}` {
   if (feeToken && /^0x[0-9a-fA-F]{40}$/.test(feeToken)) return getAddress(feeToken);
@@ -122,22 +130,30 @@ export async function sponsorTempoPathUsd(params: {
 
 /**
  * Decode the in-band reimbursement: walk the UserOp's MultiSend batch and sum every
- * TIP-20 transfer to `recipient` (the bundler EOA), in ANY token. The reimbursement is
- * paid in the token the user is sending (which their Safe holds) — not necessarily the
- * 0x76 fee token — and all Tempo stablecoins are USD-pegged ≈ $1, so the 6-decimal
- * amounts are directly comparable to the fee-token cost. Returns 0n if the UserOp isn't
- * a MultiSend batch or contains no transfer to the EOA. Trust-minimised: reads the
- * actual signed calldata rather than a wallet-supplied amount.
+ * TIP-20 transfer to `recipient` (the bundler EOA) **in the trusted `feeToken`** — the
+ * same stablecoin the bundler settles the 0x76 gas in. Returns 0n if the UserOp isn't a
+ * MultiSend batch or contains no qualifying transfer.
+ *
+ * SECURITY — token allowlist: we must NOT count a transfer in an arbitrary token. The
+ * amount is taken at face value (all Tempo stablecoins are 6-decimal, $1-pegged), so an
+ * attacker could repay in a worthless token they deployed (face value ≥ cost), pass this
+ * check AND execution, and drain the bundler's real pathUSD gas. Restricting to the
+ * feeToken the bundler actually pays gas in closes that and removes cross-token valuation
+ * risk (same token in, same token out). Trust-minimised: reads the signed calldata, not a
+ * wallet-supplied amount.
  */
 export function parseTempoReimbursement(
   callData: Hex,
   recipient: `0x${string}`,
+  feeToken: `0x${string}`,
 ): bigint {
-  // Normalise `recipient` (the bundler passes a lowercase eoa.address) so it matches the
-  // checksummed address decoded from the transfer calldata.
+  // Normalise `recipient` (the bundler passes a lowercase eoa.address) and the trusted
+  // `feeToken` so both match the checksummed addresses decoded from the batch.
   let target: `0x${string}`;
+  let trustedToken: `0x${string}`;
   try {
     target = getAddress(recipient);
+    trustedToken = getAddress(feeToken);
   } catch {
     return 0n;
   }
@@ -150,9 +166,18 @@ export function parseTempoReimbursement(
     let off = 0;
     let sum = 0n;
     while (off < total) {
+      const callTo = slice(txs, off + 1, off + 21); // sub-call target = the token contract
       const dataLen = hexToNumber(slice(txs, off + 53, off + 85));
       const innerCall = slice(txs, off + 85, off + 85 + dataLen);
       off += 85 + dataLen;
+      // Only the trusted feeToken counts — see SECURITY note above.
+      let tokenTrusted = false;
+      try {
+        tokenTrusted = getAddress(callTo) === trustedToken;
+      } catch {
+        tokenTrusted = false;
+      }
+      if (!tokenTrusted) continue;
       try {
         const t = decodeFunctionData({ abi: ERC20_ABI, data: innerCall });
         if (t.functionName === "transfer" && getAddress(t.args[0] as string) === target) {
@@ -166,6 +191,29 @@ export function parseTempoReimbursement(
   } catch {
     return 0n;
   }
+}
+
+/**
+ * Outer-0x76 gas limit needed to honour every op's DECLARED limits. The EntryPoint
+ * forwards `verificationGasLimit` then `callGasLimit` per op (each subject to the
+ * 63/64 rule), so the tx must carry at least their sum plus tx/handleOps overhead.
+ *
+ * We must NOT lean on `eth_estimateGas` here: handleOps catches a UserOp's inner
+ * revert/OOG and still succeeds, so the estimate settles at a value where the outer
+ * tx passes but the inner op ran out of gas — exactly the failure we're avoiding.
+ */
+export function tempoHandleOpsGasLimit(packedOps: PackedUserOperation[]): bigint {
+  let declared = 0n;
+  for (const op of packedOps) {
+    const agl = op.accountGasLimits.slice(2); // bytes32: vGL(16) | cGL(16)
+    const vGL = BigInt("0x" + agl.slice(0, 32));
+    const cGL = BigInt("0x" + agl.slice(32, 64));
+    declared += vGL + cGL + op.preVerificationGas;
+  }
+  // 64/63 covers the gas the EntryPoint must retain to forward each call limit in
+  // full; + per-op handleOps overhead + base-tx headroom. Unused gas isn't charged
+  // on Tempo (fee = gasUsed × price), so a generous ceiling is free.
+  return (declared * 64n) / 63n + BigInt(packedOps.length) * 50_000n + 60_000n;
 }
 
 /**
@@ -191,11 +239,16 @@ export async function submitTempoBundle(params: {
   }).extend(tempoActions());
 
   const calldata = encodeHandleOps(params.packedOps, params.beneficiary);
+  // Pin the outer gas to the ops' declared needs. Without this viem's eth_estimateGas
+  // under-provisions (handleOps swallows inner OOG), starving the execution phase and
+  // reverting the UserOp on-chain while the 0x76 still "succeeds".
+  const gas = tempoHandleOpsGasLimit(params.packedOps);
   try {
     const receipt = await client.sendTransactionSync({
       to: params.entryPoint,
       data: calldata,
       feeToken: params.feeToken,
+      gas,
     });
     return receipt.transactionHash;
   } catch (err) {

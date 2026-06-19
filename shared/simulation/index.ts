@@ -10,6 +10,7 @@ import {
   decodeErrorResult,
   decodeFunctionResult,
   encodeFunctionData,
+  parseEventLogs,
   type PublicClient,
   type Transport,
   type Chain,
@@ -846,9 +847,105 @@ export function createSimulator(config: BundlerConfig) {
     return { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice };
   }
 
+  /**
+   * Verify every op's EXECUTION (not just validation) would succeed on-chain — i.e.
+   * `UserOperationEvent.success` would be true for each. Critical on Tempo, where the
+   * bundler is repaid only by an in-band feeToken transfer batched inside the UserOp:
+   * if execution reverts (OOG, insufficient balance, …) handleOps still SUCCEEDS but the
+   * reimbursement transfer is rolled back, so the bundler pays 0x76 gas for nothing.
+   *
+   * handleOps swallows the inner revert, so eth_call / eth_estimateGas can't see it. We
+   * run handleOps through eth_simulateV1 (which returns logs) and read each
+   * UserOperationEvent.success. The op's real callGasLimit is enforced by the EntryPoint
+   * internally, so an OOG at the declared limit is faithfully reproduced. Fails CLOSED:
+   * if we can't prove success, we don't submit.
+   */
+  async function simulateExecutionSuccess(
+    packedOps: PackedUserOperation[],
+    beneficiary: `0x${string}`,
+    rpcUrlOverride?: string,
+  ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint }> {
+    const calldata = encodeHandleOps(packedOps, beneficiary);
+    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
+    let json: {
+      result?: Array<{ calls?: Array<{ status?: string; gasUsed?: string; logs?: unknown[]; error?: { message?: string } }> }>;
+      error?: { message: string };
+    };
+    try {
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_simulateV1",
+          params: [
+            {
+              blockStateCalls: [
+                { calls: [{ from: beneficiary, to: config.entryPointAddress, data: calldata }] },
+              ],
+              validation: false,
+              traceTransfers: false,
+            },
+            "latest",
+          ],
+        }),
+      });
+      json = await res.json();
+    } catch (err) {
+      return { success: false, errorMessage: `eth_simulateV1 failed: ${err instanceof Error ? err.message : String(err)}` };
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (json.error) {
+      return { success: false, errorMessage: `eth_simulateV1 error: ${json.error.message}` };
+    }
+    const call = json.result?.[0]?.calls?.[0];
+    if (!call) {
+      return { success: false, errorMessage: "eth_simulateV1 returned no call result" };
+    }
+    // handleOps itself reverted (e.g. validation FailedOp) — whole bundle is invalid.
+    if (call.status !== undefined && BigInt(call.status) === 0n) {
+      return { success: false, errorMessage: `handleOps reverted in simulation: ${call.error?.message ?? "unknown"}` };
+    }
+
+    const events = parseEventLogs({
+      abi: ENTRYPOINT_V07_ABI,
+      // deno-lint-ignore no-explicit-any
+      logs: (call.logs ?? []) as any,
+      eventName: "UserOperationEvent",
+    });
+    // EntryPoint emits one UserOperationEvent per op, in submission order.
+    for (let i = 0; i < events.length; i++) {
+      // deno-lint-ignore no-explicit-any
+      if ((events[i] as any).args?.success === false) {
+        return { success: false, failedOpIndex: i, errorMessage: `UserOp ${i} execution would revert on-chain` };
+      }
+    }
+    if (events.length < packedOps.length) {
+      return {
+        success: false,
+        errorMessage: `only ${events.length}/${packedOps.length} ops emitted a UserOperationEvent (op reverted before execution)`,
+      };
+    }
+    // gasUsed = the REAL gas handleOps burns (execution actually run), unlike
+    // eth_estimateGas which reserves the full padded callGasLimit. Used to price the
+    // bundler's cost accurately on Tempo.
+    let gasUsed: bigint | undefined;
+    try {
+      if (call.gasUsed) gasUsed = BigInt(call.gasUsed);
+    } catch { /* leave undefined */ }
+    return { success: true, gasUsed };
+  }
+
   return {
     simulateValidation,
     simulateExecution,
+    simulateExecutionSuccess,
     simulateBundle,
     estimateUserOpGas,
     getCurrentBaseFee,

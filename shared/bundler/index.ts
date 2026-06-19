@@ -39,6 +39,7 @@ import {
   tempoCostInFeeToken,
   parseTempoReimbursement,
   submitTempoBundle,
+  TEMPO_COST_BUFFER_GAS,
 } from "../tempo.ts";
 
 export interface BundleResult {
@@ -364,19 +365,45 @@ export class BundlerService {
 
     if (tempo) {
       // Tempo: the bundler is repaid by a stablecoin transfer batched into the UserOp,
-      // not by EntryPoint (maxFee=0 → refund 0). Verify that in-band reimbursement
-      // covers our outer-0x76 cost in fee-token units. Native profitability/balance
-      // checks don't apply.
+      // not by EntryPoint (maxFee=0 → refund 0). Native profitability/balance checks
+      // don't apply — instead we (1) verify execution succeeds (else the in-band transfer
+      // is rolled back), (2) price our real cost from the simulated gas, (3) require the
+      // in-band reimbursement (paid in the trusted feeToken) to cover it.
       const feeToken = resolveFeeToken(checkedEntries[0]!.entry.userOp.feeToken);
-      const costInFeeToken = tempoCostInFeeToken(bundleSim.estimatedGas!, baseFee);
       let reimbursed = 0n;
       for (const e of checkedEntries) {
-        // Reimbursement is paid in the SENT token (any USD stablecoin the Safe holds),
-        // not necessarily the 0x76 fee token — match any TIP-20 transfer to the EOA.
-        reimbursed += parseTempoReimbursement(e.entry.userOp.callData, beneficiary);
+        // Count ONLY transfers to the EOA paid in the trusted feeToken — counting any
+        // token would let an attacker repay in a worthless token and drain the bundler.
+        reimbursed += parseTempoReimbursement(e.entry.userOp.callData, beneficiary, feeToken);
       }
+
+      // Verify execution actually succeeds AND read the REAL gas it burns. handleOps
+      // swallows inner reverts, so this also protects against an OOG/insufficient-balance
+      // op that would leave us unpaid. Fails closed — no proof of success ⇒ no submit.
+      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, rpcOverride);
+      if (!execCheck.success) {
+        if (execCheck.failedOpIndex !== undefined) {
+          const failed = checkedEntries[execCheck.failedOpIndex];
+          if (failed) {
+            this.mempool.remove(failed.entry.userOpHash);
+            this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
+          }
+        }
+        console.warn(`[Bundler][Tempo] REJECT — execution would revert: ${execCheck.errorMessage}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `Tempo execution would revert (bundler not reimbursed): ${execCheck.errorMessage}`,
+        };
+      }
+
+      // Cost basis = the REAL simulated gas (+ overhead buffer), NOT eth_estimateGas which
+      // reserves the padded callGasLimit and over-prices the bundler's cost ~2.5×. This is
+      // what lets the wallet charge the user a tight margin instead of the inflated limits.
+      const realGas = (execCheck.gasUsed ?? bundleSim.estimatedGas!) + TEMPO_COST_BUFFER_GAS;
+      const costInFeeToken = tempoCostInFeeToken(realGas, baseFee);
       console.log(
-        `[Bundler][Tempo] reimbursed=${reimbursed} cost=${costInFeeToken} feeToken=${feeToken} estimatedGas=${bundleSim.estimatedGas} (${checkedEntries.length} ops)`,
+        `[Bundler][Tempo] reimbursed=${reimbursed} cost=${costInFeeToken} feeToken=${feeToken} realGas=${realGas} simGas=${execCheck.gasUsed ?? "n/a"} (${checkedEntries.length} ops)`,
       );
       if (reimbursed < costInFeeToken) {
         console.warn(`[Bundler][Tempo] REJECT — reimbursement ${reimbursed} < cost ${costInFeeToken}`);
