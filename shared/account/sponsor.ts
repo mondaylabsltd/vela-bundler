@@ -35,6 +35,16 @@ const MAX_SPONSOR_NONCE = 6;
 /** Gas units used to calculate the max sponsor amount per transfer. */
 const MAX_SPONSOR_GAS = 5_000_000n;
 
+/**
+ * Volatility margin applied to the *server-side* funding estimate (150% = +50%).
+ * Absorbs gas-price spikes between the moment we fund the gas account and the
+ * moment the bundle executes. Layered on top of the existing ×2 gas-usage buffer.
+ * A client-supplied hint (requiredWei) is trusted as-is and does NOT get this
+ * margin — the wallet already includes its own headroom. Still bounded by
+ * MAX_SPONSOR_GAS so it can never drain the treasury.
+ */
+const SPONSOR_VOLATILITY_BUFFER_BPS = 15_000n;
+
 /** Minimum sponsor target balance (0.0001 ETH) — matches wallet client MIN_BALANCE_WEI. */
 const MIN_SPONSOR_BALANCE = 100_000_000_000_000n;
 
@@ -148,7 +158,10 @@ export class SponsorService {
     const gasPrice = await client.getGasPrice();
     const gasBased = MAX_SPONSOR_GAS * gasPrice;
     const maxSponsorAmount = gasBased > MIN_SPONSOR_BALANCE ? gasBased : MIN_SPONSOR_BALANCE;
-    const serverEstimate = gasPrice * 600_000n * 2n;
+    // ×2 = gas-usage buffer; ×1.5 (15_000 bps) = volatility margin for gas-price
+    // spikes. The hint is compared raw and used as-is when it wins — it carries
+    // the wallet's own headroom, so it doesn't get the server-side volatility margin.
+    const serverEstimate = (gasPrice * 600_000n * 2n * SPONSOR_VOLATILITY_BUFFER_BPS) / 10_000n;
     let targetBalance = serverEstimate;
     if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
     if (targetBalance < MIN_SPONSOR_BALANCE) targetBalance = MIN_SPONSOR_BALANCE;
