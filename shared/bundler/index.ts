@@ -58,10 +58,10 @@ const RECEIPT_STORE_MAX = 10_000;
 /** Max polling attempts for a single pending receipt (60 × ~10s alarm = 10 min). */
 const PENDING_RECEIPT_MAX_CHECKS = 60;
 
-/** Post-bundle treasury sweep toggle. Temporarily disabled — we no longer skim
- *  25% of the relayer balance to the treasury after every bundle. Flip back to
- *  `true` to re-enable. */
-const SWEEP_ENABLED = false;
+/** Treasury sweep toggle. When on, after a confirmed bundle the relayer's surplus
+ *  is skimmed back to the treasury, but only every `sweepInterval` txs and only the
+ *  portion above a per-tx float floor (see bundler/sweep.ts). Set false to disable. */
+const SWEEP_ENABLED = true;
 
 /** Metadata for a pending transaction that needs receipt confirmation. */
 interface PendingReceipt {
@@ -784,7 +784,8 @@ export class BundlerService {
           expiresAt: Date.now() + RECEIPT_TTL_MS,
         });
       }
-      // Post-bundle sweep: transfer 25% of relayer balance to treasury.
+      // Post-bundle sweep: skim the relayer's surplus back to treasury (only every
+      // `sweepInterval` txs, only above the float floor — see executeSweep).
       // Runs after receipt is confirmed, inside the finally block would be too late
       // (reservation is released there). Non-fatal — errors are logged and ignored.
       if (SWEEP_ENABLED && receipt && receipt.status === "success" && this.config.treasuryAddress) {

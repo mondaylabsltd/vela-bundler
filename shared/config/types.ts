@@ -51,7 +51,8 @@ export interface BundlerConfig {
   readonly operatorSecret: string;
   readonly oldOperatorSecrets: string[];
   readonly treasuryAddress: `0x${string}`;
-  /** @deprecated Use treasuryAddress (derived from OPERATOR_SECRET). */
+  /** Sweep cadence: every Nth relayer tx, skim surplus back to the treasury.
+   *  Gated on `relayerNonce % sweepInterval == 0`. Set 0 to disable the gate. */
   readonly sweepInterval: number;
   readonly apiRateLimitPerMinute: number;
   readonly balanceReserveMultiplier: number;

@@ -42,7 +42,7 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     operatorSecret: env.OPERATOR_SECRET,
     oldOperatorSecrets: (env.OLD_OPERATOR_SECRETS ?? "").split(",").map(s => s.trim()).filter(Boolean),
     treasuryAddress,
-    sweepInterval: parseInt(env.SWEEP_INTERVAL ?? "30"),
+    sweepInterval: parseInt(env.SWEEP_INTERVAL ?? "20"),
     apiRateLimitPerMinute: parseInt(env.API_RATE_LIMIT_PER_MINUTE ?? "60"),
     balanceReserveMultiplier: parseFloat(env.BALANCE_RESERVE_MULTIPLIER ?? "1"),
     alchemyApiKey: env.ALCHEMY_API_KEY || null,

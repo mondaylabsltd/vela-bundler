@@ -30,7 +30,7 @@ async function main() {
   console.log(`  EntryPoint:      ${config.entryPointAddress}`);
   console.log(`  Multi-chain:     yes (chainId per-request)`);
   console.log(`  Treasury:        ${config.treasuryAddress} (derived)`);
-  console.log(`  Sweep:           25% of relayer balance after each bundle`);
+  console.log(`  Sweep:           50% of surplus every ${config.sweepInterval} txs (native + Tempo pathUSD)`);
   console.log(`  Min Margin:      ${config.minProfitMarginBps} bps`);
   console.log(`  Balance Reserve: ${config.balanceReserveMultiplier}x`);
 
