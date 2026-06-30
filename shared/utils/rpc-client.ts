@@ -20,13 +20,21 @@ import { RPC_TIMEOUT_MS } from "./timeout.ts";
  *   jitter). Kept small (2) so it doesn't stack with the reliability layer's own
  *   retry into a request-amplification storm.
  */
+/**
+ * Redirect mode for outbound RPC fetches. MUST be "manual" (NOT "error"): Cloudflare
+ * Workers' fetch only supports "follow" | "manual" and rejects "error" at the edge
+ * ("Invalid redirect value"), which would break every viem RPC call in production.
+ * "manual" still does NOT follow the redirect — a 3xx is returned as an opaqueredirect
+ * that viem fails to parse and surfaces as an error — so the anti-SSRF protection
+ * (a user-allowed host must not 302 us to an internal/metadata IP) is preserved.
+ */
+export const RPC_REDIRECT_MODE: RequestRedirect = "manual";
+
 const READ_TRANSPORT_OPTS = {
   timeout: RPC_TIMEOUT_MS,
   retryCount: 2,
   retryDelay: 150,
-  // Never follow redirects: a user-allowed public RPC host must not be able to 302 the
-  // request to an internal/metadata IP (SSRF). A redirecting "RPC" is rejected outright.
-  fetchOptions: { redirect: "error" },
+  fetchOptions: { redirect: RPC_REDIRECT_MODE },
 } as const;
 
 /**
