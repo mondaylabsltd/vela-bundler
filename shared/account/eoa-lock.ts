@@ -30,11 +30,31 @@ export interface EOAState {
  * Manages per-EOA locks, nonce tracking, and balance reservations.
  * All state is in-memory — lost on restart.
  */
+/** Max distinct EOA states retained. A flood of distinct UserOp.sender values would
+ *  otherwise grow `states` without bound (memory exhaustion). Bounded by evicting the
+ *  oldest SAFE-to-drop entry (ACTIVE, no reservation, not bundling) — its state is
+ *  re-derived from chain on next use, so eviction is lossless for idle EOAs. */
+const MAX_EOA_STATES = 20_000;
+
 export class EOALockManager {
   private states: Map<string, EOAState> = new Map();
 
   private key(address: `0x${string}`): string {
     return address.toLowerCase();
+  }
+
+  /** Evict the oldest entry that carries no in-flight state (never drops a locked/reserved
+   *  EOA — that would risk a double-submit). No-op if every entry is in-flight. */
+  private evictIfNeeded(incomingKey: string): void {
+    if (this.states.size < MAX_EOA_STATES || this.states.has(incomingKey)) return;
+    for (const [k, s] of this.states) {
+      if (s.status === "ACTIVE" && !s.bundleLock && s.reservedBalance === 0n) {
+        this.states.delete(k);
+        return;
+      }
+    }
+    // All entries are in-flight (locked/reserved) — keep them; this is bounded in practice
+    // because an in-flight state requires an actual on-chain submission (gas + balance).
   }
 
   /**
@@ -96,6 +116,7 @@ export class EOALockManager {
       bundleLock: existing?.bundleLock ?? false,
     };
 
+    this.evictIfNeeded(k);
     this.states.set(k, state);
     return state;
   }

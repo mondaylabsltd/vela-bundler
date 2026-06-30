@@ -20,7 +20,14 @@ import { RPC_TIMEOUT_MS } from "./timeout.ts";
  *   jitter). Kept small (2) so it doesn't stack with the reliability layer's own
  *   retry into a request-amplification storm.
  */
-const READ_TRANSPORT_OPTS = { timeout: RPC_TIMEOUT_MS, retryCount: 2, retryDelay: 150 } as const;
+const READ_TRANSPORT_OPTS = {
+  timeout: RPC_TIMEOUT_MS,
+  retryCount: 2,
+  retryDelay: 150,
+  // Never follow redirects: a user-allowed public RPC host must not be able to 302 the
+  // request to an internal/metadata IP (SSRF). A redirecting "RPC" is rejected outright.
+  fetchOptions: { redirect: "error" },
+} as const;
 
 /**
  * Validate a user-provided RPC URL.
@@ -39,14 +46,30 @@ export function validateRpcUrl(url: string): string | null {
     return "Only HTTPS RPC URLs are accepted";
   }
 
-  const hostname = parsed.hostname.toLowerCase();
+  // Canonicalize the host: lowercase, strip a single trailing dot (a trailing-dot FQDN
+  // like "metadata.google.internal." otherwise defeats === and .endsWith checks), and
+  // strip IPv6 brackets so we can inspect the address.
+  const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  const isIpv6Literal = hostname.startsWith("[") || hostname.includes(":");
+  const ipv6 = isIpv6Literal ? hostname.replace(/^\[/, "").replace(/\]$/, "") : "";
 
-  // Block loopback addresses (IPv4/IPv6 variants)
+  // Block URLs with credentials (user:pass@host)
+  if (parsed.username || parsed.password) {
+    return "URLs with credentials are not allowed";
+  }
+
+  // --- IPv6 literals: block loopback, unspecified, link-local, ULA, and any
+  //     IPv4-mapped form (e.g. [::ffff:169.254.169.254]) that embeds a blocked v4. ---
+  if (isIpv6Literal) {
+    const blocked = blockedIpv6(ipv6);
+    if (blocked) return blocked;
+    // Non-blocked global-unicast IPv6 is permitted (rare for public RPCs, but allowed).
+  }
+
+  // Block loopback addresses (IPv4 variants; IPv6 ::1 handled above)
   if (
     hostname === "localhost" ||
     hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname === "[::1]" ||
     hostname === "0.0.0.0" ||
     hostname.startsWith("127.")
   ) {
@@ -64,23 +87,63 @@ export function validateRpcUrl(url: string): string | null {
   }
 
   // Block private/reserved IPv4 ranges (RFC1918, RFC3927 link-local)
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
-    const parts = hostname.split(".").map(Number);
-    if (
-      parts[0] === 10 ||                                          // 10.0.0.0/8
-      (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31) || // 172.16.0.0/12
-      (parts[0] === 192 && parts[1] === 168) ||                   // 192.168.0.0/16
-      (parts[0] === 169 && parts[1] === 254)                      // 169.254.0.0/16 link-local
-    ) {
-      return "Private network addresses are not allowed";
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) && isBlockedIpv4(hostname)) {
+    return "Private network addresses are not allowed";
+  }
+
+  return null;
+}
+
+/** True if a dotted-decimal IPv4 is loopback/private/link-local/reserved. */
+function isBlockedIpv4(ip: string): boolean {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true; // malformed → block
+  return (
+    p[0] === 0 ||                                   // 0.0.0.0/8
+    p[0] === 10 ||                                  // 10.0.0.0/8
+    p[0] === 127 ||                                 // loopback
+    (p[0] === 172 && p[1]! >= 16 && p[1]! <= 31) || // 172.16.0.0/12
+    (p[0] === 192 && p[1] === 168) ||               // 192.168.0.0/16
+    (p[0] === 169 && p[1] === 254)                  // 169.254.0.0/16 link-local (cloud IMDS)
+  );
+}
+
+/**
+ * Return a rejection reason for a dangerous IPv6 address (brackets already stripped),
+ * or null to allow. Blocks loopback (::1), unspecified (::), link-local (fe80::/10),
+ * unique-local (fc00::/7), and IPv4-mapped (::ffff:a.b.c.d / ::ffff:hhhh:hhhh) whose
+ * embedded IPv4 is itself blocked — closing the [::ffff:169.254.169.254] metadata SSRF.
+ */
+function blockedIpv6(addr: string): string | null {
+  const x = addr.toLowerCase();
+  // Loopback (::1) / unspecified (::), compact or fully-expanded (0:0:0:0:0:0:0:1).
+  if (x === "::1" || x === "::") return "Loopback addresses are not allowed";
+  if (!x.includes("::") && x.split(":").length === 8) {
+    const g = x.split(":");
+    const allZero = g.every((p) => /^0+$/.test(p));
+    const loopback = g.slice(0, 7).every((p) => /^0+$/.test(p)) && /^0*1$/.test(g[7]!);
+    if (allZero || loopback) return "Loopback addresses are not allowed";
+  }
+  // Link-local fe80::/10  and unique-local fc00::/7 (fc/fd).
+  if (/^fe[89ab]/.test(x) || /^f[cd]/.test(x)) {
+    return "Private network addresses are not allowed";
+  }
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:hhhh:hhhh, compact or expanded).
+  if (x.includes("ffff:") || /:ffff:/.test(x)) {
+    const dotted = x.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (dotted) {
+      return isBlockedIpv4(dotted[1]!) ? "Blocked metadata endpoint" : null;
     }
+    // Hex-form mapped (…:ffff:a9fe:a9fe). Convert the trailing two 16-bit groups to v4.
+    const hex = x.match(/ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hex) {
+      const hi = parseInt(hex[1]!, 16), lo = parseInt(hex[2]!, 16);
+      const v4 = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+      return isBlockedIpv4(v4) ? "Blocked metadata endpoint" : null;
+    }
+    // Unrecognised mapped form — fail closed.
+    return "Blocked metadata endpoint";
   }
-
-  // Block URLs with credentials (user:pass@host)
-  if (parsed.username || parsed.password) {
-    return "URLs with credentials are not allowed";
-  }
-
   return null;
 }
 

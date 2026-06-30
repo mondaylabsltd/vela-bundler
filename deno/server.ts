@@ -23,6 +23,39 @@ import {
   type RequestContext,
 } from "../shared/rpc/process.ts";
 
+/** Max request body size. Enforced by streaming so a chunked (no Content-Length) body
+ *  can't bypass the cap and exhaust memory on this directly-bound server. */
+const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * Read a request body as text, aborting once `maxBytes` is exceeded. Returns null if the
+ * body is too large (caller responds 413). Does not trust Content-Length.
+ */
+export async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  return new TextDecoder().decode(buf);
+}
+
 // Load homepage HTML at startup (built from README.md via `deno task build`)
 let HOME_HTML = "";
 try {
@@ -45,8 +78,11 @@ export function startRpcServer(
 
   const server = Deno.serve(
     { port: config.port, hostname: config.host },
-    async (req: Request): Promise<Response> => {
+    async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> => {
       const url = new URL(req.url);
+      // Real TCP peer address — the only trustworthy rate-limit key on a directly-bound
+      // server (client-supplied X-Forwarded-For is spoofable and must not be trusted).
+      const peerAddr = (info?.remoteAddr as Deno.NetAddr | undefined)?.hostname;
 
       // Homepage
       if (url.pathname === "/" && req.method === "GET") {
@@ -102,7 +138,7 @@ export function startRpcServer(
 
       // REST API (/v1/...)
       const restResponse = await handleRestApi(
-        req, url, chainRegistry, config, rateLimitConfig, requestRpcUrl, sponsorService,
+        req, url, chainRegistry, config, rateLimitConfig, requestRpcUrl, sponsorService, peerAddr,
       );
       if (restResponse) return restResponse;
 
@@ -118,7 +154,7 @@ export function startRpcServer(
       }
 
       // Rate limit JSON-RPC requests (same limiter as REST API)
-      const limited = rateLimitGuard(req, rateLimitConfig);
+      const limited = rateLimitGuard(req, rateLimitConfig, peerAddr);
       if (limited) return limited;
 
       // JSON-RPC: POST /:chainId
@@ -139,17 +175,19 @@ export function startRpcServer(
         );
       }
 
+      // Enforce a 256KB body cap by STREAMING — never trust Content-Length (a chunked
+      // request omits it, bypassing a header-only check and letting an attacker buffer an
+      // unbounded body → OOM on this directly-bound server).
+      const bodyText = await readBodyCapped(req, MAX_BODY_BYTES);
+      if (bodyText === null) {
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large (max 256KB)") }),
+          { status: 413, headers: { "Content-Type": "application/json", ...corsHeaders } },
+        );
+      }
       let body: unknown;
       try {
-        // Enforce 256KB body size limit to prevent OOM from oversized payloads
-        const contentLength = req.headers.get("content-length");
-        if (contentLength && parseInt(contentLength) > 256 * 1024) {
-          return new Response(
-            JSON.stringify({ jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large (max 256KB)") }),
-            { status: 413, headers: { "Content-Type": "application/json", ...corsHeaders } },
-          );
-        }
-        body = await req.json();
+        body = JSON.parse(bodyText);
       } catch {
         return jsonResponse({ jsonrpc: "2.0", id: null, error: parseError() }, corsHeaders);
       }

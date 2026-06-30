@@ -12,37 +12,36 @@ const requestCounts: Map<string, { count: number; resetAt: number }> = new Map()
 let lastPruneAt = 0;
 
 /**
- * Extract client IP from request headers.
+ * Extract a TRUSTWORTHY client identifier for rate limiting.
  *
- * When behind a reverse proxy, X-Forwarded-For contains a comma-separated
- * list of IPs. The rightmost entry is the one appended by the trusted proxy
- * and is the most reliable. If no proxy headers are present, falls back
- * to "unknown" (Deno.serve does not expose remote address via Request).
+ * Only two sources are trusted, both unspoofable by the client:
+ *   1. CF-Connecting-IP — set by Cloudflare's edge (CF Worker deployments).
+ *   2. peerAddr — the real TCP peer address, passed in by the Deno server from
+ *      Deno.serve's connection info.
+ *
+ * Client-supplied `X-Forwarded-For` / `X-Real-IP` are NOT trusted: an attacker can rotate
+ * them to mint a fresh rate-limit bucket per request (limit bypass), or set them all the
+ * same to share/poison one bucket. Without a trusted source we fall back to a single
+ * shared bucket ("unknown") which fails safe (still rate-limited, just coarsely).
  */
-function extractClientIp(req: Request): string {
-  // CF-Connecting-IP is set by Cloudflare's edge and cannot be spoofed by clients.
-  // Prefer it when running on CF Workers.
+function extractClientIp(req: Request, peerAddr?: string): string {
   const cfIp = req.headers.get("cf-connecting-ip");
   if (cfIp) return cfIp;
-
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) {
-    // Rightmost IP = appended by the closest trusted proxy
-    const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
-    return parts[parts.length - 1] ?? "unknown";
-  }
-  return req.headers.get("x-real-ip") ?? "unknown";
+  if (peerAddr) return peerAddr;
+  return "unknown";
 }
 
 /**
  * Check rate limit for a request.
  * Returns null if within limit, or a 429 Response if rate limited.
+ * `peerAddr` is the real TCP peer (Deno) — pass it so each client gets its own bucket.
  */
 export function rateLimitGuard(
   req: Request,
   config: RateLimitConfig,
+  peerAddr?: string,
 ): Response | null {
-  const ip = extractClientIp(req);
+  const ip = extractClientIp(req, peerAddr);
 
   const now = Date.now();
   const windowMs = 60_000;

@@ -24,6 +24,7 @@ export async function handleRestApi(
   rateLimitConfig: RateLimitConfig,
   requestRpcUrl?: string,
   sponsorService?: SponsorService,
+  peerAddr?: string,
 ): Promise<Response | null> {
   if (!url.pathname.startsWith("/v1/")) return null;
 
@@ -37,7 +38,7 @@ export async function handleRestApi(
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  const limited = rateLimitGuard(req, rateLimitConfig);
+  const limited = rateLimitGuard(req, rateLimitConfig, peerAddr);
   if (limited) return limited;
 
   // GET /v1/account/:chainId/:safeAddress
@@ -141,7 +142,7 @@ async function handleGetAccount(
         latestNonce: info.latestNonce,
         pendingNonce: info.pendingNonce,
         status: info.status,
-        rpcUsed: effectiveRpc.replace(/\/[a-zA-Z0-9_-]{20,}(\/|$)/, "/***$1"),
+        rpcUsed: redactUrl(effectiveRpc),
       },
       200,
       corsHeaders,
@@ -169,10 +170,12 @@ async function handleSponsor(
   try {
     const chain = await chainRegistry.getChain(chainId, requestRpcUrl);
 
-    let effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
-    if (requestRpcUrl && isRpcBlacklisted(requestRpcUrl) && hasFallback(requestRpcUrl, chain.rpcUrl)) {
-      effectiveRpc = chain.rpcUrl;
-    }
+    // SECURITY: sponsorship reads the treasury/relayer balances AND signs+broadcasts a
+    // TREASURY transfer (a shared operator asset). It must NEVER use the attacker-supplied
+    // X-Rpc-Url for those — a malicious RPC could feed fake balances/gas-price into the
+    // fund-moving math or capture the signed treasury tx. Always use the trusted,
+    // registry-resolved chain default RPC here. (`requestRpcUrl` is ignored for sponsor.)
+    const trustedRpc = chain.rpcUrl;
 
     // Derive the relayer EOA address for this Safe
     const eoa = await chain.accountService.deriveEOA(safeAddress);
@@ -181,7 +184,7 @@ async function handleSponsor(
       chainId,
       safeAddress,
       eoa.address,
-      effectiveRpc,
+      trustedRpc,
       requiredWei,
     );
 

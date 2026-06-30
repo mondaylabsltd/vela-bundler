@@ -121,7 +121,15 @@ export async function reliableTextFetch(
     const onDeadline = () => controller.abort(makeTimeout(budget));
     deadline.signal?.addEventListener?.("abort", onDeadline, { once: true });
     try {
-      const res = await doFetch(url, { ...init, signal: controller.signal });
+      // redirect:"manual" — never auto-follow a redirect: a user-allowed public RPC host
+      // must not be able to 302 us to an internal/metadata IP (SSRF). A redirecting RPC is
+      // rejected (not retried — it's not a transient condition).
+      const res = await doFetch(url, { ...init, signal: controller.signal, redirect: "manual" });
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        const e = new Error(`refusing to follow redirect from ${redactUrl(url)}`);
+        (e as { classified?: ClassifiedError }).classified = { category: "permanent", retryable: false, reason: "redirect_blocked" };
+        throw e;
+      }
       const text = await res.text();
       // Only non-2xx/3xx statuses are candidates for transient classification.
       if (res.status >= 400) {

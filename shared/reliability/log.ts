@@ -41,16 +41,27 @@ export interface LogEvent {
   [k: string]: unknown;
 }
 
-/** Redact an API key / token embedded in an RPC URL path or query for safe logging. */
+/**
+ * Redact an API key / token embedded in an RPC URL for safe logging, keeping only the
+ * host (for debuggability). Conservative by construction: redacts EVERY query value and
+ * any path segment >= 8 chars — so a short key, a key containing '.', or a key in a query
+ * value can't slip through. Over-redaction of long non-secret path parts is acceptable.
+ */
 export function redactUrl(url: string): string {
   try {
     const u = new URL(url);
-    u.pathname = u.pathname.replace(/\/[a-zA-Z0-9_-]{20,}(?=\/|$)/g, "/***");
-    if (u.search) u.search = u.search.replace(/([?&][^=]*=)[a-zA-Z0-9_-]{16,}/g, "$1***");
+    // Redact any path segment >= 8 chars (API keys/tokens); keep short ones like /v2//rpc.
+    u.pathname = u.pathname.replace(/\/[^/]{8,}(?=\/|$)/g, "/***");
+    // Redact ALL query values unconditionally (keep only the parameter names).
+    if (u.search) {
+      const params = new URLSearchParams(u.search);
+      for (const k of [...params.keys()]) params.set(k, "***");
+      u.search = params.toString();
+    }
     if (u.username || u.password) { u.username = "***"; u.password = ""; }
     return u.toString();
   } catch {
-    return url.replace(/[a-zA-Z0-9_-]{20,}/g, "***");
+    return url.replace(/[a-zA-Z0-9_-]{8,}/g, "***");
   }
 }
 

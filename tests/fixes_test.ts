@@ -79,46 +79,36 @@ Deno.test("ReputationManager - included ops improve reputation from throttled to
 // ---- Rate limiter ----
 
 Deno.test("rateLimitGuard - allows requests within limit", () => {
-  const req = new Request("http://localhost/test", {
-    headers: { "x-forwarded-for": "test-ip-unique-1" },
-  });
-  const result = rateLimitGuard(req, { rateLimitPerMinute: 100 });
+  const req = new Request("http://localhost/test");
+  const result = rateLimitGuard(req, { rateLimitPerMinute: 100 }, "test-peer-unique-1");
   assertEquals(result, null); // null means allowed
 });
 
 Deno.test("rateLimitGuard - blocks requests over limit", () => {
+  // Identity is the trusted peerAddr (3rd arg); spoofable X-Forwarded-For is ignored.
   const config = { rateLimitPerMinute: 3 };
-  const ip = "test-ip-rate-limit-" + Date.now();
+  const peer = "test-ip-rate-limit-" + Date.now();
+  const req = () => new Request("http://localhost/test");
   for (let i = 0; i < 3; i++) {
-    const req = new Request("http://localhost/test", {
-      headers: { "x-forwarded-for": ip },
-    });
-    assertEquals(rateLimitGuard(req, config), null);
+    assertEquals(rateLimitGuard(req(), config, peer), null);
   }
   // 4th request should be blocked
-  const req4 = new Request("http://localhost/test", {
-    headers: { "x-forwarded-for": ip },
-  });
-  const result = rateLimitGuard(req4, config);
+  const result = rateLimitGuard(req(), config, peer);
   assertNotEquals(result, null);
   assertEquals(result!.status, 429);
 });
 
 Deno.test("rateLimitGuard - different IPs have separate limits", () => {
   const config = { rateLimitPerMinute: 1 };
-  const ip1 = "rate-test-ip-a-" + Date.now();
-  const ip2 = "rate-test-ip-b-" + Date.now();
+  const peer1 = "rate-test-ip-a-" + Date.now();
+  const peer2 = "rate-test-ip-b-" + Date.now();
+  const req = () => new Request("http://localhost/test");
 
-  const req1 = new Request("http://localhost/test", { headers: { "x-forwarded-for": ip1 } });
-  assertEquals(rateLimitGuard(req1, config), null);
-
-  // ip1 is now rate limited
-  const req1b = new Request("http://localhost/test", { headers: { "x-forwarded-for": ip1 } });
-  assertNotEquals(rateLimitGuard(req1b, config), null);
-
-  // ip2 should still be allowed
-  const req2 = new Request("http://localhost/test", { headers: { "x-forwarded-for": ip2 } });
-  assertEquals(rateLimitGuard(req2, config), null);
+  assertEquals(rateLimitGuard(req(), config, peer1), null);
+  // peer1 is now rate limited
+  assertNotEquals(rateLimitGuard(req(), config, peer1), null);
+  // peer2 should still be allowed
+  assertEquals(rateLimitGuard(req(), config, peer2), null);
 });
 
 // ---- RPC client cache ----

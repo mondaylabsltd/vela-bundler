@@ -2,7 +2,7 @@
  * SponsorService — auto-fund new users' gas account EOAs from the treasury.
  *
  * Eligibility:
- *   1. Relayer EOA nonce <= 3 (new user)
+ *   1. Relayer EOA nonce <= MAX_SPONSOR_NONCE (new user; see constant below)
  *   2. User's Safe address has a registered WebAuthn public key
  *   3. Treasury balance stays above a safety floor
  *   4. Per-transfer amount capped

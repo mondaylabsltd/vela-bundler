@@ -283,7 +283,6 @@ export class BundlerService {
     const rpcOverride = isTempoChain(this.config.chainId)
       ? undefined
       : entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
-    const effectiveRpc = rpcOverride ?? this.config.rpcUrl;
 
     // Bound this single sender's bundle prep by a deadline shared across all its RPC
     // reads/simulations, so one slow sender can't starve the rest of the senders (or the
@@ -535,9 +534,14 @@ export class BundlerService {
     // Reserve balance atomically (native only — Tempo settles in stablecoin in-band).
     if (!tempo) this.accountService.reserveBalance(eoa.address, expectedCost);
 
-    // Submit using the dedicated EOA as signer, via user's RPC if provided
+    // SECURITY: sign & broadcast ONLY via the bundler's own trusted RPC, never the
+    // user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC leaks it and lets
+    // the attacker drop/withhold it or feed lies into the (subsequent) reconciliation.
+    // The user RPC (rpcOverride) is still used for the read-only sim/gas/balance above,
+    // where the worst case is the user grieving their OWN op. (On mainnet config.rpcUrl is
+    // Alchemy/public; on a dev chain it is whatever the registry resolved.)
     const account = privateKeyToAccount(eoa.privateKey!);
-    const submitRpcUrl = rpcOverride ?? this.config.rpcUrl;
+    const submitRpcUrl = this.config.rpcUrl;
     const walletClient = createWalletClient({
       account,
       transport: http(submitRpcUrl),
@@ -599,7 +603,8 @@ export class BundlerService {
           })),
           eoaAddress: eoa.address,
           reservedAmount: expectedCost,
-          rpcOverride,
+          // Reconcile (receipt poll + sweep) via the trusted submit RPC, NOT the user RPC.
+          rpcOverride: undefined,
           submittedAt: Date.now(),
           checkCount: 0,
         });
@@ -607,10 +612,11 @@ export class BundlerService {
         // cannot abandon this in-flight bundle's reconciliation. Non-fatal on error.
         await this.flushPendingReceipts();
       } else {
-        // Deno mode: process receipt in background — unlocks EOA on success
-        this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
+        // Deno mode: process receipt in background — unlocks EOA on success.
+        // Reconcile via the trusted RPC (undefined → this.publicClient = config.rpcUrl).
+        this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, undefined)
           .then(async () => {
-            const client = rpcOverride ? getPublicClient(rpcOverride) : this.publicClient;
+            const client = this.publicClient;
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
                 await this.accountService.lockManager.initEOA(eoa.address, client);

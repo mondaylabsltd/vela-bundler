@@ -117,3 +117,69 @@ Deno.test("blacklistRpc - blacklisted URL is detected", () => {
 Deno.test("isRpcBlacklisted - returns false for unknown URL", () => {
   assertEquals(isRpcBlacklisted("https://never-blacklisted.example.com"), false);
 });
+
+// --- SSRF bypass regression tests (these MUST stay blocked) ---
+
+Deno.test("validateRpcUrl - blocks IPv4-mapped IPv6 loopback [::ffff:127.0.0.1]", () => {
+  assert(validateRpcUrl("https://[::ffff:127.0.0.1]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks IPv4-mapped IPv6 cloud metadata [::ffff:169.254.169.254]", () => {
+  // The headline SSRF: AWS/GCP IMDS via IPv4-mapped IPv6 must be blocked.
+  assert(validateRpcUrl("https://[::ffff:169.254.169.254]/latest/meta-data/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks fully-expanded mapped metadata [0:0:0:0:0:ffff:a9fe:a9fe]", () => {
+  assert(validateRpcUrl("https://[0:0:0:0:0:ffff:a9fe:a9fe]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks expanded IPv6 loopback [0:0:0:0:0:0:0:1]", () => {
+  assert(validateRpcUrl("https://[0:0:0:0:0:0:0:1]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks IPv6 unspecified [::]", () => {
+  assert(validateRpcUrl("https://[::]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks IPv6 ULA fc00::/7 (fc/fd)", () => {
+  assert(validateRpcUrl("https://[fd00::1]/") !== null);
+  assert(validateRpcUrl("https://[fc00::1]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks IPv6 link-local fe80::/10", () => {
+  assert(validateRpcUrl("https://[fe80::1]/") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks trailing-dot FQDN metadata.google.internal.", () => {
+  assert(validateRpcUrl("https://metadata.google.internal./") !== null);
+});
+
+Deno.test("validateRpcUrl - blocks 0.0.0.0/8 and Azure IMDS", () => {
+  assert(validateRpcUrl("https://0.1.2.3/") !== null);
+  assert(validateRpcUrl("https://168.63.129.16/") !== null);
+});
+
+Deno.test("validateRpcUrl - still allows legit global-unicast IPv6 RPC", () => {
+  assertEquals(validateRpcUrl("https://[2001:4860:4860::8888]/"), null);
+});
+
+// --- redactUrl secret-masking regression (INFO-2) ---
+import { redactUrl } from "../shared/reliability/log.ts";
+
+Deno.test("redactUrl - masks query-string keys (any length) and short path keys, keeps host", () => {
+  const cases = [
+    "https://eth.llamarpc.com/rpc?apikey=sk_live_0123456789abcdef",
+    "https://nd-1.p2pify.com/abcd1234",                 // 8-char path key
+    "https://x.example/v2/SECRETKEY1234567890",
+    "https://x.example/path?token=ab.cd.ef&x=1",        // key with dots
+  ];
+  for (const u of cases) {
+    const r = redactUrl(u);
+    assert(!r.includes("sk_live_0123456789abcdef"), `leak: ${r}`);
+    assert(!r.includes("abcd1234"), `leak: ${r}`);
+    assert(!r.includes("SECRETKEY1234567890"), `leak: ${r}`);
+    assert(!r.includes("ab.cd.ef"), `leak: ${r}`);
+  }
+  // Host must remain for debuggability.
+  assert(redactUrl("https://eth.llamarpc.com/rpc?apikey=secret").includes("llamarpc.com"));
+});
