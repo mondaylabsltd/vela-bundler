@@ -419,4 +419,11 @@ export const RPC_ERROR_CODES = {
   STAKE_TOO_LOW: -32505,
   SIGNATURE_VALIDATION_FAILED: -32507,
   PAYMASTER_BALANCE_INSUFFICIENT: -32508,
+  /**
+   * Transient infrastructure degradation (RPC down/slow, deadline exceeded, circuit
+   * open). Distinct from the business rejections above so clients can RETRY rather than
+   * treat the UserOp as invalid. Carried in the JSON-RPC standard "server error" range.
+   * The error `data` carries `{ retryable: true, retryAfterMs? }`.
+   */
+  SERVICE_DEGRADED: -32000,
 } as const;

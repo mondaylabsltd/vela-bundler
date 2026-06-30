@@ -8,8 +8,15 @@
  */
 
 import { buildAlchemyRpcUrl } from "./alchemy.ts";
+import { reliableTextFetch, rpcCall } from "../reliability/rpc-fetch.ts";
+import { getClassification } from "../reliability/errors.ts";
 
 const REGISTRY_BASE_URL = "https://ethereum-data.awesometools.dev";
+
+/** Per-attempt timeout for the chain-registry HTTP API. */
+const REGISTRY_TIMEOUT_MS = 5_000;
+/** Total budget (across retries) for resolving chain metadata — bounds DO/chain init. */
+const REGISTRY_DEADLINE_MS = 12_000;
 
 /**
  * Chain metadata as returned by the registry.
@@ -43,28 +50,54 @@ export interface ChainInfo {
 export async function fetchChainInfo(chainId: number): Promise<ChainInfo> {
   const url = `${REGISTRY_BASE_URL}/chains/eip155-${chainId}.json`;
 
-  const res = await fetch(url);
-  if (!res.ok) {
-    // Consume body to avoid leaks
-    await res.body?.cancel();
+  // Bounded fetch: per-attempt timeout + a total deadline + bounded retry of
+  // TRANSIENT failures only. Without this a hung registry blocked chain/DO init
+  // (and therefore every request for that chain) indefinitely.
+  let res;
+  try {
+    res = await reliableTextFetch(
+      url,
+      { method: "GET", headers: { accept: "application/json" } },
+      {
+        dependency: "chain-registry",
+        operation: "fetchChainInfo",
+        chainId,
+        timeoutMs: REGISTRY_TIMEOUT_MS,
+        deadlineMs: REGISTRY_DEADLINE_MS,
+        maxAttempts: 3,
+      },
+    );
+  } catch (err) {
+    // Transient exhaustion / circuit open / timeout — distinguish "registry is
+    // unreachable right now" from "chain is genuinely unsupported".
+    const cls = getClassification(err);
+    throw new Error(
+      `Chain registry temporarily unreachable for chain ${chainId} (${cls.reason}). Retry shortly.`,
+    );
+  }
+
+  // 404 / other permanent non-2xx → genuinely unsupported chain.
+  if (res.status >= 400) {
     throw new Error(
       `Chain ${chainId} is not supported. ` +
       `Only networks listed at ${REGISTRY_BASE_URL} are supported.`,
     );
   }
 
-  // The registry may return HTML for unknown chains instead of 404
+  // The registry may return HTML for unknown chains instead of 404.
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("json")) {
-    await res.body?.cancel();
     throw new Error(
       `Chain ${chainId} is not supported. ` +
       `Only networks listed at ${REGISTRY_BASE_URL} are supported.`,
     );
   }
 
-  const data = await res.json() as ChainInfo;
-  return data;
+  try {
+    return JSON.parse(res.text) as ChainInfo;
+  } catch {
+    throw new Error(`Chain registry returned malformed data for chain ${chainId}`);
+  }
 }
 
 /**
@@ -95,39 +128,27 @@ export async function pickBestRpc(
     throw new Error("No usable public RPC endpoints found for this chain");
   }
 
-  // Try up to 5 RPCs sequentially with short timeout
+  // Try up to 5 RPCs sequentially with short timeout. The sequential loop over
+  // candidates IS the fallback strategy, so each probe is a single bounded attempt
+  // (no inner retry → no request amplification). The breaker lets a repeatedly-dead
+  // public RPC be skipped fast on later calls.
   const candidates = publicRpcs.slice(0, 5);
 
   for (const url of candidates) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_chainId",
-          params: [],
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      if (!res.ok) {
-        await res.body?.cancel();
-        continue;
-      }
-      const json = await res.json();
+      const json = await rpcCall(
+        url,
+        { jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] },
+        { dependency: "rpc", operation: "eth_chainId", chainId: expectedChainId, timeoutMs: 5000, maxAttempts: 1 },
+      );
+      if (json.error || typeof json.result !== "string") continue;
       const returnedChainId = parseInt(json.result, 16);
       if (returnedChainId !== expectedChainId) {
         continue;
       }
       return url;
     } catch {
-      // This RPC failed, try next
+      // This RPC failed (timeout / transient / circuit open) — try next.
       continue;
     }
   }

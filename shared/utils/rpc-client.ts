@@ -9,6 +9,18 @@ import {
   type Transport,
   type Chain,
 } from "viem";
+import { RPC_TIMEOUT_MS } from "./timeout.ts";
+
+/**
+ * Transport tuning for read-only viem clients.
+ * - timeout: hard per-request bound so a hung node can't block us indefinitely
+ *   (viem aborts the underlying fetch on timeout — real cancellation, unlike a
+ *   bare Promise race).
+ * - retryCount: bounded internal retry for idempotent reads (viem backs off with
+ *   jitter). Kept small (2) so it doesn't stack with the reliability layer's own
+ *   retry into a request-amplification storm.
+ */
+const READ_TRANSPORT_OPTS = { timeout: RPC_TIMEOUT_MS, retryCount: 2, retryDelay: 150 } as const;
 
 /**
  * Validate a user-provided RPC URL.
@@ -103,7 +115,7 @@ export function getPublicClient(rpcUrl: string): PublicClient<Transport, Chain> 
       if (oldest !== undefined) clientCache.delete(oldest);
     }
     client = createPublicClient({
-      transport: http(rpcUrl),
+      transport: http(rpcUrl, READ_TRANSPORT_OPTS),
     }) as PublicClient<Transport, Chain>;
     clientCache.set(rpcUrl, client);
   }

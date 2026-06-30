@@ -10,6 +10,7 @@ import type { ChainRegistryLike } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
+import { redactUrl } from "../reliability/log.ts";
 import type { SponsorService } from "../account/sponsor.ts";
 
 /**
@@ -108,7 +109,7 @@ async function handleGetAccount(
     // For dev networks where chain.rpcUrl === requestRpcUrl, keep using it.
     let effectiveRpc = requestRpcUrl ?? chain.rpcUrl;
     if (requestRpcUrl && isRpcBlacklisted(requestRpcUrl) && hasFallback(requestRpcUrl, chain.rpcUrl)) {
-      console.warn(`[REST] Skipping blacklisted user RPC ${requestRpcUrl}, using chain default ${chain.rpcUrl}`);
+      console.warn(`[REST] Skipping blacklisted user RPC ${redactUrl(requestRpcUrl)}, using chain default ${redactUrl(chain.rpcUrl)}`);
       effectiveRpc = chain.rpcUrl;
     }
 
@@ -118,7 +119,7 @@ async function handleGetAccount(
     } catch (err) {
       // User RPC failed — blacklist + retry with chain default if alternative exists
       if (requestRpcUrl && effectiveRpc === requestRpcUrl && hasFallback(requestRpcUrl, chain.rpcUrl)) {
-        console.warn(`[REST] User RPC ${requestRpcUrl} failed, blacklisting and retrying with chain default (${chain.rpcUrl})`);
+        console.warn(`[REST] User RPC ${redactUrl(requestRpcUrl)} failed, blacklisting and retrying with chain default (${redactUrl(chain.rpcUrl)})`);
         blacklistRpc(requestRpcUrl);
         effectiveRpc = chain.rpcUrl;
         info = await chain.accountService.getAccountInfo(safeAddress, effectiveRpc);

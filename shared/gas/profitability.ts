@@ -3,6 +3,7 @@
  */
 
 import type { UserOperation } from "../userop/types.ts";
+import { ceilDiv } from "./fee-model.ts";
 
 /**
  * Calculate the effective gas price a UserOp will pay.
@@ -68,8 +69,9 @@ export function checkBundleProfitability(params: {
 
   const expectedRevenue = calcExpectedRevenue(actualGasCosts);
   const expectedCost = calcExpectedCost(estimatedHandleOpsGas, outerTxEffectiveGasPrice);
-  const requiredRevenue =
-    (expectedCost * BigInt(10000 + minProfitMarginBps)) / 10000n;
+  // Round the required revenue UP so truncation can't let a hair-below-margin bundle slip
+  // through (conservative gate — never submit below the intended margin).
+  const requiredRevenue = ceilDiv(expectedCost * BigInt(10000 + minProfitMarginBps), 10000n);
 
   const profitable = expectedRevenue >= requiredRevenue;
 
@@ -100,8 +102,8 @@ export function checkUserOpProfitability(params: {
   marginBps: number;
 }): boolean {
   const { userOpGasPrice, outerTxEffectiveGasPrice, marginBps } = params;
-  const requiredPrice =
-    (outerTxEffectiveGasPrice * BigInt(10000 + marginBps)) / 10000n;
+  // Round the required price UP (conservative — never under-charge the margin).
+  const requiredPrice = ceilDiv(outerTxEffectiveGasPrice * BigInt(10000 + marginBps), 10000n);
   return userOpGasPrice >= requiredPrice;
 }
 

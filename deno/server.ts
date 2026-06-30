@@ -15,6 +15,7 @@ import {
   internalError,
 } from "../shared/rpc/errors.ts";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";
+import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 import {
   processRequest,
   jsonResponse,
@@ -59,17 +60,25 @@ export function startRpcServer(
         const chains = chainRegistry.getAll();
         let totalMempoolSize = 0;
         let totalLockedEOAs = 0;
+        let oldestMempoolAgeMs = 0;
+        let totalPendingReceipts = 0;
         for (const chain of chains) {
           totalMempoolSize += chain.mempool.size;
           totalLockedEOAs += chain.accountService.lockManager.getLockedEOAs().length;
+          oldestMempoolAgeMs = Math.max(oldestMempoolAgeMs, chain.mempool.oldestEntryAgeMs());
+          totalPendingReceipts += chain.bundler.pendingReceiptCount;
         }
+        const rel = reliabilityHealth();
         return Response.json({
           service: "vela-bundler",
-          status: totalLockedEOAs > 0 ? "degraded" : "ok",
+          status: totalLockedEOAs > 0 || rel.circuit.degraded > 0 ? "degraded" : "ok",
           activeChains: chains.length,
           mempoolSize: totalMempoolSize,
+          oldestMempoolAgeMs,
           lockedEOAs: totalLockedEOAs,
+          pendingReceipts: totalPendingReceipts,
           entryPoint: config.entryPointAddress,
+          reliability: rel,
         }, {
           headers: {
             "Access-Control-Allow-Origin": "*",

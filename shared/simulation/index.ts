@@ -27,10 +27,29 @@ import { encodeHandleOps } from "../userop/encode.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient, resolveRpcUrl } from "../utils/rpc-client.ts";
 import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
+import { rpcCall, type RpcEnvelope } from "../reliability/rpc-fetch.ts";
+import { createDeadline, type Deadline } from "../reliability/retry.ts";
+import { getClassification } from "../reliability/errors.ts";
+import { redactUrl } from "../reliability/log.ts";
 import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../gas/l2-data-fee.ts";
 
 /** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
 const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
+
+/**
+ * Total wall-time budget for a multi-RPC simulation fan-out. Bounds the worst case
+ * where the primary RPC is down and we walk the fallback list — without this, a
+ * dead upstream made a single simulate take (per-RPC timeout × list length).
+ */
+const SIMULATION_TOTAL_DEADLINE_MS = SIMULATION_TIMEOUT_MS * 2; // 30s across all RPCs
+
+/** Cap on how many public fallback RPCs we walk per simulation (after user + default). */
+const MAX_PUBLIC_FALLBACKS = 2;
+
+/** L1-data-fee volatility buffer (bps) applied to the rollup L1 component baked into
+ *  preVerificationGas — protects the bundler when the L1 base fee rises between quote and
+ *  inclusion. 15000 = ×1.5. */
+const L2_DATA_FEE_BUFFER_BPS = 15_000n;
 
 
 export interface SimulationResult {
@@ -38,6 +57,9 @@ export interface SimulationResult {
   validationResult?: ValidationResultInfo;
   errorCode?: number;
   errorMessage?: string;
+  /** True when the failure was a transport/transient RPC issue (try another node), as
+   *  opposed to a definitive validation rejection. Set from structured classification. */
+  transient?: boolean;
 }
 
 export interface BundleSimulationResult {
@@ -54,6 +76,8 @@ export interface ExecutionSimulationResult {
   paid?: bigint;
   errorCode?: number;
   errorMessage?: string;
+  /** True when the failure was a transport/transient RPC issue (try another node). */
+  transient?: boolean;
 }
 
 /**
@@ -66,21 +90,23 @@ export function createSimulator(config: BundlerConfig) {
     return getPublicClient(url);
   }
 
-  /** Build a deduplicated RPC list: user RPC → chain default → publicRpcs. */
+  /**
+   * Build a deduplicated RPC list: user RPC → chain default → capped publicRpcs.
+   * The public fallbacks are capped (MAX_PUBLIC_FALLBACKS) so a fully-degraded chain
+   * can't make one simulation walk a 10+ endpoint list at the per-RPC timeout.
+   */
   function buildRpcFallbackList(cfg: BundlerConfig, rpcUrlOverride?: string): string[] {
     const seen = new Set<string>();
     const list: string[] = [];
     const add = (url?: string | null) => { if (url && !seen.has(url)) { seen.add(url); list.push(url); } };
     add(rpcUrlOverride);      // user-provided RPC first
     add(cfg.rpcUrl);           // chain default (Alchemy or registry)
-    for (const r of cfg.publicRpcs) add(r); // remaining public RPCs
+    let publicAdded = 0;
+    for (const r of cfg.publicRpcs) {
+      if (publicAdded >= MAX_PUBLIC_FALLBACKS) break;
+      if (!seen.has(r)) { add(r); publicAdded++; }
+    }
     return list;
-  }
-
-  /** Check if an error message indicates a transient RPC issue worth retrying on another node. */
-  function isTransientSimError(msg?: string): boolean {
-    if (!msg) return false;
-    return msg.includes("Temporary") || msg.includes("internal error") || msg.includes("RPC failed") || msg.includes("non-JSON") || msg.includes("Can't route");
   }
 
   /**
@@ -94,6 +120,7 @@ export function createSimulator(config: BundlerConfig) {
   async function simulateValidation(
     userOp: UserOperation,
     rpcUrlOverride?: string,
+    deadline?: Deadline,
   ): Promise<SimulationResult> {
     const packed = packUserOp(userOp);
     const calldata = encodeFunctionData({
@@ -103,6 +130,9 @@ export function createSimulator(config: BundlerConfig) {
     });
 
     const ep = config.entryPointAddress;
+    // Bound the whole fan-out by a shared deadline (request budget if supplied, else
+    // a local cap) so a degraded chain can't make this walk every RPC at full timeout.
+    const dl = deadline ?? createDeadline(SIMULATION_TOTAL_DEADLINE_MS);
 
     // Build RPC list: user RPC first (if provided), then chain default, then publicRpcs.
     // stateOverride (EntryPointSimulations bytecode injection) is flaky on some providers,
@@ -110,53 +140,53 @@ export function createSimulator(config: BundlerConfig) {
     const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
 
     for (let i = 0; i < rpcsToTry.length; i++) {
+      if (dl.expired()) break;
       const rpcUrl = rpcsToTry[i]!;
-      const result = await _doSimulateValidation(calldata, ep, rpcUrl);
+      const result = await _doSimulateValidation(calldata, ep, rpcUrl, dl);
       if (result.valid) return result;
-      if (isTransientSimError(result.errorMessage)) {
-        console.warn(`[Simulator] simulateValidation failed on ${rpcUrl.slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
+      if (result.transient) {
+        console.warn(`[Simulator] simulateValidation transient failure on ${redactUrl(rpcUrl).slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
         continue;
       }
       return result; // Definitive failure — don't retry
     }
-    return { valid: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `Simulation failed on all ${rpcsToTry.length} RPCs` };
+    return { valid: false, transient: true, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `Simulation unavailable on all ${rpcsToTry.length} RPCs (within deadline)` };
   }
 
   async function _doSimulateValidation(
     calldata: `0x${string}`,
     ep: `0x${string}`,
     rpcUrl: string,
+    deadline?: Deadline,
   ): Promise<SimulationResult> {
+    let json: RpcEnvelope;
     try {
-      const controller = new AbortController();
-      const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
-      let res: Response;
-      try {
-        res = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: 1,
-            method: "eth_call",
-            params: [
-              { to: ep, data: calldata },
-              "latest",
-              // State override: inject EntryPointSimulations code at the EntryPoint address
-              { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
-            ],
-          }),
-        });
-      } finally {
-        clearTimeout(simTimeout);
-      }
-
-      const json = await res.json() as {
-        result?: string;
-        error?: { code: number; message: string; data?: string };
+      json = await rpcCall(
+        rpcUrl,
+        {
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [
+            { to: ep, data: calldata },
+            "latest",
+            // State override: inject EntryPointSimulations code at the EntryPoint address
+            { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
+          ],
+        },
+        { dependency: "rpc", operation: "simulateValidation", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
+      );
+    } catch (err) {
+      // Transport failure (network/timeout/transient status/circuit open) — flagged
+      // transient so the caller advances to the next RPC.
+      const cls = getClassification(err);
+      return {
+        valid: false, transient: true,
+        errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+        errorMessage: `Simulation RPC ${cls.reason}`,
       };
-
-      if (json.result && json.result !== "0x") {
+    }
+    try {
+      if (json.result && typeof json.result === "string" && json.result !== "0x") {
         // v0.7 EntryPointSimulations.simulateValidation returns ValidationResult directly
         return parseReturnedValidationResult(json.result as `0x${string}`);
       }
@@ -199,11 +229,13 @@ export function createSimulator(config: BundlerConfig) {
 
       return parseRevertData(revertData);
     } catch (err: unknown) {
-      console.warn(`[Simulator] simulateValidation RPC failed:`, err instanceof Error ? err.message : err);
+      // Decode failure of a 200 body — a malformed response from THIS node shouldn't
+      // doom the op, so flag transient to let the caller try another RPC.
+      console.warn(`[Simulator] simulateValidation response decode failed:`, err instanceof Error ? err.message : err);
       return {
-        valid: false,
+        valid: false, transient: true,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `Simulation RPC failed`,
+        errorMessage: `Simulation response decode failed`,
       };
     }
   }
@@ -218,6 +250,7 @@ export function createSimulator(config: BundlerConfig) {
   async function simulateExecution(
     userOp: UserOperation,
     rpcUrlOverride?: string,
+    deadline?: Deadline,
   ): Promise<ExecutionSimulationResult> {
     const packed = packUserOp(userOp);
     const calldata = encodeFunctionData({
@@ -231,56 +264,51 @@ export function createSimulator(config: BundlerConfig) {
     });
 
     const ep = config.entryPointAddress;
+    const dl = deadline ?? createDeadline(SIMULATION_TOTAL_DEADLINE_MS);
     const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
 
     for (let i = 0; i < rpcsToTry.length; i++) {
+      if (dl.expired()) break;
       const rpcUrl = rpcsToTry[i]!;
-      const result = await _doSimulateExecution(calldata, ep, rpcUrl);
+      const result = await _doSimulateExecution(calldata, ep, rpcUrl, dl);
       if (result.success) return result;
-      if (isTransientSimError(result.errorMessage)) {
-        console.warn(`[Simulator] simulateHandleOp failed on ${rpcUrl.slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
+      if (result.transient) {
+        console.warn(`[Simulator] simulateHandleOp transient failure on ${redactUrl(rpcUrl).slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
         continue;
       }
       return result;
     }
-    return { success: false, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `simulateHandleOp failed on all ${rpcsToTry.length} RPCs` };
+    return { success: false, transient: true, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `simulateHandleOp unavailable on all ${rpcsToTry.length} RPCs (within deadline)` };
   }
 
   async function _doSimulateExecution(
     calldata: `0x${string}`,
     ep: `0x${string}`,
     rpcUrl: string,
+    deadline?: Deadline,
   ): Promise<ExecutionSimulationResult> {
+    let json: RpcEnvelope;
     try {
-      const controller = new AbortController();
-      const simTimeout = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
-      let res: Response;
-      try {
-        res = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: 1,
-            method: "eth_call",
-            params: [
-              { to: ep, data: calldata },
-              "latest",
-              { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
-            ],
-          }),
-        });
-      } finally {
-        clearTimeout(simTimeout);
-      }
-
-      const json = await res.json() as {
-        result?: string;
-        error?: { code: number; message: string; data?: string };
-      };
-
+      json = await rpcCall(
+        rpcUrl,
+        {
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [
+            { to: ep, data: calldata },
+            "latest",
+            { [ep]: { code: ENTRY_POINT_SIMULATIONS_BYTECODE } },
+          ],
+        },
+        { dependency: "rpc", operation: "simulateHandleOp", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
+      );
+    } catch (err) {
+      const cls = getClassification(err);
+      return { success: false, transient: true, errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, errorMessage: `simulateHandleOp RPC ${cls.reason}` };
+    }
+    try {
       // Successful return — decode ExecutionResult
-      if (json.result && json.result !== "0x") {
+      if (json.result && typeof json.result === "string" && json.result !== "0x") {
         return parseExecutionResultReturn(json.result as `0x${string}`);
       }
 
@@ -312,11 +340,11 @@ export function createSimulator(config: BundlerConfig) {
         errorMessage: `simulateHandleOp reverted with no data: ${json.error?.message ?? "unknown"}`,
       };
     } catch (err: unknown) {
-      console.warn(`[Simulator] simulateHandleOp RPC failed:`, err instanceof Error ? err.message : err);
+      console.warn(`[Simulator] simulateHandleOp response decode failed:`, err instanceof Error ? err.message : err);
       return {
-        success: false,
+        success: false, transient: true,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
-        errorMessage: `simulateHandleOp RPC failed`,
+        errorMessage: `simulateHandleOp response decode failed`,
       };
     }
   }
@@ -588,6 +616,7 @@ export function createSimulator(config: BundlerConfig) {
     packedOps: PackedUserOperation[],
     beneficiary: `0x${string}`,
     rpcUrlOverride?: string,
+    _deadline?: Deadline,
   ): Promise<BundleSimulationResult> {
     const client = clientFor(rpcUrlOverride);
     const calldata = encodeHandleOps(packedOps, beneficiary);
@@ -629,30 +658,18 @@ export function createSimulator(config: BundlerConfig) {
     // UserOperationEvent with success=false and UserOperationRevertReason)
     try {
       const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
-      const bundleController = new AbortController();
-      const bundleTimeout = setTimeout(() => bundleController.abort(), SIMULATION_TIMEOUT_MS);
-      let callRes: Response;
-      try {
-        callRes = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: bundleController.signal,
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: 1,
-            method: "eth_call",
-            params: [
-              { to: config.entryPointAddress, data: calldata, from: beneficiary },
-              "latest",
-            ],
-          }),
-        });
-      } finally {
-        clearTimeout(bundleTimeout);
-      }
-      const callJson = await callRes.json() as {
-        result?: string;
-        error?: { code: number; message: string; data?: string };
-      };
+      const callJson = await rpcCall(
+        rpcUrl,
+        {
+          jsonrpc: "2.0", id: 1,
+          method: "eth_call",
+          params: [
+            { to: config.entryPointAddress, data: calldata, from: beneficiary },
+            "latest",
+          ],
+        },
+        { dependency: "rpc", operation: "simulateBundle.ethCall", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1 },
+      );
 
       // If eth_call itself reverts, the whole bundle fails (FailedOp during validation)
       if (callJson.error) {
@@ -695,12 +712,14 @@ export function createSimulator(config: BundlerConfig) {
   async function estimateUserOpGas(
     userOp: UserOperation,
     rpcUrlOverride?: string,
+    deadline?: Deadline,
   ): Promise<{
     preVerificationGas: bigint;
     verificationGasLimit: bigint;
     callGasLimit: bigint;
     paymasterVerificationGasLimit: bigint | null;
   }> {
+    const dl = deadline ?? createDeadline(SIMULATION_TOTAL_DEADLINE_MS);
     const client = clientFor(rpcUrlOverride);
     const { calcPreVerificationGas } = await import("../gas/preVerificationGas.ts");
 
@@ -721,13 +740,21 @@ export function createSimulator(config: BundlerConfig) {
         );
       } else if (isOpStackChain(config.chainId)) {
         // OP Stack needs current gas price to convert wei → gas units
-        const { baseFee, suggestedMaxPriorityFeePerGas } = await getGasPrices(rpcUrlOverride);
+        const { baseFee, suggestedMaxPriorityFeePerGas } = await getGasPrices(rpcUrlOverride, dl);
         const gasPrice = baseFee + suggestedMaxPriorityFeePerGas;
         l2DataFeeGas = await estimateOpStackL1Gas(
           handleOpsCalldata,
           gasPrice,
           rpcUrl,
         );
+      }
+      // L1-fee volatility buffer: the L1 data fee is fixed into preVerificationGas at
+      // quote/estimate time, but the REAL L1 fee at inclusion depends on the L1 base fee
+      // then (which can spike). Inflate the L1 component so the user's prepaid pvg still
+      // covers the bundler's L1 cost across normal L1 volatility, rather than the bundler
+      // eating the difference. Bounded (×1.5) so users aren't materially overcharged.
+      if (l2DataFeeGas && l2DataFeeGas > 0n) {
+        l2DataFeeGas = (l2DataFeeGas * L2_DATA_FEE_BUFFER_BPS) / 10_000n;
       }
     }
 
@@ -736,7 +763,7 @@ export function createSimulator(config: BundlerConfig) {
       l2DataFeeGas,
     });
 
-    const simResult = await simulateValidation(userOp, rpcUrlOverride);
+    const simResult = await simulateValidation(userOp, rpcUrlOverride, dl);
     let verificationGasLimit: bigint;
     let paymasterVerificationGasLimit: bigint | null = null;
 
@@ -795,50 +822,45 @@ export function createSimulator(config: BundlerConfig) {
    * than the bundler's configured tip. This fetches the chain's actual suggestion
    * so the bundler can use max(config tip, chain suggestion).
    */
-  async function getGasPrices(rpcUrlOverride?: string): Promise<{
+  async function getGasPrices(rpcUrlOverride?: string, deadline?: Deadline): Promise<{
     baseFee: bigint;
     suggestedMaxPriorityFeePerGas: bigint;
     /** eth_gasPrice — used as floor to prevent nodes rejecting txs with too-low gas price. */
     chainGasPrice: bigint;
   }> {
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
-    const GAS_PRICE_TIMEOUT_MS = RPC_TIMEOUT_MS; // 5s per fetch
 
-    function timedFetch(body: object): Promise<Response> {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), GAS_PRICE_TIMEOUT_MS);
-      return fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      }).finally(() => clearTimeout(timer));
-    }
+    // Route through the unified wrapper: per-call timeout + circuit breaker + structured
+    // classification. Single attempt (the allSettled fan-out already tolerates partial
+    // failure by falling back to defaults), so no request amplification.
+    const call = (id: number, method: string) =>
+      rpcCall(rpcUrl, { jsonrpc: "2.0", id, method, params: method === "eth_getBlockByNumber" ? ["latest", false] : [] },
+        { dependency: "rpc", operation: method, timeoutMs: RPC_TIMEOUT_MS, maxAttempts: 1, deadline });
 
     // Fetch baseFee, priority fee, and gasPrice in parallel
     const [blockRes, tipRes, gpRes] = await Promise.allSettled([
-      timedFetch({ jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: ["latest", false] })
-        .then((r) => r.json()),
-      timedFetch({ jsonrpc: "2.0", id: 2, method: "eth_maxPriorityFeePerGas", params: [] })
-        .then((r) => r.json()),
-      timedFetch({ jsonrpc: "2.0", id: 3, method: "eth_gasPrice", params: [] })
-        .then((r) => r.json()),
+      call(1, "eth_getBlockByNumber"),
+      call(2, "eth_maxPriorityFeePerGas"),
+      call(3, "eth_gasPrice"),
     ]);
 
     let baseFee = 0n;
-    if (blockRes.status === "fulfilled" && blockRes.value?.result?.baseFeePerGas) {
-      baseFee = BigInt(blockRes.value.result.baseFeePerGas);
+    const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
+    if (blockResult?.baseFeePerGas) {
+      baseFee = BigInt(blockResult.baseFeePerGas);
     }
 
     // eth_gasPrice — always fetched, used as floor on non-EIP-1559 chains
     let chainGasPrice = 0n;
-    if (gpRes.status === "fulfilled" && gpRes.value?.result) {
-      chainGasPrice = BigInt(gpRes.value.result);
+    const gpResult = gpRes.status === "fulfilled" ? (gpRes.value?.result as string | undefined) : undefined;
+    if (gpResult) {
+      chainGasPrice = BigInt(gpResult);
     }
 
     let suggestedMaxPriorityFeePerGas = 0n;
-    if (tipRes.status === "fulfilled" && tipRes.value?.result) {
-      suggestedMaxPriorityFeePerGas = BigInt(tipRes.value.result);
+    const tipResult = tipRes.status === "fulfilled" ? (tipRes.value?.result as string | undefined) : undefined;
+    if (tipResult) {
+      suggestedMaxPriorityFeePerGas = BigInt(tipResult);
     } else {
       // Fallback: derive tip from gasPrice - baseFee
       suggestedMaxPriorityFeePerGas = chainGasPrice > baseFee ? chainGasPrice - baseFee : chainGasPrice;
@@ -864,21 +886,19 @@ export function createSimulator(config: BundlerConfig) {
     packedOps: PackedUserOperation[],
     beneficiary: `0x${string}`,
     rpcUrlOverride?: string,
+    deadline?: Deadline,
   ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint }> {
     const calldata = encodeHandleOps(packedOps, beneficiary);
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SIMULATION_TIMEOUT_MS);
-    let json: {
+    type SimV1 = {
       result?: Array<{ calls?: Array<{ status?: string; gasUsed?: string; logs?: unknown[]; error?: { message?: string } }> }>;
       error?: { message: string };
     };
+    let json: SimV1;
     try {
-      const res = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
+      json = (await rpcCall(
+        rpcUrl,
+        {
           jsonrpc: "2.0",
           id: 1,
           method: "eth_simulateV1",
@@ -892,13 +912,12 @@ export function createSimulator(config: BundlerConfig) {
             },
             "latest",
           ],
-        }),
-      });
-      json = await res.json();
+        },
+        { dependency: "rpc", operation: "eth_simulateV1", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
+      )) as SimV1;
     } catch (err) {
-      return { success: false, errorMessage: `eth_simulateV1 failed: ${err instanceof Error ? err.message : String(err)}` };
-    } finally {
-      clearTimeout(timer);
+      // Fails CLOSED: any transport failure ⇒ we can't prove execution succeeds ⇒ no submit.
+      return { success: false, errorMessage: `eth_simulateV1 failed: ${getClassification(err).reason}` };
     }
 
     if (json.error) {

@@ -35,6 +35,7 @@ import { tempoMainnet, tempoModerato } from "viem/chains";
 import { tempoActions } from "viem/tempo";
 import type { PackedUserOperation } from "./userop/types.ts";
 import { encodeHandleOps } from "./userop/encode.ts";
+import { ceilDiv } from "./gas/fee-model.ts";
 
 /** Tempo mainnet (4217) → its viem chain; Moderato testnet (42431) for dev. */
 const TEMPO_CHAINS: Record<number, Chain> = {
@@ -67,7 +68,10 @@ export function resolveFeeToken(feeToken?: string | null): `0x${string}` {
   return getAddress(TEMPO_DEFAULT_FEE_TOKEN);
 }
 
-/** Our expected outer-0x76 cost in fee-token smallest units: gas × price (atto) → units. */
+/** Our expected outer-0x76 cost in fee-token smallest units: gas × price (atto) → units.
+ *  Rounded UP (ceilDiv): this is the bundler's COST that the in-band reimbursement must
+ *  cover. Truncating DOWN would set the required-reimbursement floor a hair too low and
+ *  let the bundler accept a reimbursement below its real cost (a per-tx leak). */
 export function tempoCostInFeeToken(
   estimatedGas: bigint,
   gasPriceAtto: bigint,
@@ -75,7 +79,7 @@ export function tempoCostInFeeToken(
 ): bigint {
   const price = gasPriceAtto > 0n ? gasPriceAtto : TEMPO_BASE_FEE_ATTO;
   const atto = estimatedGas * price;
-  return (atto * 10n ** BigInt(decimals)) / 10n ** 18n;
+  return ceilDiv(atto * 10n ** BigInt(decimals), 10n ** 18n);
 }
 
 const EXECUTE_USER_OP_ABI = parseAbi([

@@ -191,6 +191,19 @@ export class Mempool {
   }
 
   /**
+   * Age (ms) of the oldest pending entry, or 0 if the mempool is empty. Surfaced in
+   * /health so a stuck backlog (ops not being bundled) is observable before it grows.
+   */
+  oldestEntryAgeMs(now: number = Date.now()): number {
+    let oldest = 0;
+    for (const entry of this.entries.values()) {
+      const age = now - entry.addedAt;
+      if (age > oldest) oldest = age;
+    }
+    return oldest;
+  }
+
+  /**
    * Clear all entries (debug RPC).
    */
   clear(): void {

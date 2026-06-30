@@ -89,8 +89,25 @@ export class SponsorService {
   /** Rate limit: safeAddress (lowercase) → last attempt timestamp. */
   private readonly lastAttempt = new Map<string, number>();
 
+  /**
+   * Serializes all transactions sent FROM the single treasury EOA. Without this, two
+   * concurrent sponsorships of DIFFERENT safes both auto-fetch the same `pending` nonce
+   * and one tx is dropped/replaced. Funds aren't lost (nonce reuse just fails one), but
+   * the user sees a spurious sponsor failure. A promise-chain mutex keeps treasury sends
+   * strictly sequential so each picks up the prior one's nonce.
+   */
+  private treasuryTxChain: Promise<unknown> = Promise.resolve();
+
   constructor(config: BundlerConfig) {
     this.config = config;
+  }
+
+  /** Run `fn` exclusively against the treasury nonce (serialized across all callers). */
+  private runTreasuryExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.treasuryTxChain.then(fn, fn);
+    // Keep the chain alive regardless of fn's outcome.
+    this.treasuryTxChain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   async sponsor(
@@ -233,7 +250,10 @@ export class SponsorService {
     } catch { /* use fallback */ }
 
     try {
-      const txHash = await walletClient.sendTransaction({
+      // Serialize the submit against the treasury nonce — concurrent sponsorships of
+      // other safes must not pick the same nonce. The confirmation wait stays outside
+      // the lock (it doesn't affect nonce assignment).
+      const txHash = await this.runTreasuryExclusive(() => walletClient.sendTransaction({
         to: relayerAddress,
         value: amount,
         maxFeePerGas: maxFee,
@@ -241,7 +261,7 @@ export class SponsorService {
         gas: transferGas,
         chain: null,
         account,
-      });
+      }));
 
       console.log(`[Sponsor] Submitted: ${txHash}`);
 
@@ -297,13 +317,14 @@ export class SponsorService {
     console.log(
       `[Sponsor][Tempo] treasury → ${relayerAddress} (chain ${chainId}): ${amount} pathUSD units`,
     );
-    const txHash = await sponsorTempoPathUsd({
+    // Serialized against the treasury nonce (see runTreasuryExclusive).
+    const txHash = await this.runTreasuryExclusive(() => sponsorTempoPathUsd({
       chainId,
       privateKey: treasuryPrivateKey,
       rpcUrl,
       to: relayerAddress,
       amount,
-    });
+    }));
     console.log(`[Sponsor][Tempo] Confirmed: ${txHash}`);
     return { sponsored: true, txHash, amount: "0x" + amount.toString(16) };
   }

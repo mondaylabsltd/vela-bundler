@@ -36,3 +36,17 @@ export function parseError(): JsonRpcError {
 export function bundlerError(code: number, message: string, data?: unknown): JsonRpcError {
   return rpcError(code, message, data);
 }
+
+/**
+ * Transient-degradation error (SERVICE_DEGRADED, -32000). Use for upstream-dependency
+ * instability (RPC down/slow, deadline exceeded, circuit open) so the client gets a
+ * STABLE, retryable signal instead of a business-rejection code. Never leaks the raw
+ * provider message — only a stable reason and an optional Retry-After hint.
+ */
+export function serviceDegraded(message: string, opts?: { retryAfterMs?: number; reason?: string }): JsonRpcError {
+  return rpcError(-32000, message, {
+    retryable: true,
+    ...(opts?.retryAfterMs != null ? { retryAfterMs: opts.retryAfterMs } : {}),
+    ...(opts?.reason ? { reason: opts.reason } : {}),
+  });
+}

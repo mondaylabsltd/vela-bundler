@@ -27,6 +27,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
+import { rpcCall } from "../reliability/rpc-fetch.ts";
 import {
   isTempoChain,
   tempoPathUsdBalance,
@@ -125,16 +126,15 @@ export async function executeSweep(params: {
 
     const baseFee = block.baseFeePerGas ?? 1_000_000_000n;
 
-    // Query chain-suggested tip
+    // Query chain-suggested tip (bounded timeout + circuit breaker via rpcCall)
     let tip = 0n;
     try {
-      const tipRes = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_maxPriorityFeePerGas", params: [] }),
-      });
-      const tipJson = await tipRes.json() as { result?: string };
-      if (tipJson.result) tip = BigInt(tipJson.result);
+      const tipJson = await rpcCall(
+        rpcUrl,
+        { jsonrpc: "2.0", id: 1, method: "eth_maxPriorityFeePerGas", params: [] },
+        { dependency: "rpc", operation: "eth_maxPriorityFeePerGas", timeoutMs: 5000, maxAttempts: 1 },
+      );
+      if (typeof tipJson.result === "string") tip = BigInt(tipJson.result);
     } catch {
       tip = baseFee / 10n || 1n; // 10% of baseFee as fallback
     }

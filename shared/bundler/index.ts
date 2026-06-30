@@ -8,7 +8,6 @@
 
 import {
   createWalletClient,
-  createPublicClient,
   http,
   type PublicClient,
   type Transport,
@@ -18,6 +17,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
+import { metrics } from "../reliability/log.ts";
+import { createDeadline } from "../reliability/retry.ts";
 import { executeSweep } from "./sweep.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import type { Simulator } from "../simulation/index.ts";
@@ -32,6 +33,7 @@ import {
   calcUserOpGasPrice,
   checkBundleProfitability,
 } from "../gas/profitability.ts";
+import { computeOuterGas, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 import {
   isTempoChain,
@@ -55,20 +57,48 @@ const RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 /** Max receipt store entries — prevents unbounded memory growth. */
 const RECEIPT_STORE_MAX = 10_000;
 
-/** Max polling attempts for a single pending receipt (60 × ~10s alarm = 10 min). */
-const PENDING_RECEIPT_MAX_CHECKS = 60;
+/** Max polling attempts for a single pending receipt. Now that pending receipts are
+ *  persisted across DO evictions, we can poll far longer before giving up — a stuck
+ *  (underpriced) tx may take many minutes to clear. 360 × ~10s alarm ≈ 1 hour. */
+const PENDING_RECEIPT_MAX_CHECKS = 360;
+
+/** Per-sender bundle-prep budget: bounds one sender's RPC reads + simulations so a slow
+ *  sender can't starve the others (or the alarm) within a cycle. */
+const PER_SENDER_BUNDLE_DEADLINE_MS = 20_000;
 
 /** Treasury sweep toggle. When on, after a confirmed bundle the relayer's surplus
  *  is skimmed back to the treasury, but only every `sweepInterval` txs and only the
  *  portion above a per-tx float floor (see bundler/sweep.ts). Set false to disable. */
 const SWEEP_ENABLED = true;
 
+/**
+ * Lean projection of a submitted op, kept for receipt reconciliation. Only the fields
+ * reconciliation actually needs (hash for the receipt store, sender to derive the EOA /
+ * label the receipt, nonce for the receipt body) — small enough to persist to DO storage
+ * so an eviction between submit and confirmation does not abandon the in-flight bundle.
+ */
+interface PendingEntry {
+  userOpHash: `0x${string}`;
+  userOp: { sender: `0x${string}`; nonce: bigint };
+}
+
 /** Metadata for a pending transaction that needs receipt confirmation. */
 interface PendingReceipt {
   txHash: `0x${string}`;
-  entries: MempoolEntry[];
+  entries: PendingEntry[];
   eoaAddress: `0x${string}`;
   reservedAmount: bigint;
+  rpcOverride?: string;
+  submittedAt: number;
+  checkCount: number;
+}
+
+/** Serialized form persisted to DO storage (bigints → decimal strings). */
+interface SerializedPendingReceipt {
+  txHash: `0x${string}`;
+  entries: Array<{ userOpHash: `0x${string}`; sender: `0x${string}`; nonce: string }>;
+  eoaAddress: `0x${string}`;
+  reservedAmount: string;
   rpcOverride?: string;
   submittedAt: number;
   checkCount: number;
@@ -83,6 +113,12 @@ export class BundlerService {
   private readonly disableTimers: boolean;
   /** Pending receipts tracked for alarm-driven polling (CF Worker mode). */
   private pendingReceipts: PendingReceipt[] = [];
+  /**
+   * Durable-storage hook. In CF Worker mode the DO wires this to persist the in-flight
+   * pending-receipt list to DO storage, so reconciliation survives eviction/crash. No-op
+   * in Deno mode (which keeps state in-memory by design).
+   */
+  private persistPendingHook?: (state: SerializedPendingReceipt[]) => Promise<void>;
 
   constructor(
     private readonly config: BundlerConfig,
@@ -93,9 +129,8 @@ export class BundlerService {
   ) {
     this.currentBundlingMode = config.bundlingMode;
     this.disableTimers = options?.disableTimers ?? false;
-    this.publicClient = createPublicClient({
-      transport: http(config.rpcUrl),
-    }) as PublicClient<Transport, Chain>;
+    // Tuned, cached read client (explicit timeout + bounded retry — see rpc-client.ts).
+    this.publicClient = getPublicClient(config.rpcUrl);
     // Receipt cleanup runs regardless of bundling mode (every 10 min).
     // Disabled in CF Worker where DO alarm handles cleanup.
     if (!this.disableTimers) {
@@ -250,32 +285,41 @@ export class BundlerService {
       : entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
     const effectiveRpc = rpcOverride ?? this.config.rpcUrl;
 
-    const gasPrices = await this.simulator.getGasPrices(rpcOverride);
+    // Bound this single sender's bundle prep by a deadline shared across all its RPC
+    // reads/simulations, so one slow sender can't starve the rest of the senders (or the
+    // alarm itself) within a cycle. Real cancellation flows through rpcCall's AbortSignal.
+    const dl = createDeadline(PER_SENDER_BUNDLE_DEADLINE_MS);
+
+    const gasPrices = await this.simulator.getGasPrices(rpcOverride, dl);
     const baseFee = gasPrices.baseFee;
 
-    // Derive outer tx gas price from the UserOp's maxFeePerGas.
-    // Wallet sets: maxFeePerGas = gasPrice × speedTier × WALLET_GAS_MARKUP
-    // Bundler reverses: outerGasPrice = userOpGasPrice / WALLET_GAS_MARKUP = gasPrice × speedTier
-    // Margin = WALLET_GAS_MARKUP - 1 (constant, independent of tier).
-    // Speed tier is preserved: higher tier → higher outer gas → faster inclusion.
-    const firstUserOp = entries[0]!.userOp;
-    const userOpEffective = calcUserOpGasPrice(firstUserOp, baseFee);
-    const markupScaled = BigInt(Math.round(this.config.walletGasMarkup * 100));
-    const intendedGasPrice = (userOpEffective * 100n) / markupScaled;
-
-    // Put the whole intended premium into the priority fee so a higher-tier op
-    // (higher intendedGasPrice) genuinely gets faster inclusion — not just more
-    // base-fee headroom. Floor at the chain's suggested tip (some chains enforce a
-    // minimum priority fee). This also makes effectiveGasPrice the price actually
-    // paid (baseFee + priorityFee), so the reported margin matches reality.
+    // Derive outer tx gas pricing from the user's SIGNED price via the fee model.
+    //   revenueCap = min over this sender's ops of the EntryPoint refund price (userPrice).
+    //                Using the MIN is conservative: the single outer price must not exceed
+    //                ANY op's revenue, else that op would be a loss.
+    //   intendedGasPrice = reverseMarkup(revenueCap) = the quote-time network price (the
+    //                outer price target in the calm case; tier/speed is preserved since a
+    //                higher-tier op signs a higher userPrice → higher intendedGasPrice).
+    // computeOuterGas then clamps the outer maxFeePerGas to [baseFee+priority, revenueCap]
+    // with base-fee head-room, guaranteeing: never a loss (maxFee ≤ revenue) AND reliable
+    // inclusion when base fee rises post-submit (the previous code had ~tip head-room and
+    // could strand the tx after one rising block). See shared/gas/fee-model.ts.
+    const markupBps = markupToBps(this.config.walletGasMarkup);
+    let revenueCap = calcUserOpGasPrice(entries[0]!.userOp, baseFee);
+    for (const e of entries) {
+      const p = calcUserOpGasPrice(e.userOp, baseFee);
+      if (p < revenueCap) revenueCap = p;
+    }
+    const userOpEffective = revenueCap; // revenue basis used by the profitability gate below
+    const intendedGasPrice = reverseMarkup(revenueCap, markupBps);
     const chainTip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
-    let priorityFee = intendedGasPrice > baseFee ? intendedGasPrice - baseFee : 0n;
-    if (priorityFee < chainTip) priorityFee = chainTip;
-    const outerGas = {
-      maxFeePerGas: intendedGasPrice > baseFee + priorityFee ? intendedGasPrice : baseFee + priorityFee,
-      maxPriorityFeePerGas: priorityFee,
-      effectiveGasPrice: baseFee + priorityFee,
-    };
+    const outerGas = computeOuterGas({
+      revenueCapPerGas: revenueCap,
+      baseFee,
+      intendedGasPrice,
+      chainTip,
+      minPriorityFee: this.config.minPriorityFeePerGas,
+    });
 
     // Enforce binding: every UserOp.sender must be the bound safeAddress
     const validEntries: MempoolEntry[] = [];
@@ -299,12 +343,12 @@ export class BundlerService {
     type CheckedEntry = { entry: MempoolEntry; accountValidationData: bigint; paymasterValidationData: bigint };
     const simResults = await Promise.allSettled(
       validEntries.map(async (entry): Promise<CheckedEntry | null> => {
-        const simResult = await this.simulator.simulateValidation(entry.userOp, rpcOverride);
+        const simResult = await this.simulator.simulateValidation(entry.userOp, rpcOverride, dl);
         if (!simResult.valid) {
           console.warn(`[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`);
           return null;
         }
-        const execResult = await this.simulator.simulateExecution(entry.userOp, rpcOverride);
+        const execResult = await this.simulator.simulateExecution(entry.userOp, rpcOverride, dl);
         if (!execResult.success) {
           console.warn(`[Bundler] UserOp ${entry.userOpHash} failed execution simulation: ${execResult.errorMessage}`);
           return null;
@@ -339,7 +383,7 @@ export class BundlerService {
 
     // Full bundle simulation
     const packedOps = checkedEntries.map((e) => e.entry.packed);
-    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, rpcOverride);
+    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, rpcOverride, dl);
 
     if (!bundleSim.success) {
       // Remove failed op if identified
@@ -380,7 +424,7 @@ export class BundlerService {
       // Verify execution actually succeeds AND read the REAL gas it burns. handleOps
       // swallows inner reverts, so this also protects against an OOG/insufficient-balance
       // op that would leave us unpaid. Fails closed — no proof of success ⇒ no submit.
-      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, rpcOverride);
+      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, rpcOverride, dl);
       if (!execCheck.success) {
         if (execCheck.failedOpIndex !== undefined) {
           const failed = checkedEntries[execCheck.failedOpIndex];
@@ -528,6 +572,7 @@ export class BundlerService {
             account,
           });
 
+      metrics.inc("bundle_submit_total", 1, { chain: this.config.chainId, outcome: "ok" });
       console.log(
         `[Bundler] Bundle submitted for ${safeAddress}: ${txHash} ` +
         `(${checkedEntries.length} ops, EOA: ${eoa.address})`,
@@ -548,13 +593,19 @@ export class BundlerService {
         // DO alarm calls checkPendingReceipts() each cycle — no fire-and-forget.
         this.pendingReceipts.push({
           txHash,
-          entries: submittedEntries,
+          entries: submittedEntries.map((e) => ({
+            userOpHash: e.userOpHash,
+            userOp: { sender: e.userOp.sender, nonce: e.userOp.nonce ?? 0n },
+          })),
           eoaAddress: eoa.address,
           reservedAmount: expectedCost,
           rpcOverride,
           submittedAt: Date.now(),
           checkCount: 0,
         });
+        // Persist immediately so an eviction in the gap before the next alarm tick
+        // cannot abandon this in-flight bundle's reconciliation. Non-fatal on error.
+        await this.flushPendingReceipts();
       } else {
         // Deno mode: process receipt in background — unlocks EOA on success
         this.processReceipt(txHash, submittedEntries, eoa.address, expectedCost, rpcOverride)
@@ -587,6 +638,7 @@ export class BundlerService {
     } catch (err) {
       // Release reservation on submission failure
       this.accountService.releaseBalance(eoa.address, expectedCost);
+      metrics.inc("bundle_submit_total", 1, { chain: this.config.chainId, outcome: "error" });
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error("[Bundler] Failed to submit bundle:", errorMsg);
 
@@ -894,11 +946,22 @@ export class BundlerService {
         }
       }
 
-      // Give up after max checks
+      // Give up after max checks. Do NOT fabricate a success=false receipt here: the
+      // dropped-tx path above already stores a failed receipt when the nonce proves the
+      // tx is gone. Reaching here means the tx is still pending (e.g. underpriced/stuck)
+      // after ~1h of polling — telling the wallet "failed" would be a lie if it later
+      // lands. Release the reservation and recover the EOA, but leave the receipt absent
+      // (honest "still pending"); emit a HIGH-PRIORITY signal for an operator to inspect.
       if (pending.checkCount >= PENDING_RECEIPT_MAX_CHECKS) {
-        console.error(`[Bundler] Giving up on receipt for ${pending.txHash} after ${pending.checkCount} checks`);
-        this.storeFailedReceipts(pending.entries, pending.txHash, pending.eoaAddress);
+        metrics.inc("pending_receipt_abandoned_total", 1, { chain: this.config.chainId });
+        console.error(
+          `[Bundler] ALERT pending-receipt-abandoned tx=${pending.txHash} eoa=${pending.eoaAddress} ` +
+          `checks=${pending.checkCount} ageMs=${Date.now() - pending.submittedAt} — tx still pending after max polls; needs operator review`,
+        );
         this.accountService.releaseBalance(pending.eoaAddress, pending.reservedAmount);
+        // Leave the EOA locked (LOCKED_PENDING_UNKNOWN) for the health loop — the tx may
+        // still confirm and we must not build a new bundle on its nonce.
+        this.accountService.lockManager.lockEOA(pending.eoaAddress, "LOCKED_PENDING_UNKNOWN");
         continue;
       }
 
@@ -906,10 +969,91 @@ export class BundlerService {
     }
 
     this.pendingReceipts = remaining;
+    // Persist the trimmed list so completed/abandoned receipts aren't re-polled after an
+    // eviction, and so a restart resumes exactly the still-in-flight set.
+    await this.flushPendingReceipts();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Durable pending-receipt state (CF Worker mode)
+  // ---------------------------------------------------------------------------
+
+  /** Wire the durable-storage persistence hook (called by BundlerDO). */
+  setPersistPendingHook(hook: (state: SerializedPendingReceipt[]) => Promise<void>): void {
+    this.persistPendingHook = hook;
+  }
+
+  /** True when at least one bundle is awaiting confirmation. */
+  get pendingReceiptCount(): number {
+    return this.pendingReceipts.length;
+  }
+
+  /** Age (ms) of the oldest in-flight pending receipt, or 0 if none. */
+  oldestPendingReceiptAgeMs(now: number = Date.now()): number {
+    let oldest = 0;
+    for (const p of this.pendingReceipts) {
+      const age = now - p.submittedAt;
+      if (age > oldest) oldest = age;
+    }
+    return oldest;
+  }
+
+  /** Serialize the in-flight pending receipts for durable storage. */
+  exportPendingState(): SerializedPendingReceipt[] {
+    return this.pendingReceipts.map((p) => ({
+      txHash: p.txHash,
+      entries: p.entries.map((e) => ({ userOpHash: e.userOpHash, sender: e.userOp.sender, nonce: e.userOp.nonce.toString() })),
+      eoaAddress: p.eoaAddress,
+      reservedAmount: p.reservedAmount.toString(),
+      rpcOverride: p.rpcOverride,
+      submittedAt: p.submittedAt,
+      checkCount: p.checkCount,
+    }));
+  }
+
+  /**
+   * Restore pending receipts from durable storage after a DO eviction/restart, so the
+   * alarm resumes reconciling bundles submitted before the eviction. Also re-locks the
+   * EOAs so no new bundle is built on top of an unconfirmed nonce. Merges with (does not
+   * clobber) any in-memory entries.
+   */
+  importPendingState(saved: SerializedPendingReceipt[] | undefined | null): void {
+    if (!saved || !Array.isArray(saved) || saved.length === 0) return;
+    const known = new Set(this.pendingReceipts.map((p) => p.txHash));
+    for (const s of saved) {
+      if (known.has(s.txHash)) continue;
+      try {
+        this.pendingReceipts.push({
+          txHash: s.txHash,
+          entries: (s.entries ?? []).map((e) => ({ userOpHash: e.userOpHash, userOp: { sender: e.sender, nonce: BigInt(e.nonce) } })),
+          eoaAddress: s.eoaAddress,
+          reservedAmount: BigInt(s.reservedAmount),
+          rpcOverride: s.rpcOverride,
+          submittedAt: s.submittedAt,
+          checkCount: s.checkCount,
+        });
+        // Re-establish the reservation + lock so a recovered DO doesn't double-spend the
+        // EOA while the prior tx is still in flight.
+        this.accountService.reserveBalance(s.eoaAddress, BigInt(s.reservedAmount));
+        this.accountService.lockManager.lockEOA(s.eoaAddress, "LOCKED_PENDING_UNKNOWN");
+      } catch (err) {
+        console.warn(`[Bundler] Skipped unrestorable pending receipt ${s.txHash}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  /** Persist the current pending-receipt list via the durable hook (non-fatal). */
+  private async flushPendingReceipts(): Promise<void> {
+    if (!this.persistPendingHook) return;
+    try {
+      await this.persistPendingHook(this.exportPendingState());
+    } catch (err) {
+      console.warn(`[Bundler] Failed to persist pending receipts: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   /** Store event logs from a confirmed receipt into the receipt store. */
-  private storeReceiptLogs(receipt: { status: string; logs: readonly any[]; blockNumber: bigint; blockHash: `0x${string}`; transactionHash: `0x${string}`; transactionIndex: number; from: `0x${string}`; to: `0x${string}` | null; cumulativeGasUsed: bigint; gasUsed: bigint; effectiveGasPrice: bigint }, entries: MempoolEntry[]): void {
+  private storeReceiptLogs(receipt: { status: string; logs: readonly any[]; blockNumber: bigint; blockHash: `0x${string}`; transactionHash: `0x${string}`; transactionIndex: number; from: `0x${string}`; to: `0x${string}` | null; cumulativeGasUsed: bigint; gasUsed: bigint; effectiveGasPrice: bigint }, entries: PendingEntry[]): void {
     const logs = parseEventLogs({
       abi: ENTRYPOINT_V07_ABI,
       logs: receipt.logs as any,
@@ -960,7 +1104,7 @@ export class BundlerService {
   }
 
   /** Store failed receipt entries for user-facing feedback. */
-  private storeFailedReceipts(entries: MempoolEntry[], txHash: `0x${string}`, eoaAddress: `0x${string}`): void {
+  private storeFailedReceipts(entries: PendingEntry[], txHash: `0x${string}`, eoaAddress: `0x${string}`): void {
     for (const entry of entries) {
       if (this.receiptStore.size >= RECEIPT_STORE_MAX) {
         const oldest = this.receiptStore.keys().next().value;

@@ -8,8 +8,6 @@
  */
 
 import {
-  createPublicClient,
-  http,
   parseAbi,
   type PublicClient,
   type Transport,
@@ -60,9 +58,8 @@ export class AccountService {
     this.config = params.config;
     this.lockManager = new EOALockManager();
     this.balanceReserveMultiplier = params.balanceReserveMultiplier ?? 2;
-    this.client = createPublicClient({
-      transport: http(params.config.rpcUrl),
-    }) as PublicClient<Transport, Chain>;
+    // Tuned, cached read client (explicit timeout + bounded retry — see rpc-client.ts).
+    this.client = getPublicClient(params.config.rpcUrl);
   }
 
   /**

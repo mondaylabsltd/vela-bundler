@@ -11,6 +11,7 @@
  */
 
 import { getPublicClient } from "../utils/rpc-client.ts";
+import { ceilDiv } from "./fee-model.ts";
 
 // ---------------------------------------------------------------------------
 // Chain ID sets
@@ -159,8 +160,10 @@ export async function estimateOpStackL1Gas(
 
     // Return value = L1 fee in wei
     const l1FeeWei = BigInt("0x" + result.data.slice(2, 66));
-    // Convert wei → gas units by dividing by gasPrice
-    const l1GasUnits = l1FeeWei / gasPrice;
+    // Convert wei → gas units by dividing by gasPrice. Round UP: this is a COST the
+    // bundler must recover via preVerificationGas — truncating down would under-recover
+    // the L1 data fee by up to ~1 gas-unit's worth of wei per tx.
+    const l1GasUnits = ceilDiv(l1FeeWei, gasPrice);
 
     console.log(`[L2Fee] OP Stack L1 fee: ${l1FeeWei} wei → ${l1GasUnits} gas units (at gasPrice=${gasPrice})`);
     return l1GasUnits;

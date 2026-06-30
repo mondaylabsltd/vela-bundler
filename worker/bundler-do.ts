@@ -23,6 +23,8 @@ import { LocalKeyManager } from "../shared/keys/local.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
+import { metrics, logEvent } from "../shared/reliability/log.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import {
@@ -54,6 +56,9 @@ const STORAGE_KEY_CHAIN_ID = "chainId";
 
 /** DO storage key for persisting lastDecayAt across evictions. */
 const STORAGE_KEY_LAST_DECAY = "lastDecayAt";
+
+/** DO storage key for persisting in-flight pending receipts across evictions. */
+const STORAGE_KEY_PENDING_RECEIPTS = "pendingReceipts";
 
 /** Redact API keys from RPC URLs for safe logging. */
 function redactRpcUrl(url: string): string {
@@ -185,6 +190,32 @@ export class BundlerDO implements DurableObject {
     // Receipt cleanup
     this.chainServices.bundler.cleanExpiredReceipts();
 
+    // Observability: publish per-cycle gauges + one structured heartbeat so a slow
+    // backlog / stuck reconciliation is visible before in-memory state is evicted.
+    try {
+      const cs = this.chainServices;
+      const lockedEOAs = cs.accountService.lockManager.getLockedEOAs().length;
+      const mempoolSize = cs.mempool.size;
+      const oldestMempoolMs = cs.mempool.oldestEntryAgeMs();
+      const pendingReceipts = cs.bundler.pendingReceiptCount;
+      const oldestPendingMs = cs.bundler.oldestPendingReceiptAgeMs();
+      const labels = { chain: this.chainId };
+      metrics.gauge("mempool_size", mempoolSize, labels);
+      metrics.gauge("mempool_oldest_age_ms", oldestMempoolMs, labels);
+      metrics.gauge("locked_eoas", lockedEOAs, labels);
+      metrics.gauge("pending_receipts", pendingReceipts, labels);
+      metrics.gauge("pending_receipt_oldest_age_ms", oldestPendingMs, labels);
+      logEvent({
+        level: lockedEOAs > 0 || oldestMempoolMs > 60_000 ? "warn" : "debug",
+        dependency: "internal", operation: "alarm_heartbeat", chain_id: this.chainId, outcome: "ok",
+        mempool_size: mempoolSize, mempool_oldest_age_ms: oldestMempoolMs, locked_eoas: lockedEOAs,
+        pending_receipts: pendingReceipts, pending_receipt_oldest_age_ms: oldestPendingMs,
+        circuit_degraded: reliabilityHealth().circuit.degraded,
+      });
+    } catch (err) {
+      console.error(`[BundlerDO:${this.chainId}] Heartbeat error:`, err);
+    }
+
     // Re-schedule alarm
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
@@ -264,6 +295,21 @@ export class BundlerDO implements DurableObject {
     const bundler = new BundlerService(chainConfig, mempool, simulator, accountService, {
       disableTimers: true,
     });
+
+    // Durably persist in-flight receipt reconciliation so a DO eviction between submit
+    // and confirmation does not abandon a submitted bundle (receipt would otherwise be
+    // null forever and the EOA effectively stuck). The hook fires immediately after each
+    // submit and after each alarm reconciliation pass.
+    bundler.setPersistPendingHook(async (state) => {
+      if (state.length === 0) await this.state.storage.delete(STORAGE_KEY_PENDING_RECEIPTS);
+      else await this.state.storage.put(STORAGE_KEY_PENDING_RECEIPTS, state);
+    });
+    // Restore any in-flight receipts from before the eviction and resume polling them.
+    const savedPending = await this.state.storage.get(STORAGE_KEY_PENDING_RECEIPTS);
+    if (savedPending) {
+      bundler.importPendingState(savedPending as Parameters<typeof bundler.importPendingState>[0]);
+      console.log(`[BundlerDO] Restored ${(savedPending as unknown[]).length} in-flight pending receipt(s) for chain ${chainId}`);
+    }
 
     this.chainServices = {
       chainId,
@@ -412,16 +458,21 @@ export class BundlerDO implements DurableObject {
       return Response.json({ status: "uninitialized", chainId: this.chainId });
     }
 
+    const cs = this.chainServices;
+    const lockedEOAs = cs.accountService.lockManager.getLockedEOAs().length;
+    const rel = reliabilityHealth();
     return Response.json({
       service: "vela-bundler",
       runtime: "cloudflare-workers",
       chainId: this.chainId,
-      chainName: this.chainServices.chainInfo?.name ?? "unknown",
-      status: this.chainServices.accountService.lockManager.getLockedEOAs().length > 0
-        ? "degraded"
-        : "ok",
-      mempoolSize: this.chainServices.mempool.size,
-      lockedEOAs: this.chainServices.accountService.lockManager.getLockedEOAs().length,
+      chainName: cs.chainInfo?.name ?? "unknown",
+      status: lockedEOAs > 0 || rel.circuit.degraded > 0 ? "degraded" : "ok",
+      mempoolSize: cs.mempool.size,
+      oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
+      lockedEOAs,
+      pendingReceipts: cs.bundler.pendingReceiptCount,
+      oldestPendingReceiptAgeMs: cs.bundler.oldestPendingReceiptAgeMs(),
+      reliability: rel,
     }, {
       headers: {
         "Access-Control-Allow-Origin": "*",

@@ -10,6 +10,7 @@ import {
   methodNotFound,
   invalidParams,
   bundlerError,
+  serviceDegraded,
 } from "./errors.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
@@ -22,6 +23,31 @@ import {
   calcOuterTxGasPrice,
 } from "../gas/profitability.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
+import { applyMarkup, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
+import { createDeadline } from "../reliability/retry.ts";
+import { getClassification } from "../reliability/errors.ts";
+import { redactUrl } from "../reliability/log.ts";
+
+/**
+ * End-to-end budget for the synchronous accept path (eth_sendUserOperation /
+ * eth_estimateUserOperationGas). All downstream read RPCs (gas price, balance,
+ * simulation) share this single deadline so a slow/down upstream can NEVER make the
+ * request hang for minutes — it fails fast with a stable, retryable degraded error.
+ */
+const REQUEST_DEADLINE_MS = 15_000;
+
+/**
+ * Map an upstream-dependency error to a stable, retryable SERVICE_DEGRADED JSON-RPC
+ * error. Never leaks the raw provider message/stack — only a stable reason + optional
+ * Retry-After hint, so the client can back off and retry without parsing prose.
+ */
+function degradedFromError(err: unknown, what: string): ReturnType<typeof serviceDegraded> {
+  const cls = getClassification(err);
+  return serviceDegraded(
+    `${what} temporarily unavailable — please retry`,
+    { reason: cls.reason, retryAfterMs: cls.retryAfterMs },
+  );
+}
 
 /**
  * Dispatch an RPC method to its handler.
@@ -82,6 +108,9 @@ async function handleSendUserOperation(
   }
 
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
+  // Single end-to-end budget shared by all downstream read RPCs (gas/balance/sim) so a
+  // slow/down upstream fails fast with a stable retryable error instead of hanging.
+  const deadline = createDeadline(REQUEST_DEADLINE_MS);
   // Tempo public RPCs are flaky (timeouts) — use the bundler's configured (Alchemy) RPC.
   let rpcOverride = isTempoChain(reqCtx.chainId) ? undefined : reqCtx.requestRpcUrl;
 
@@ -89,7 +118,7 @@ async function handleSendUserOperation(
   // chain default (Alchemy / public), skip the bad URL upfront.
   // For dev networks where chain.rpcUrl === rpcOverride (no alternative), keep using it.
   if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
-    console.warn(`[RPC] Skipping blacklisted user RPC ${rpcOverride}, using chain default ${chain.rpcUrl}`);
+    console.warn(`[RPC] Skipping blacklisted user RPC ${redactUrl(rpcOverride)}, using chain default ${redactUrl(chain.rpcUrl)}`);
     rpcOverride = undefined;
   }
 
@@ -152,15 +181,19 @@ async function handleSendUserOperation(
   // Check balance — use chain-aware gas pricing
   let gasPrices;
   try {
-    gasPrices = await chain.simulator.getGasPrices(rpcOverride);
+    gasPrices = await chain.simulator.getGasPrices(rpcOverride, deadline);
   } catch (err) {
     if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
-      console.warn(`[RPC] getGasPrices failed on user RPC ${rpcOverride}, blacklisting and retrying with chain default ${chain.rpcUrl}`);
+      console.warn(`[RPC] getGasPrices failed on user RPC ${redactUrl(rpcOverride)}, blacklisting and retrying with chain default ${redactUrl(chain.rpcUrl)}`);
       blacklistRpc(rpcOverride);
       rpcOverride = undefined;
-      gasPrices = await chain.simulator.getGasPrices(undefined);
+      try {
+        gasPrices = await chain.simulator.getGasPrices(undefined, deadline);
+      } catch (retryErr) {
+        throw degradedFromError(retryErr, "gas price");
+      }
     } else {
-      throw err;
+      throw degradedFromError(err, "gas price");
     }
   }
   const baseFee = gasPrices.baseFee;
@@ -179,28 +212,24 @@ async function handleSendUserOperation(
     balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, rpcOverride);
     console.log(`[RPC] Balance result: spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
   } catch (err) {
-    // If user-provided RPC failed and chain has a different default, blacklist + retry
+    // If user-provided RPC failed and chain has a different default, blacklist + retry.
+    // A balance-query failure is INFRA (transient), not a bad UserOp — return the stable
+    // retryable SERVICE_DEGRADED code, never the business INVALID_USEROPERATION code.
     if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
-      console.warn(`[RPC] User RPC ${rpcOverride} failed, blacklisting and retrying with chain default (${chain.rpcUrl})`);
+      console.warn(`[RPC] User RPC ${redactUrl(rpcOverride)} failed, blacklisting and retrying with chain default (${redactUrl(chain.rpcUrl)})`);
       blacklistRpc(rpcOverride);
       rpcOverride = undefined;
       try {
         balanceCheck = await chain.accountService.checkBalance(safeAddress, estimatedCost, undefined);
         console.log(`[RPC] Balance result (fallback): spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
       } catch (retryErr) {
-        console.error(`[RPC] Balance query also failed on chain default RPC:`, retryErr);
-        throw bundlerError(
-          RPC_ERROR_CODES.INVALID_USEROPERATION,
-          "Failed to query EOA balance — RPC temporarily unavailable",
-        );
+        console.error(`[RPC] Balance query also failed on chain default RPC:`, getClassification(retryErr).reason);
+        throw degradedFromError(retryErr, "balance check");
       }
     } else {
       // No fallback available (dev network or already using chain default)
-      console.error(`[RPC] Balance query failed for ${safeAddress}:`, err);
-      throw bundlerError(
-        RPC_ERROR_CODES.INVALID_USEROPERATION,
-        "Failed to query EOA balance — RPC temporarily unavailable",
-      );
+      console.error(`[RPC] Balance query failed for ${safeAddress}:`, getClassification(err).reason);
+      throw degradedFromError(err, "balance check");
     }
   }
   if (!balanceCheck.sufficient) {
@@ -236,8 +265,9 @@ async function handleSendUserOperation(
   // Margin = walletGasMarkup - 1 (constant, independent of speed tier).
   // Speed tier scales both the user cost and the outer gas price equally.
   const userOpGasPrice = calcUserOpGasPrice(userOp, baseFee);
-  const markupScaled = BigInt(Math.round(config.walletGasMarkup * 100));
-  const derivedOuterPrice = (userOpGasPrice * 100n) / markupScaled;
+  // Reverse the markup to recover the intended network price (single source of truth:
+  // shared/gas/fee-model.ts, consistent bps scale with the quote below).
+  const derivedOuterPrice = reverseMarkup(userOpGasPrice, markupToBps(config.walletGasMarkup));
 
   // Sanity check: derived outer price must not be absurdly below chain rate.
   // Use 5x tolerance — on cheap-gas chains (Gnosis, ~0.001 Gwei) the gas price
@@ -250,9 +280,12 @@ async function handleSendUserOperation(
     );
   }
 
-  // Simulate validation
-  const simResult = await chain.simulator.simulateValidation(userOp, rpcOverride);
+  // Simulate validation. A `transient` result means the simulation could not be
+  // completed (RPC degraded / deadline), NOT that the UserOp is invalid — surface it as
+  // a retryable degraded error so the wallet retries instead of discarding a good op.
+  const simResult = await chain.simulator.simulateValidation(userOp, rpcOverride, deadline);
   if (!simResult.valid) {
+    if (simResult.transient) throw serviceDegraded("validation simulation temporarily unavailable — please retry", { reason: "simulation_degraded" });
     throw bundlerError(
       simResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
       simResult.errorMessage ?? "Simulation failed",
@@ -260,8 +293,9 @@ async function handleSendUserOperation(
   }
 
   // Simulate execution — catch callData reverts before accepting into mempool
-  const execResult = await chain.simulator.simulateExecution(userOp, rpcOverride);
+  const execResult = await chain.simulator.simulateExecution(userOp, rpcOverride, deadline);
   if (!execResult.success) {
+    if (execResult.transient) throw serviceDegraded("execution simulation temporarily unavailable — please retry", { reason: "simulation_degraded" });
     throw bundlerError(
       execResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
       execResult.errorMessage ?? "Execution simulation failed",
@@ -299,7 +333,7 @@ async function handleEstimateUserOperationGas(
   let rpcOverride = isTempoChain(reqCtx.chainId) ? undefined : reqCtx.requestRpcUrl;
 
   if (rpcOverride && isRpcBlacklisted(rpcOverride) && hasFallback(rpcOverride, chain.rpcUrl)) {
-    console.warn(`[RPC] Skipping blacklisted user RPC ${rpcOverride}, using chain default ${chain.rpcUrl}`);
+    console.warn(`[RPC] Skipping blacklisted user RPC ${redactUrl(rpcOverride)}, using chain default ${redactUrl(chain.rpcUrl)}`);
     rpcOverride = undefined;
   }
 
@@ -318,16 +352,21 @@ async function handleEstimateUserOperationGas(
     throw invalidParams("Invalid UserOperation");
   }
 
+  const deadline = createDeadline(REQUEST_DEADLINE_MS);
   let gasEstimate;
   try {
-    gasEstimate = await chain.simulator.estimateUserOpGas(userOp, rpcOverride);
+    gasEstimate = await chain.simulator.estimateUserOpGas(userOp, rpcOverride, deadline);
   } catch (err) {
     if (rpcOverride && hasFallback(rpcOverride, chain.rpcUrl)) {
-      console.warn(`[RPC] estimateGas failed on user RPC ${rpcOverride}, blacklisting and retrying with chain default ${chain.rpcUrl}`);
+      console.warn(`[RPC] estimateGas failed on user RPC ${redactUrl(rpcOverride)}, blacklisting and retrying with chain default ${redactUrl(chain.rpcUrl)}`);
       blacklistRpc(rpcOverride);
-      gasEstimate = await chain.simulator.estimateUserOpGas(userOp, undefined);
+      try {
+        gasEstimate = await chain.simulator.estimateUserOpGas(userOp, undefined, deadline);
+      } catch (retryErr) {
+        throw degradedFromError(retryErr, "gas estimation");
+      }
     } else {
-      throw err;
+      throw degradedFromError(err, "gas estimation");
     }
   }
 
@@ -378,8 +417,9 @@ async function handleGetUserOperationGasPrice(
   const { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice } =
     await chain.simulator.getGasPrices(rpcOverride);
 
-  // walletGasMarkup is a float (e.g. 2.0); scale to bps for integer math.
-  const markupBps = BigInt(Math.round(config.walletGasMarkup * 10000));
+  // walletGasMarkup is a float (e.g. 2.0); scale to bps for integer math (single source
+  // of truth: shared/gas/fee-model.ts — same scale the bundle uses to reverse it).
+  const markupBps = markupToBps(config.walletGasMarkup);
 
   // Speed tiers scale the priority tip only (as a percentage). Faster tier →
   // higher tip → faster inclusion; the relayer markup stays the same.
@@ -390,7 +430,7 @@ async function handleGetUserOperationGasPrice(
     let networkPrice = baseFee + tip;
     if (chainGasPrice > networkPrice) networkPrice = chainGasPrice;
 
-    const userPrice = (networkPrice * markupBps) / 10000n;
+    const userPrice = applyMarkup(networkPrice, markupBps);
     const relayerPrice = userPrice > networkPrice ? userPrice - networkPrice : 0n;
 
     return {
