@@ -27,6 +27,7 @@ import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 import { metrics, logEvent } from "../shared/reliability/log.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
+import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import {
   processRequest,
   jsonResponse,
@@ -353,11 +354,7 @@ export class BundlerDO implements DurableObject {
       );
     }
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
-    };
+    const corsHeaders = CORS_HEADERS;
 
     // Rate limit using CF-Connecting-IP (cannot be spoofed by clients)
     const rateLimitConfig: RateLimitConfig = {

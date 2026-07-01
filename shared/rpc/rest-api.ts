@@ -11,6 +11,7 @@ import type { BundlerConfig } from "../config/types.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 import { redactUrl } from "../reliability/log.ts";
+import { CORS_HEADERS } from "./cors.ts";
 import type { SponsorService } from "../account/sponsor.ts";
 
 /**
@@ -28,11 +29,7 @@ export async function handleRestApi(
 ): Promise<Response | null> {
   if (!url.pathname.startsWith("/v1/")) return null;
 
-  const corsHeaders: Record<string, string> = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url, X-Chain-Id",
-  };
+  const corsHeaders = CORS_HEADERS;
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });

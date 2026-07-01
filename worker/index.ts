@@ -4,15 +4,10 @@
 
 import type { Env } from "./types.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 
 // Re-export BundlerDO for wrangler to discover
 export { BundlerDO } from "./bundler-do.ts";
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
-} as const;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

@@ -16,6 +16,7 @@ import {
 } from "../shared/rpc/errors.ts";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
+import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import {
   processRequest,
   jsonResponse,
@@ -142,12 +143,8 @@ export function startRpcServer(
       );
       if (restResponse) return restResponse;
 
-      // CORS headers
-      const corsHeaders = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, X-Rpc-Url",
-      };
+      // CORS headers (site-wide permissive policy — see shared/rpc/cors.ts)
+      const corsHeaders = CORS_HEADERS;
 
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });
