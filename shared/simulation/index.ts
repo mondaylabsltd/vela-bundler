@@ -91,25 +91,6 @@ export function createSimulator(config: BundlerConfig) {
   }
 
   /**
-   * Build a deduplicated RPC list: user RPC → chain default → capped publicRpcs.
-   * The public fallbacks are capped (MAX_PUBLIC_FALLBACKS) so a fully-degraded chain
-   * can't make one simulation walk a 10+ endpoint list at the per-RPC timeout.
-   */
-  function buildRpcFallbackList(cfg: BundlerConfig, rpcUrlOverride?: string): string[] {
-    const seen = new Set<string>();
-    const list: string[] = [];
-    const add = (url?: string | null) => { if (url && !seen.has(url)) { seen.add(url); list.push(url); } };
-    add(rpcUrlOverride);      // user-provided RPC first
-    add(cfg.rpcUrl);           // chain default (Alchemy or registry)
-    let publicAdded = 0;
-    for (const r of cfg.publicRpcs) {
-      if (publicAdded >= MAX_PUBLIC_FALLBACKS) break;
-      if (!seen.has(r)) { add(r); publicAdded++; }
-    }
-    return list;
-  }
-
-  /**
    * Simulate validation of a single UserOperation.
    *
    * EntryPoint v0.7 removed simulateValidation from the on-chain contract.
@@ -137,7 +118,7 @@ export function createSimulator(config: BundlerConfig) {
     // Build RPC list: user RPC first (if provided), then chain default, then publicRpcs.
     // stateOverride (EntryPointSimulations bytecode injection) is flaky on some providers,
     // so we try multiple RPCs before giving up.
-    const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
+    const rpcsToTry = buildSimulationRpcList(config, rpcUrlOverride);
 
     for (let i = 0; i < rpcsToTry.length; i++) {
       if (dl.expired()) break;
@@ -220,6 +201,19 @@ export function createSimulator(config: BundlerConfig) {
       console.log(`[Simulator] simulateValidation revert: data=${revertData?.slice(0, 20) ?? "none"}... raw=${JSON.stringify(json.error).slice(0, 200)}`);
 
       if (!revertData) {
+        // No decodable revert data. An EntryPoint verdict ALWAYS carries ABI revert
+        // data, so a bare `{error}` here is almost always a provider/transport failure
+        // (dRPC "can't route your request to suitable provider" code 12, unsupported
+        // state override, rate-limit surfaced as a JSON body, pruned/stale state) — not
+        // a validation rejection. Flag transient so the fan-out advances to the next RPC
+        // instead of rejecting a possibly-valid UserOp on one flaky node.
+        if (!isExecutionRevertError(json.error)) {
+          return {
+            valid: false, transient: true,
+            errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+            errorMessage: `Simulation RPC error, no revert data (${json.error?.message ?? "unknown"})`,
+          };
+        }
         return {
           valid: false,
           errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
@@ -265,7 +259,7 @@ export function createSimulator(config: BundlerConfig) {
 
     const ep = config.entryPointAddress;
     const dl = deadline ?? createDeadline(SIMULATION_TOTAL_DEADLINE_MS);
-    const rpcsToTry = buildRpcFallbackList(config, rpcUrlOverride);
+    const rpcsToTry = buildSimulationRpcList(config, rpcUrlOverride);
 
     for (let i = 0; i < rpcsToTry.length; i++) {
       if (dl.expired()) break;
@@ -334,6 +328,16 @@ export function createSimulator(config: BundlerConfig) {
         return parseExecutionResultRevert(revertData);
       }
 
+      // No revert data — same reasoning as simulateValidation: a provider/transport
+      // error (route failure, unsupported override, rate limit) should walk to the next
+      // RPC, not fail the op. Only a genuine execution revert is a definitive verdict.
+      if (!isExecutionRevertError(json.error)) {
+        return {
+          success: false, transient: true,
+          errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
+          errorMessage: `simulateHandleOp RPC error, no revert data (${json.error?.message ?? "unknown"})`,
+        };
+      }
       return {
         success: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
@@ -975,6 +979,88 @@ export function createSimulator(config: BundlerConfig) {
 export type Simulator = ReturnType<typeof createSimulator>;
 
 // --- Helpers ---
+
+/**
+ * True when `url` is a trusted managed RPC (Alchemy). A managed primary is reliable
+ * enough — and supports the state-override `eth_call` that simulation needs — to be
+ * used on its own, so we skip the flaky public registry fallbacks behind it.
+ */
+export function isManagedRpcUrl(url?: string | null): boolean {
+  if (!url) return false;
+  try {
+    return new URL(url).hostname.endsWith(".g.alchemy.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the ordered RPC list a simulation call walks.
+ *
+ * Policy (per operator directive — "prefer Alchemy unless the client passes its own"):
+ *   1. A client-supplied X-Rpc-Url wins — it is explicitly choosing its own node.
+ *   2. The chain default (Alchemy when configured & supported) comes next.
+ *   3. The registry's public RPCs are appended ONLY when NO managed primary is in front.
+ *
+ * Why (3) is gated: public Gnosis endpoints such as `gnosis.drpc.org` cannot route the
+ * state-override `eth_call` and reply `{"code":12,"message":"Can't route your request to
+ * suitable provider"}`. Walking onto them turned a healthy UserOp into a false rejection.
+ * With Alchemy (which we verified serves the override) in front, those endpoints are
+ * skipped entirely; chains WITHOUT Alchemy still get the capped public fallback for
+ * resilience.
+ */
+export function buildSimulationRpcList(cfg: BundlerConfig, rpcUrlOverride?: string): string[] {
+  const seen = new Set<string>();
+  const list: string[] = [];
+  const add = (url?: string | null) => { if (url && !seen.has(url)) { seen.add(url); list.push(url); } };
+
+  add(rpcUrlOverride);       // 1. client's custom RPC wins, if provided
+  add(cfg.rpcUrl);           // 2. chain default — Alchemy when configured & supported
+
+  // 3. Append capped public fallbacks ONLY when the primary is not a managed/trusted node.
+  const primaryIsManaged = isManagedRpcUrl(rpcUrlOverride) || isManagedRpcUrl(cfg.rpcUrl);
+  if (!primaryIsManaged) {
+    let publicAdded = 0;
+    for (const r of cfg.publicRpcs) {
+      if (publicAdded >= MAX_PUBLIC_FALLBACKS) break;
+      if (!seen.has(r)) { add(r); publicAdded++; }
+    }
+  }
+  return list;
+}
+
+/**
+ * Decide whether a JSON-RPC `error` that carried NO decodable revert data represents a
+ * genuine on-chain execution revert (a definitive EntryPoint verdict) versus a
+ * provider/transport-level failure that should be retried on another node.
+ *
+ * EntryPoint verdicts always come back as ABI-encoded revert data
+ * (ValidationResult / FailedOp / FailedOpWithRevert), so a no-data error is almost never
+ * a real verdict. But some nodes surface the revert reason ONLY as plain text (no hex),
+ * so we still confirm via the standard "execution reverted" signals before treating it
+ * as definitive — otherwise a legitimate AAxx rejection could be mistaken for a blip.
+ *
+ * Returns true  → genuine execution revert (definitive; do NOT try another RPC).
+ * Returns false → provider/transport failure (advance to the next RPC). This covers
+ *   dRPC "Can't route your request to suitable provider" (code 12), capacity/rate-limit
+ *   errors returned in a 200 body, unsupported method/state-override, and pruned state.
+ */
+export function isExecutionRevertError(error?: { code?: number; message?: string } | null): boolean {
+  if (!error) return false;
+  // EIP-1474 standard "execution reverted" code — authoritative.
+  if (error.code === 3) return true;
+  const msg = (error.message ?? "").toLowerCase();
+  if (!msg) return false;
+  // Provider/transport signatures win over the revert heuristic below: these all mean
+  // "this node can't serve the request", not "the UserOp is invalid".
+  if (/can'?t route|cannot route|suitable provider|no (backend|provider|suitable)|capacity|rate.?limit|too many requests|try again|timeout|timed out|method [^ ]* ?(not found|not supported|not available|unsupported)|not supported|unsupported|missing trie node|header not found|resource not found|state[^.]*(unavailable|pruned)|overloaded|temporarily|unavailable/.test(msg)) {
+    return false;
+  }
+  // Genuine execution revert surfaced as text (some nodes omit the hex data).
+  if (/execution reverted|reverted|out of gas|\baa\d{2}\b/.test(msg)) return true;
+  // Unknown no-data error → treat as provider-level so the fan-out can recover.
+  return false;
+}
 
 function extractRevertData(err: unknown): `0x${string}` | null {
   if (!err || typeof err !== "object") return null;

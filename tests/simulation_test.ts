@@ -16,6 +16,8 @@ import {
 } from "viem";
 import { ENTRYPOINT_V07_ABI, RPC_ERROR_CODES } from "../shared/contracts/entrypoint.ts";
 import { parseValidationData, isValidTimeRange } from "../shared/userop/validate.ts";
+import { isExecutionRevertError, isManagedRpcUrl, buildSimulationRpcList } from "../shared/simulation/index.ts";
+import type { BundlerConfig } from "../shared/config/types.ts";
 
 // ---- Helpers: build encoded data for simulation result parsing ----
 
@@ -290,6 +292,93 @@ Deno.test("simulateHandleOp ABI - outputs include targetSuccess field", () => {
   assert(fieldNames.includes("targetSuccess"), "outputs must include targetSuccess");
   assert(fieldNames.includes("targetResult"), "outputs must include targetResult");
   assert(fieldNames.includes("paid"), "outputs must include paid");
+});
+
+// ---- isExecutionRevertError: provider/transport vs. genuine revert ----
+
+Deno.test("isExecutionRevertError - dRPC 'can't route' (code 12) is transient, not a revert", () => {
+  // The exact Gnosis production failure: dRPC couldn't route the state-override eth_call.
+  assert(!isExecutionRevertError({
+    code: 12,
+    message: "Can't route your request to suitable provider, if you specified certain providers revise the list",
+  }));
+});
+
+Deno.test("isExecutionRevertError - rate limit / capacity errors are transient", () => {
+  assert(!isExecutionRevertError({ code: -32005, message: "rate limit exceeded" }));
+  assert(!isExecutionRevertError({ code: -32000, message: "exceeded capacity, try again" }));
+  assert(!isExecutionRevertError({ message: "429 Too Many Requests" }));
+});
+
+Deno.test("isExecutionRevertError - unsupported method / state override is transient", () => {
+  assert(!isExecutionRevertError({ code: -32601, message: "the method eth_call is not supported" }));
+  assert(!isExecutionRevertError({ message: "missing trie node" }));
+  assert(!isExecutionRevertError({ message: "header not found" }));
+});
+
+Deno.test("isExecutionRevertError - genuine execution revert IS definitive", () => {
+  assert(isExecutionRevertError({ code: 3, message: "execution reverted" }));
+  assert(isExecutionRevertError({ message: "execution reverted: AA24 signature error" }));
+  assert(isExecutionRevertError({ message: "err: intrinsic gas too low; out of gas" }));
+});
+
+Deno.test("isExecutionRevertError - empty / unknown no-data error defaults to transient", () => {
+  assert(!isExecutionRevertError(undefined));
+  assert(!isExecutionRevertError(null));
+  assert(!isExecutionRevertError({ message: "" }));
+  assert(!isExecutionRevertError({ code: 99, message: "something weird happened" }));
+});
+
+// ---- RPC selection policy: prefer Alchemy, custom-override wins, no dRPC fallthrough ----
+
+const ALCHEMY_GNOSIS = "https://gnosis-mainnet.g.alchemy.com/v2/testkey";
+const PUBLICNODE = "https://gnosis-rpc.publicnode.com";
+const GNOSIS_PUBLIC = [
+  PUBLICNODE,
+  "https://gnosis.drpc.org",
+  "https://gnosis.oat.farm",
+  "https://rpc.gnosischain.com",
+];
+
+/** Minimal config for buildSimulationRpcList (reads only rpcUrl + publicRpcs). */
+function cfg(rpcUrl: string, publicRpcs: string[]): BundlerConfig {
+  return { rpcUrl, publicRpcs } as unknown as BundlerConfig;
+}
+
+Deno.test("isManagedRpcUrl - detects Alchemy, rejects public/dRPC", () => {
+  assert(isManagedRpcUrl(ALCHEMY_GNOSIS));
+  assert(isManagedRpcUrl("https://eth-mainnet.g.alchemy.com/v2/x"));
+  assert(!isManagedRpcUrl("https://gnosis.drpc.org"));
+  assert(!isManagedRpcUrl("https://rpc.gnosischain.com"));
+  assert(!isManagedRpcUrl(undefined));
+  assert(!isManagedRpcUrl("not a url"));
+});
+
+Deno.test("buildSimulationRpcList - Alchemy primary → NO public fallthrough (dRPC excluded)", () => {
+  const list = buildSimulationRpcList(cfg(ALCHEMY_GNOSIS, GNOSIS_PUBLIC));
+  assertEquals(list, [ALCHEMY_GNOSIS]);
+  assert(!list.some((u) => u.includes("drpc.org")), "dRPC must never be in the Alchemy list");
+});
+
+Deno.test("buildSimulationRpcList - client X-Rpc-Url wins, Alchemy backs it, still no public", () => {
+  const custom = "https://my-own-node.example/rpc";
+  const list = buildSimulationRpcList(cfg(ALCHEMY_GNOSIS, GNOSIS_PUBLIC), custom);
+  assertEquals(list, [custom, ALCHEMY_GNOSIS]);
+  assert(!list.some((u) => u.includes("drpc.org")));
+});
+
+Deno.test("buildSimulationRpcList - no Alchemy (public primary) → keeps capped public fallback", () => {
+  // Chain with no Alchemy support: primary is a public node, fallbacks retained for resilience.
+  const list = buildSimulationRpcList(cfg(PUBLICNODE, GNOSIS_PUBLIC));
+  assertEquals(list[0], PUBLICNODE);
+  assert(list.length > 1, "public-only chains still get fallbacks");
+  assert(list.length <= 1 + 2, "public fallbacks are capped at MAX_PUBLIC_FALLBACKS");
+});
+
+Deno.test("buildSimulationRpcList - custom Alchemy override also suppresses public fallthrough", () => {
+  const customAlchemy = "https://gnosis-mainnet.g.alchemy.com/v2/otherkey";
+  const list = buildSimulationRpcList(cfg(PUBLICNODE, GNOSIS_PUBLIC), customAlchemy);
+  assertEquals(list, [customAlchemy, PUBLICNODE]);
 });
 
 // ---- RPC error codes ----

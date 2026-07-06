@@ -338,24 +338,37 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "No valid ops after binding check" };
     }
 
-    // Re-validate all ops in parallel: validation + execution simulation
+    // Re-validate all ops in parallel: validation + execution simulation.
+    // A `transient` result means the RPC could not complete the simulation (degraded /
+    // unreachable node — e.g. an Alchemy blip with no public fallback), NOT that the op is
+    // invalid. Distinguish it from a definitive rejection so we DEFER (keep in mempool,
+    // retry next cycle) instead of dropping + penalizing a valid op the client already holds
+    // a hash for. Mirrors the ingress path in handlers.ts, which surfaces transient as a
+    // retryable degraded error rather than a rejection.
     type CheckedEntry = { entry: MempoolEntry; accountValidationData: bigint; paymasterValidationData: bigint };
+    type Revalidated =
+      | { kind: "ok"; checked: CheckedEntry }
+      | { kind: "drop"; reason: string }
+      | { kind: "defer"; reason: string };
     const simResults = await Promise.allSettled(
-      validEntries.map(async (entry): Promise<CheckedEntry | null> => {
+      validEntries.map(async (entry): Promise<Revalidated> => {
         const simResult = await this.simulator.simulateValidation(entry.userOp, rpcOverride, dl);
         if (!simResult.valid) {
-          console.warn(`[Bundler] UserOp ${entry.userOpHash} failed re-validation: ${simResult.errorMessage}`);
-          return null;
+          const reason = simResult.errorMessage ?? "re-validation failed";
+          return simResult.transient ? { kind: "defer", reason } : { kind: "drop", reason };
         }
         const execResult = await this.simulator.simulateExecution(entry.userOp, rpcOverride, dl);
         if (!execResult.success) {
-          console.warn(`[Bundler] UserOp ${entry.userOpHash} failed execution simulation: ${execResult.errorMessage}`);
-          return null;
+          const reason = execResult.errorMessage ?? "execution simulation failed";
+          return execResult.transient ? { kind: "defer", reason } : { kind: "drop", reason };
         }
         return {
-          entry,
-          accountValidationData: simResult.validationResult?.accountValidationData ?? 0n,
-          paymasterValidationData: simResult.validationResult?.paymasterValidationData ?? 0n,
+          kind: "ok",
+          checked: {
+            entry,
+            accountValidationData: simResult.validationResult?.accountValidationData ?? 0n,
+            paymasterValidationData: simResult.validationResult?.paymasterValidationData ?? 0n,
+          },
         };
       }),
     );
@@ -363,13 +376,24 @@ export class BundlerService {
     const checkedEntries: CheckedEntry[] = [];
     for (let i = 0; i < simResults.length; i++) {
       const result = simResults[i]!;
-      if (result.status === "fulfilled" && result.value) {
-        checkedEntries.push(result.value);
-      } else {
-        // Failed validation or execution — remove from mempool
-        const failed = validEntries[i]!;
+      const failed = validEntries[i]!;
+      if (result.status === "rejected") {
+        // simulate* catch internally, so a throw here is unexpected — defer (keep the op)
+        // rather than penalize on an error we don't understand.
+        console.warn(`[Bundler] UserOp ${failed.userOpHash} re-validation threw, deferring: ${result.reason}`);
+        continue;
+      }
+      const outcome = result.value;
+      if (outcome.kind === "ok") {
+        checkedEntries.push(outcome.checked);
+      } else if (outcome.kind === "drop") {
+        // Definitive rejection — remove from mempool + penalize sender.
+        console.warn(`[Bundler] UserOp ${failed.userOpHash} dropped in re-validation: ${outcome.reason}`);
         this.mempool.remove(failed.userOpHash);
         this.mempool.reputation.penalize(failed.userOp.sender, "sender");
+      } else {
+        // Transient RPC failure — keep in mempool for the next cycle, no penalty.
+        console.warn(`[Bundler] UserOp ${failed.userOpHash} deferred (transient RPC): ${outcome.reason}`);
       }
     }
 
