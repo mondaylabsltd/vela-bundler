@@ -232,6 +232,8 @@ export async function submitTempoBundle(params: {
   packedOps: PackedUserOperation[];
   beneficiary: `0x${string}`;
   feeToken: `0x${string}`;
+  /** Base fee (attodollars/gas) — pins the outer 0x76 price; omit only in tests. */
+  baseFee?: bigint;
 }): Promise<`0x${string}`> {
   const chain = TEMPO_CHAINS[params.chainId];
   if (!chain) throw new Error(`Not a Tempo chain: ${params.chainId}`);
@@ -247,12 +249,23 @@ export async function submitTempoBundle(params: {
   // under-provisions (handleOps swallows inner OOG), starving the execution phase and
   // reverting the UserOp on-chain while the 0x76 still "succeeds".
   const gas = tempoHandleOpsGasLimit(params.packedOps);
+  // Pin the outer 0x76 price too. Left to viem, sendTransactionSync defaults maxFeePerGas to
+  // 2×baseFee + tip (~2.4× base) — an EIP-1559 volatility buffer that is WRONG for Tempo, whose
+  // base fee is a fixed protocol constant. On a DEPLOY the outer gas limit is ~8.3M, so 2.4× base
+  // makes the 0x76's pre-fund check demand ~0.40 pathUSD while the gas account only floats
+  // TEMPO_SPONSOR_TARGET (0.3) → "total cost exceeds balance" → the tx never broadcasts and the op
+  // is dropped (nonce never advances). A tight buffer over the stable base fee both fixes that and
+  // stops the gas account over-locking float it never spends (real cost = gasUsed × base fee).
+  const base = params.baseFee && params.baseFee > 0n ? params.baseFee : TEMPO_BASE_FEE_ATTO;
+  const outerMaxFeePerGas = (base * 3n) / 2n; // base × 1.5 — 50% head-room on a stable base fee
   try {
     const receipt = await client.sendTransactionSync({
       to: params.entryPoint,
       data: calldata,
       feeToken: params.feeToken,
       gas,
+      maxFeePerGas: outerMaxFeePerGas,
+      maxPriorityFeePerGas: 0n,
     });
     return receipt.transactionHash;
   } catch (err) {

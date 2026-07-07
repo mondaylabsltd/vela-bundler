@@ -590,6 +590,7 @@ export class BundlerService {
             packedOps,
             beneficiary,
             feeToken: resolveFeeToken(checkedEntries[0]!.entry.userOp.feeToken),
+            baseFee, // pin the outer 0x76 price to ~base fee (not viem's 2.4× default)
           })
         : await walletClient.sendTransaction({
             to: this.config.entryPointAddress,
