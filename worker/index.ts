@@ -4,6 +4,12 @@
 
 import type { Env } from "./types.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import {
+  computeSplitterAddress,
+  SPLITTER_CREATION_CODE_HASH,
+  SPLITTER_FACTORY,
+  SPLITTER_SALT,
+} from "../shared/contracts/splitter.ts";
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 
 // Re-export BundlerDO for wrangler to discover
@@ -56,6 +62,19 @@ export default {
       if (url.pathname === "/v1/treasury" && request.method === "GET") {
         const addr = await deriveTreasuryAddress(env.OPERATOR_SECRET);
         return Response.json({ address: addr }, { headers: CORS_HEADERS });
+      }
+
+      // /v1/splitter — the VelaGasSettlementSplitter address + its derivation inputs, so the
+      // wallet can compute the identical address locally and cross-check its embedded copy.
+      if (url.pathname === "/v1/splitter" && request.method === "GET") {
+        const treasury = await deriveTreasuryAddress(env.OPERATOR_SECRET);
+        return Response.json({
+          address: computeSplitterAddress(treasury),
+          treasury,
+          factory: SPLITTER_FACTORY,
+          salt: SPLITTER_SALT,
+          creationCodeHash: SPLITTER_CREATION_CODE_HASH,
+        }, { headers: CORS_HEADERS });
       }
     }
 

@@ -3,7 +3,9 @@
  *
  * In private mode, each bundle contains ops from ONE safeAddress only,
  * signed by the dedicated bundler EOA derived for that safeAddress.
- * The beneficiary is the dedicated EOA itself.
+ * On native chains the handleOps beneficiary is the VelaGasSettlementSplitter
+ * (splits the gas settlement 50/50 between the EOA and the treasury); on Tempo
+ * it stays the EOA (repaid in-band by a feeToken transfer).
  */
 
 import {
@@ -19,7 +21,6 @@ import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { metrics } from "../reliability/log.ts";
 import { createDeadline } from "../reliability/retry.ts";
-import { executeSweep } from "./sweep.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import type { Simulator } from "../simulation/index.ts";
 import { Mempool } from "../mempool/index.ts";
@@ -65,11 +66,6 @@ const PENDING_RECEIPT_MAX_CHECKS = 360;
 /** Per-sender bundle-prep budget: bounds one sender's RPC reads + simulations so a slow
  *  sender can't starve the others (or the alarm) within a cycle. */
 const PER_SENDER_BUNDLE_DEADLINE_MS = 20_000;
-
-/** Treasury sweep toggle. When on, after a confirmed bundle the relayer's surplus
- *  is skimmed back to the treasury, but only every `sweepInterval` txs and only the
- *  portion above a per-tx float floor (see bundler/sweep.ts). Set false to disable. */
-const SWEEP_ENABLED = true;
 
 /**
  * Lean projection of a submitted op, kept for receipt reconciliation. Only the fields
@@ -401,12 +397,18 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "All ops failed re-validation" };
     }
 
-    // Beneficiary = the dedicated bundler EOA itself
-    const beneficiary = eoa.address;
+    // Beneficiary: on native chains the EntryPoint pays the VelaGasSettlementSplitter, whose
+    // receive() splits the gas settlement 50/50 between the bundler EOA (tx.origin) and the
+    // treasury. On Tempo the EntryPoint refund is 0 (maxFee=0) and the bundler is repaid by an
+    // in-band feeToken transfer to the EOA, so the beneficiary MUST stay the EOA there.
+    const tempo = isTempoChain(this.config.chainId);
+    const beneficiary = tempo ? eoa.address : this.config.splitterAddress;
 
-    // Full bundle simulation
+    // Full bundle simulation. The outer handleOps tx is sent BY the EOA (eoa.address is
+    // tx.origin), so simulation's `from` stays the EOA even when the encoded beneficiary is
+    // the splitter — otherwise tx.origin would resolve to the splitter and mis-simulate.
     const packedOps = checkedEntries.map((e) => e.entry.packed);
-    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, rpcOverride, dl);
+    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, eoa.address, rpcOverride, dl);
 
     if (!bundleSim.success) {
       // Remove failed op if identified
@@ -423,8 +425,6 @@ export class BundlerService {
         error: `Bundle simulation failed: ${bundleSim.errorMessage}`,
       };
     }
-
-    const tempo = isTempoChain(this.config.chainId);
 
     // expectedCost is the native outer-tx cost (used for native balance reserve).
     // On Tempo it's meaningless (no native coin) and unused.
@@ -447,7 +447,7 @@ export class BundlerService {
       // Verify execution actually succeeds AND read the REAL gas it burns. handleOps
       // swallows inner reverts, so this also protects against an OOG/insufficient-balance
       // op that would leave us unpaid. Fails closed — no proof of success ⇒ no submit.
-      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, rpcOverride, dl);
+      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
       if (!execCheck.success) {
         if (execCheck.failedOpIndex !== undefined) {
           const failed = checkedEntries[execCheck.failedOpIndex];
@@ -627,7 +627,7 @@ export class BundlerService {
           })),
           eoaAddress: eoa.address,
           reservedAmount: expectedCost,
-          // Reconcile (receipt poll + sweep) via the trusted submit RPC, NOT the user RPC.
+          // Reconcile (receipt poll) via the trusted submit RPC, NOT the user RPC.
           rpcOverride: undefined,
           submittedAt: Date.now(),
           checkCount: 0,
@@ -866,29 +866,6 @@ export class BundlerService {
           expiresAt: Date.now() + RECEIPT_TTL_MS,
         });
       }
-      // Post-bundle sweep: skim the relayer's surplus back to treasury (only every
-      // `sweepInterval` txs, only above the float floor — see executeSweep).
-      // Runs after receipt is confirmed, inside the finally block would be too late
-      // (reservation is released there). Non-fatal — errors are logged and ignored.
-      if (SWEEP_ENABLED && receipt && receipt.status === "success" && this.config.treasuryAddress) {
-        try {
-          const eoaDerived = await this.accountService.deriveEOA(
-            entries[0]!.userOp.sender as `0x${string}`,
-          );
-          if (eoaDerived.privateKey) {
-            const sweepRpc = rpcOverride ?? this.config.rpcUrl;
-            await executeSweep({
-              eoaAddress,
-              eoaPrivateKey: eoaDerived.privateKey,
-              treasuryAddress: this.config.treasuryAddress,
-              rpcUrl: sweepRpc,
-              config: this.config,
-            });
-          }
-        } catch (err) {
-          console.warn(`[Bundler] Post-bundle sweep failed for ${eoaAddress}:`, err);
-        }
-      }
     } finally {
       // Always release reservation after confirmation/failure
       this.accountService.releaseBalance(eoaAddress, reservedAmount);
@@ -918,26 +895,6 @@ export class BundlerService {
         if (receipt) {
           // Receipt found — process it synchronously
           this.storeReceiptLogs(receipt, pending.entries);
-
-          // Post-bundle sweep
-          if (SWEEP_ENABLED && receipt.status === "success" && this.config.treasuryAddress) {
-            try {
-              const eoaDerived = await this.accountService.deriveEOA(
-                pending.entries[0]!.userOp.sender as `0x${string}`,
-              );
-              if (eoaDerived.privateKey) {
-                await executeSweep({
-                  eoaAddress: pending.eoaAddress,
-                  eoaPrivateKey: eoaDerived.privateKey,
-                  treasuryAddress: this.config.treasuryAddress,
-                  rpcUrl: pending.rpcOverride ?? this.config.rpcUrl,
-                  config: this.config,
-                });
-              }
-            } catch (err) {
-              console.warn(`[Bundler] Post-bundle sweep failed for ${pending.eoaAddress}:`, err);
-            }
-          }
 
           // Release reservation and recover EOA
           this.accountService.releaseBalance(pending.eoaAddress, pending.reservedAmount);

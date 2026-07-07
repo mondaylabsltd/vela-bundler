@@ -8,7 +8,7 @@ export interface Env {
 
   /** 32+ byte hex secret for deterministic key derivation. */
   OPERATOR_SECRET: string;
-  /** Comma-separated old secrets for sweeping rotated EOAs. */
+  /** Comma-separated old secrets for draining rotated EOAs. */
   OLD_OPERATOR_SECRETS?: string;
   /** Alchemy API key — preferred RPCs for supported chains. */
   ALCHEMY_API_KEY?: string;
@@ -28,5 +28,4 @@ export interface Env {
   AUTO_BUNDLE_INTERVAL_MS?: string;
   API_RATE_LIMIT_PER_MINUTE?: string;
   BALANCE_RESERVE_MULTIPLIER?: string;
-  SWEEP_INTERVAL?: string;
 }

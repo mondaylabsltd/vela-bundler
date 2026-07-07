@@ -39,7 +39,7 @@ function mockConfig(): BundlerConfig {
     operatorSecret: "0x" + "ab".repeat(32),
     oldOperatorSecrets: [],
     treasuryAddress: TREASURY,
-    sweepInterval: 30,
+    splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226" as `0x${string}`,
     apiRateLimitPerMinute: 60,
     balanceReserveMultiplier: 1,
     alchemyApiKey: null,
@@ -90,6 +90,19 @@ Deno.test("handleRestApi - GET /v1/treasury returns treasury address", async () 
   assertEquals(result!.status, 200);
   const body = await result!.json();
   assertEquals(body.address, TREASURY);
+});
+
+Deno.test("handleRestApi - GET /v1/splitter returns address + derivation inputs", async () => {
+  const req = new Request("http://localhost/v1/splitter", { method: "GET" });
+  const url = new URL(req.url);
+  const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
+  assert(result !== null);
+  assertEquals(result!.status, 200);
+  const body = await result!.json();
+  assertEquals(body.address, "0x3979be163bFb74Dce66F8E0839577807C2197226");
+  assertEquals(body.treasury, TREASURY);
+  assertEquals(body.factory, "0x4e59b44847b379578588920cA78FbF26c0B4956C");
+  assertEquals(body.salt, "0x650cb20978a0e7efdcf6f077240c609a59f2f02401ed16fb4a222a2b51cb9720");
 });
 
 Deno.test("handleRestApi - returns 404 for unknown v1 path", async () => {

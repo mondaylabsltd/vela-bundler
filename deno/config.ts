@@ -5,6 +5,7 @@
  */
 
 import type { BundlerConfig } from "../shared/config/types.ts";
+import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
 
 function env(key: string, defaultValue?: string): string {
   const value = Deno.env.get(key) ?? defaultValue;
@@ -72,7 +73,7 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
     operatorSecret,
     oldOperatorSecrets: envCsv("OLD_OPERATOR_SECRETS"),
     treasuryAddress,
-    sweepInterval: parseInt(env("SWEEP_INTERVAL", "20")),
+    splitterAddress: computeSplitterAddress(treasuryAddress),
     apiRateLimitPerMinute: parseInt(env("API_RATE_LIMIT_PER_MINUTE", "60")),
     balanceReserveMultiplier: parseFloat(env("BALANCE_RESERVE_MULTIPLIER", "1")),
     alchemyApiKey: envOptional("ALCHEMY_API_KEY") ?? null,

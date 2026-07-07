@@ -22,7 +22,7 @@ function mockConfig(): BundlerConfig {
     minProfitMarginBps: 1000, maxProfitMarginBps: 15000, walletGasMarkup: 1.5,
     useEip1559: true, baseFeeMultiplier: 1.25, bundlerTipGwei: 0.5, autoBundleIntervalMs: 10000,
     operatorSecret: "0x" + "ab".repeat(32), oldOperatorSecrets: [],
-    treasuryAddress: "0x" + "cc".repeat(20) as `0x${string}`, sweepInterval: 30,
+    treasuryAddress: "0x" + "cc".repeat(20) as `0x${string}`, splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226" as `0x${string}`,
     apiRateLimitPerMinute: 60, balanceReserveMultiplier: 1, alchemyApiKey: null,
   } as BundlerConfig;
 }

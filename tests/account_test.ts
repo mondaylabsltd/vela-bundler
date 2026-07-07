@@ -2,8 +2,10 @@
  * Tests for account service, EOA lock manager, and binding rules.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { assertEquals, assert, assertNotEquals } from "@std/assert";
 import { EOALockManager } from "../shared/account/eoa-lock.ts";
+import { isTempoChain } from "../shared/tempo.ts";
+import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
 
 const EOA_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const EOA_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
@@ -160,10 +162,20 @@ Deno.test("Bundle only contains ops from the bound safeAddress", () => {
   assertEquals(validOps.length, 2);
 });
 
-Deno.test("handleOps beneficiary must equal dedicated bundler EOA", () => {
-  const eoaAddress = "0xcccccccccccccccccccccccccccccccccccccccc";
-  const beneficiary = eoaAddress; // Must be the same
-  assertEquals(beneficiary, eoaAddress);
+Deno.test("handleOps beneficiary: splitter on native chains, EOA on Tempo", () => {
+  const eoaAddress = "0xcccccccccccccccccccccccccccccccccccccccc" as `0x${string}`;
+  const treasury = "0x1111111111111111111111111111111111111111" as `0x${string}`;
+  const splitter = computeSplitterAddress(treasury);
+
+  // The exact rule from shared/bundler/index.ts: `tempo ? eoa.address : splitterAddress`.
+  const beneficiaryFor = (chainId: number) => (isTempoChain(chainId) ? eoaAddress : splitter);
+
+  // Native chain (mainnet=1): the EntryPoint pays the splitter, NOT the EOA.
+  assertEquals(beneficiaryFor(1), splitter);
+  assertNotEquals(beneficiaryFor(1), eoaAddress);
+
+  // Tempo (4217): repaid in-band to the EOA, so the beneficiary stays the EOA.
+  assertEquals(beneficiaryFor(4217), eoaAddress);
 });
 
 // --- Restart recovery logic ---

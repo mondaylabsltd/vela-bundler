@@ -49,7 +49,7 @@ shared/              Platform-agnostic logic (used by both runtimes)
 ├── gas/             preVerificationGas, profitability model
 ├── simulation/      simulateValidation + bundle simulation
 ├── mempool/         In-memory mempool with reputation tracking
-├── bundler/         Bundle building, submission, treasury sweep
+├── bundler/         Bundle building, submission, receipt reconciliation
 ├── chain/           Per-chain service registry (lazy init + health loop)
 ├── rpc/             JSON-RPC handlers + REST API + request processing
 └── utils/           Hex utilities, RPC client factory
@@ -160,7 +160,7 @@ On CF Workers, global `/health` returns minimal info. Per-chain health available
 
 1. Generate new `OPERATOR_SECRET`
 2. Put old one in `OLD_OPERATOR_SECRETS` (comma-separated)
-3. New secret → new EOAs; old secret → old EOAs still derivable for sweep
+3. New secret → new EOAs; old secret → old EOAs still derivable for draining
 4. Remove old secret once old EOAs are drained
 
 ## Configuration
@@ -177,8 +177,7 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 | `MAX_BUNDLE_SIZE` | `10` | Max UserOps per bundle |
 | `MAX_BUNDLE_GAS` | `5000000` | Max gas per bundle |
 | `AUTO_BUNDLE_INTERVAL_MS` | `10000` | Auto-bundling interval (ms) |
-| `SWEEP_INTERVAL` | `30` | Sweep every N bundles per EOA |
-| `OLD_OPERATOR_SECRETS` | — | Old secrets for sweep (comma-separated) |
+| `OLD_OPERATOR_SECRETS` | — | Old secrets for draining rotated EOAs (comma-separated) |
 | `ALCHEMY_API_KEY` | — | Alchemy API key for preferred RPCs |
 | `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
 | `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |

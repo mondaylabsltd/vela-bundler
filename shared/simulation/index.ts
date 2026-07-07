@@ -619,10 +619,15 @@ export function createSimulator(config: BundlerConfig) {
   async function simulateBundle(
     packedOps: PackedUserOperation[],
     beneficiary: `0x${string}`,
+    from?: `0x${string}`,
     rpcUrlOverride?: string,
     _deadline?: Deadline,
   ): Promise<BundleSimulationResult> {
     const client = clientFor(rpcUrlOverride);
+    // `beneficiary` is only the encoded handleOps arg; `from` is the actual outer-tx sender
+    // (the bundler EOA / tx.origin). They differ once the beneficiary is the splitter — the
+    // splitter distributes to tx.origin, so simulating with from=splitter would self-reference.
+    const caller = from ?? beneficiary;
     const calldata = encodeHandleOps(packedOps, beneficiary);
 
     // Step 1: eth_estimateGas for gas estimation
@@ -631,7 +636,7 @@ export function createSimulator(config: BundlerConfig) {
       estimatedGas = await client.estimateGas({
         to: config.entryPointAddress,
         data: calldata,
-        account: beneficiary,
+        account: caller,
       });
     } catch (err: unknown) {
       const revertData = extractRevertData(err);
@@ -668,7 +673,7 @@ export function createSimulator(config: BundlerConfig) {
           jsonrpc: "2.0", id: 1,
           method: "eth_call",
           params: [
-            { to: config.entryPointAddress, data: calldata, from: beneficiary },
+            { to: config.entryPointAddress, data: calldata, from: caller },
             "latest",
           ],
         },
@@ -889,9 +894,12 @@ export function createSimulator(config: BundlerConfig) {
   async function simulateExecutionSuccess(
     packedOps: PackedUserOperation[],
     beneficiary: `0x${string}`,
+    from?: `0x${string}`,
     rpcUrlOverride?: string,
     deadline?: Deadline,
   ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint }> {
+    // See simulateBundle: `from` is the real tx sender (EOA); differs from a splitter beneficiary.
+    const caller = from ?? beneficiary;
     const calldata = encodeHandleOps(packedOps, beneficiary);
     const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
     type SimV1 = {
@@ -909,7 +917,7 @@ export function createSimulator(config: BundlerConfig) {
           params: [
             {
               blockStateCalls: [
-                { calls: [{ from: beneficiary, to: config.entryPointAddress, data: calldata }] },
+                { calls: [{ from: caller, to: config.entryPointAddress, data: calldata }] },
               ],
               validation: false,
               traceTransfers: false,

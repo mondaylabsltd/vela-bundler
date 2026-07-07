@@ -38,7 +38,7 @@ const mockConfig = {
   operatorSecret: "0x" + "ab".repeat(32),
   oldOperatorSecrets: [] as string[],
   treasuryAddress: "0x" + "00".repeat(20) as `0x${string}`,
-  sweepInterval: 30,
+  splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226" as `0x${string}`,
   apiRateLimitPerMinute: 60,
   balanceReserveMultiplier: 1,
   alchemyApiKey: null,

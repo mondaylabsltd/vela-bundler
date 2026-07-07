@@ -8,6 +8,7 @@
 
 import type { ChainRegistryLike } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/types.ts";
+import { SPLITTER_CREATION_CODE_HASH, SPLITTER_FACTORY, SPLITTER_SALT } from "../contracts/splitter.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
 import { redactUrl } from "../reliability/log.ts";
@@ -56,6 +57,18 @@ export async function handleRestApi(
   // GET /v1/treasury — return the treasury address (same on all chains)
   if (url.pathname === "/v1/treasury" && req.method === "GET") {
     return jsonResponse({ address: config.treasuryAddress }, 200, corsHeaders);
+  }
+
+  // GET /v1/splitter — VelaGasSettlementSplitter address + derivation inputs (same on all chains).
+  // Lets the wallet compute the identical address locally and cross-check its embedded constants.
+  if (url.pathname === "/v1/splitter" && req.method === "GET") {
+    return jsonResponse({
+      address: config.splitterAddress,
+      treasury: config.treasuryAddress,
+      factory: SPLITTER_FACTORY,
+      salt: SPLITTER_SALT,
+      creationCodeHash: SPLITTER_CREATION_CODE_HASH,
+    }, 200, corsHeaders);
   }
 
   // POST /v1/sponsor/:chainId/:safeAddress

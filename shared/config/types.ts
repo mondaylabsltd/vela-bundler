@@ -51,9 +51,10 @@ export interface BundlerConfig {
   readonly operatorSecret: string;
   readonly oldOperatorSecrets: string[];
   readonly treasuryAddress: `0x${string}`;
-  /** Sweep cadence: every Nth relayer tx, skim surplus back to the treasury.
-   *  Gated on `relayerNonce % sweepInterval == 0`. Set 0 to disable the gate. */
-  readonly sweepInterval: number;
+  /** VelaGasSettlementSplitter address — the handleOps beneficiary on native chains.
+   *  Derived (CREATE2) from treasuryAddress; identical on every chain. See
+   *  shared/contracts/splitter.ts. */
+  readonly splitterAddress: `0x${string}`;
   readonly apiRateLimitPerMinute: number;
   readonly balanceReserveMultiplier: number;
 
