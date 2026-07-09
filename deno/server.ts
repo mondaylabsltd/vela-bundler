@@ -20,7 +20,6 @@ import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import {
   processRequest,
   jsonResponse,
-  type JsonRpcResponse,
   type RequestContext,
 } from "../shared/rpc/process.ts";
 

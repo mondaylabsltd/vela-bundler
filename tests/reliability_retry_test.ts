@@ -89,7 +89,7 @@ Deno.test("withRetry - honours Retry-After as a floor on the backoff delay", asy
 Deno.test("withRetry - full jitter keeps delay within [0, cap]", async () => {
   const clk = fakeClock();
   const delays: number[] = [];
-  let prev = clk.t;
+  const prev = clk.t;
   await assertRejects(() => withRetry(async () => { throw transient(); }, {
     maxAttempts: 4, baseDelayMs: 100, maxDelayMs: 800,
     now: clk.now, sleep: (ms) => { delays.push(ms); clk.advance(ms); return Promise.resolve(); },

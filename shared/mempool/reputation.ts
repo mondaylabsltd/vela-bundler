@@ -20,12 +20,21 @@ export interface ReputationConfig {
   minInclusionDenominator: number; // default 10
   throttlingSlack: number;         // default 10
   banSlack: number;                // default 50
+  /**
+   * Hard cap on tracked entities. `decay()` only prunes fully-decayed, >24h-stale entries
+   * hourly, so a flood of distinct sender addresses (opsSeen accrues on every mempool add, not
+   * just on-chain inclusion) could otherwise grow the map without bound between decays. At the
+   * cap we PREFER to evict the oldest **ok** entry (no penalty to lose); only when every entry
+   * is penalized do we evict the oldest overall, so the cap is always a hard bound.
+   */
+  maxEntries: number;              // default 50_000
 }
 
 const DEFAULT_REPUTATION_CONFIG: ReputationConfig = {
   minInclusionDenominator: 10,
   throttlingSlack: 10,
   banSlack: 50,
+  maxEntries: 50_000,
 };
 
 export class ReputationManager {
@@ -52,9 +61,34 @@ export class ReputationManager {
         status: "ok",
         lastUpdated: Date.now(),
       };
+      this.evictIfNeeded();
       this.entries.set(k, entry);
     }
     return entry;
+  }
+
+  /** At capacity, evict one entry so size can never exceed maxEntries (a HARD cap). Prefer the
+   *  oldest "ok" entry — it carries no penalty to lose. Only if EVERY entry is penalized (an
+   *  attack flood of distinct throttled/banned senders) do we evict the oldest overall, trading
+   *  one stale penalty reset for a guaranteed memory bound. */
+  private evictIfNeeded(): void {
+    if (this.entries.size < this.config.maxEntries) return;
+    let oldestOkKey: string | undefined;
+    let oldestOkTime = Infinity;
+    let oldestAnyKey: string | undefined;
+    let oldestAnyTime = Infinity;
+    for (const [key, e] of this.entries) {
+      if (e.lastUpdated < oldestAnyTime) {
+        oldestAnyTime = e.lastUpdated;
+        oldestAnyKey = key;
+      }
+      if (e.status === "ok" && e.lastUpdated < oldestOkTime) {
+        oldestOkTime = e.lastUpdated;
+        oldestOkKey = key;
+      }
+    }
+    const victim = oldestOkKey ?? oldestAnyKey;
+    if (victim !== undefined) this.entries.delete(victim);
   }
 
   /**
@@ -157,6 +191,20 @@ export class ReputationManager {
    */
   dump(): ReputationEntry[] {
     return Array.from(this.entries.values());
+  }
+
+  /** Count entities of `entityType` currently in a penalized status. Feeds the operational
+   *  monitor's "a user's ops keep failing" alert (senders are no longer hard-banned, but a
+   *  banned/throttled sender still signals repeated failures worth an operator's attention). */
+  countPenalized(entityType: EntityType): { throttled: number; banned: number } {
+    let throttled = 0;
+    let banned = 0;
+    for (const e of this.entries.values()) {
+      if (e.entityType !== entityType) continue;
+      if (e.status === "banned") banned++;
+      else if (e.status === "throttled") throttled++;
+    }
+    return { throttled, banned };
   }
 
   /**

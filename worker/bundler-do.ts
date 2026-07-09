@@ -6,14 +6,15 @@
  *
  * Key design decisions:
  * - chainId is persisted in DO storage so alarms can re-initialize after eviction
- * - processReceipt fire-and-forget is kept alive via state.waitUntil (not ctx.waitUntil)
+ * - in-flight receipt reconciliation is durable: pending receipts persist to DO storage and are
+ *   polled by the alarm (checkPendingReceipts) — no fire-and-forget
  * - ensureInitialized guards against cached rejections and chain mismatch
  */
 
 import type { Env } from "./types.ts";
 import { buildConfig } from "./config.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
-import { resolveChain, type ChainInfo } from "../shared/config/chain-registry.ts";
+import { resolveChain } from "../shared/config/chain-registry.ts";
 import { createSimulator } from "../shared/simulation/index.ts";
 import { Mempool } from "../shared/mempool/index.ts";
 import { AccountService } from "../shared/account/index.ts";
@@ -39,6 +40,9 @@ import {
   internalError,
 } from "../shared/rpc/errors.ts";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";
+import { createAlerter, type Alerter } from "../shared/monitoring/telegram.ts";
+import { checkTreasuryBalance } from "../shared/monitoring/treasury.ts";
+import { checkOperationalHealth, DEFAULT_OPERATIONAL_THRESHOLDS } from "../shared/monitoring/operational.ts";
 
 /** Auto-bundle alarm interval — 10 seconds. */
 const ALARM_INTERVAL_MS = 10_000;
@@ -102,6 +106,8 @@ export class BundlerDO implements DurableObject {
   private sponsorService: SponsorService | null = null;
   private chainId: number = 0;
   private initPromise: Promise<void> | null = null;
+  /** Telegram alerter — persistent so the per-alert cooldown survives across alarm cycles. */
+  private alerter: Alerter | null = null;
 
   // Health loop state
   private lastDecayAt: number = 0;
@@ -115,16 +121,32 @@ export class BundlerDO implements DurableObject {
     const url = new URL(request.url);
     const chainId = parseInt(url.searchParams.get("chainId") ?? "0");
 
-    // Ensure services are initialized for this chain
     if (chainId > 0) {
-      try {
-        await this.ensureInitialized(chainId);
-      } catch (err) {
-        console.error(`[BundlerDO] Init failed for chain ${chainId}:`, err);
-        return Response.json(
-          { jsonrpc: "2.0", id: null, error: internalError("Chain initialization failed") },
-          { status: 503 },
-        );
+      if (url.pathname === "/health") {
+        // Health is READ-ONLY. Do NOT force-init a brand-new/bogus chainId just because someone
+        // curled its health. But DO recover a chain this DO has served before (persisted
+        // chainId) that was merely evicted from memory, so its health is accurate rather than a
+        // misleading "uninitialized". Failure is non-fatal — we still report current state.
+        if (!this.chainServices) {
+          const known = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+          if (known === chainId) {
+            try {
+              await this.ensureInitialized(chainId);
+            } catch {
+              // leave uninitialized — handleHealth reports it with the requested chainId
+            }
+          }
+        }
+      } else {
+        try {
+          await this.ensureInitialized(chainId);
+        } catch (err) {
+          console.error(`[BundlerDO] Init failed for chain ${chainId}:`, err);
+          return Response.json(
+            { jsonrpc: "2.0", id: null, error: internalError("Chain initialization failed") },
+            { status: 503 },
+          );
+        }
       }
     }
 
@@ -138,7 +160,7 @@ export class BundlerDO implements DurableObject {
       }
 
       if (url.pathname === "/health") {
-        return this.handleHealth();
+        return this.handleHealth(chainId);
       }
 
       return new Response("not found", { status: 404 });
@@ -258,6 +280,8 @@ export class BundlerDO implements DurableObject {
     // Derive treasury from OPERATOR_SECRET
     const treasuryAddress = await deriveTreasuryAddress(this.env.OPERATOR_SECRET);
     this.config = buildConfig(this.env, treasuryAddress);
+    // No-op unless TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are configured.
+    this.alerter = createAlerter(this.config);
 
     const keyManager = new LocalKeyManager({
       operatorSecret: this.config.operatorSecret,
@@ -363,14 +387,17 @@ export class BundlerDO implements DurableObject {
     const limited = rateLimitGuard(request, rateLimitConfig);
     if (limited) return limited;
 
-    // Read body as text first to enforce size limit (Content-Length can be spoofed/omitted)
-    const bodyText = await request.text();
-    if (bodyText.length > MAX_BODY_SIZE) {
+    // Enforce the size limit on the raw BYTE length (Content-Length can be spoofed/omitted,
+    // and String.length counts UTF-16 code units — a multibyte body could carry up to ~3× the
+    // cap in real bytes before .length trips). Measure the ArrayBuffer, then decode.
+    const bodyBuf = await request.arrayBuffer();
+    if (bodyBuf.byteLength > MAX_BODY_SIZE) {
       return Response.json(
         { jsonrpc: "2.0", id: null, error: invalidRequest("Request body too large") },
         { status: 413, headers: corsHeaders },
       );
     }
+    const bodyText = new TextDecoder().decode(bodyBuf);
 
     const rawRpcUrl = request.headers.get("x-rpc-url") ?? undefined;
     let requestRpcUrl: string | undefined;
@@ -416,7 +443,7 @@ export class BundlerDO implements DurableObject {
     return jsonResponse(response, corsHeaders);
   }
 
-  private async handleRest(request: Request, doUrl: URL, chainId: number): Promise<Response> {
+  private async handleRest(request: Request, doUrl: URL, _chainId: number): Promise<Response> {
     if (!this.chainAdapter || !this.config) {
       return Response.json({ error: "DO not initialized" }, { status: 500 });
     }
@@ -450,9 +477,10 @@ export class BundlerDO implements DurableObject {
     return response ?? new Response("not found", { status: 404 });
   }
 
-  private handleHealth(): Response {
+  private handleHealth(requestedChainId: number = this.chainId): Response {
     if (!this.chainServices) {
-      return Response.json({ status: "uninitialized", chainId: this.chainId });
+      // Report the chain that was actually asked about (this.chainId is 0 when init was skipped).
+      return Response.json({ status: "uninitialized", chainId: requestedChainId || this.chainId });
     }
 
     const cs = this.chainServices;
@@ -513,6 +541,42 @@ export class BundlerDO implements DurableObject {
       }
     } catch (err) {
       console.error(`[BundlerDO:${this.chainId}] Health recovery error:`, err);
+    }
+
+    // Treasury-balance monitor (deduped Telegram alert when low). No-op if unconfigured.
+    if (this.config && this.alerter) {
+      try {
+        await checkTreasuryBalance({
+          chainId: this.chainId,
+          chainName: this.chainServices.chainInfo?.name ?? null,
+          treasuryAddress: this.config.treasuryAddress,
+          client: getPublicClient(this.chainServices.rpcUrl),
+          thresholdWei: this.config.treasuryAlertThresholdWei,
+          thresholdPathUsd: this.config.treasuryAlertThresholdPathUsd,
+          alerter: this.alerter,
+        });
+      } catch (err) {
+        console.error(`[BundlerDO:${this.chainId}] Treasury monitor error:`, err);
+      }
+
+      // Operational-health monitor: alert on any STUCK condition (mempool op / pending bundle /
+      // locked EOA / degraded RPC) — a user's money can't move and a developer must intervene.
+      try {
+        const cs = this.chainServices;
+        await checkOperationalHealth({
+          chainId: this.chainId,
+          chainName: cs.chainInfo?.name ?? null,
+          oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
+          lockedEoaCount: cs.accountService.lockManager.getLockedEOAs().length,
+          oldestLockedAgeMs: cs.accountService.lockManager.oldestLockedAgeMs(),
+          pendingReceiptCount: cs.bundler.pendingReceiptCount,
+          oldestPendingReceiptAgeMs: cs.bundler.oldestPendingReceiptAgeMs(),
+          circuitDegraded: reliabilityHealth().circuit.degraded,
+          reputationBannedSenders: cs.mempool.reputation.countPenalized("sender").banned,
+        }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
+      } catch (err) {
+        console.error(`[BundlerDO:${this.chainId}] Operational monitor error:`, err);
+      }
     }
 
     // Hourly reputation decay

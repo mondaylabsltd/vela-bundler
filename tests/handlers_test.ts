@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-explicit-any -- partial `as any` mocks of ChainServices/Simulator/etc.
 /**
  * Tests for RPC method handlers (shared/rpc/handlers.ts).
  *
@@ -5,7 +6,7 @@
  * and receipt/mempool lookup without RPC dependencies.
  */
 
-import { assertEquals, assert, assertRejects } from "@std/assert";
+import { assertEquals, assert } from "@std/assert";
 import { handleRpcMethod } from "../shared/rpc/handlers.ts";
 import { processRequest } from "../shared/rpc/process.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
@@ -151,9 +152,15 @@ Deno.test("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost wi
     },
   });
 
+  type GasTier = {
+    networkFeePerGas: string;
+    relayerFeePerGas: string;
+    maxFeePerGas: string;
+    maxPriorityFeePerGas: string;
+  };
   const result = (await handleRpcMethod(
     "pimlico_getUserOperationGasPrice", [], config, registry, mockReqCtx(),
-  )) as Record<string, Record<string, string>>;
+  )) as Record<string, GasTier>;
 
   // standard: tip×1.5 = 1.5 gwei → networkPrice = max(11.5, 11) = 11.5 gwei
   //           userPrice = 11.5 × 2 = 23 gwei

@@ -9,7 +9,6 @@ import type { BundlerConfig } from "../config/types.ts";
 import type { ChainRegistryLike } from "../chain/index.ts";
 import { handleRpcMethod } from "./handlers.ts";
 import {
-  parseError,
   invalidRequest,
   internalError,
   type JsonRpcError,

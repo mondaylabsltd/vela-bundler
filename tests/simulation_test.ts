@@ -11,7 +11,6 @@ import { assertEquals, assert } from "@std/assert";
 import {
   decodeErrorResult,
   encodeErrorResult,
-  encodeFunctionResult,
   encodeFunctionData,
 } from "viem";
 import { ENTRYPOINT_V07_ABI, RPC_ERROR_CODES } from "../shared/contracts/entrypoint.ts";
@@ -102,28 +101,28 @@ Deno.test("parseValidationData - zero data means valid forever, no aggregator", 
 });
 
 Deno.test("parseValidationData - sig failure aggregator == address(1)", () => {
-  // aggregator = 0x0000...0001 at bits [96..256]
-  const sigFail = 1n << 96n;
+  // Canonical ERC-4337 v0.7: aggregator occupies the LOW 160 bits; SIG_VALIDATION_FAILED == 1.
+  const sigFail = 1n;
   const result = parseValidationData(sigFail);
   assertEquals(result.aggregator, "0x0000000000000000000000000000000000000001");
 });
 
 Deno.test("parseValidationData - encodes validAfter and validUntil correctly", () => {
-  // validUntil = 1700000000 (6 bytes at bits [48..96])
-  // validAfter = 1600000000 (6 bytes at bits [0..48])
+  // Canonical packing: validUntil << 160, validAfter << 208.
   const validUntil = 1700000000n;
   const validAfter = 1600000000n;
-  const data = (validUntil << 48n) | validAfter;
+  const data = (validUntil << 160n) | (validAfter << 208n);
   const result = parseValidationData(data);
   assertEquals(result.validAfter, 1600000000);
   assertEquals(result.validUntil, 1700000000);
 });
 
 Deno.test("parseValidationData - combined aggregator + time range", () => {
+  // Canonical: aggregator(low 160) | validUntil<<160 | validAfter<<208.
   const aggregator = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefn;
   const validUntil = 2000000000n;
   const validAfter = 1000000000n;
-  const data = (aggregator << 96n) | (validUntil << 48n) | validAfter;
+  const data = aggregator | (validUntil << 160n) | (validAfter << 208n);
   const result = parseValidationData(data);
   assertEquals(result.aggregator, "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
   assertEquals(result.validAfter, 1000000000);
@@ -233,8 +232,8 @@ Deno.test("ValidationResult error - roundtrip with valid data", () => {
 });
 
 Deno.test("ValidationResult error - sig failure aggregator is detectable", () => {
-  // accountValidationData with aggregator=0x01 (sig fail)
-  const sigFail = 1n << 96n;
+  // accountValidationData with aggregator=0x01 (sig fail) — canonical low-bit encoding.
+  const sigFail = 1n;
   const encoded = encodeValidationResultError({
     accountValidationData: sigFail,
   });

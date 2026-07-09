@@ -24,6 +24,9 @@ export interface EOAState {
   reservedBalance: bigint;
   /** Whether this EOA has a bundle currently being prepared/submitted. */
   bundleLock: boolean;
+  /** Epoch ms when this EOA entered LOCKED_PENDING_UNKNOWN — used to detect a *stuck* EOA
+   *  (locked too long → a user's funds can't move → operator alert). undefined when ACTIVE. */
+  lockedSince?: number;
 }
 
 /**
@@ -114,6 +117,10 @@ export class EOALockManager {
       pendingNonce,
       reservedBalance: existing?.reservedBalance ?? 0n,
       bundleLock: existing?.bundleLock ?? false,
+      // Preserve the original lock timestamp if still locked; clear it once recovered to ACTIVE.
+      lockedSince: status === "LOCKED_PENDING_UNKNOWN"
+        ? (existing?.lockedSince ?? Date.now())
+        : undefined,
     };
 
     this.evictIfNeeded(k);
@@ -178,14 +185,56 @@ export class EOALockManager {
     const k = this.key(address);
     const state = this.states.get(k);
     if (state) {
+      if (state.status !== "LOCKED_PENDING_UNKNOWN") state.lockedSince = Date.now();
       state.status = reason;
     }
+  }
+
+  /**
+   * Restore an EOA's in-flight state after a durable-storage reload (CF Worker DO eviction):
+   * mark it LOCKED_PENDING_UNKNOWN and carry the persisted reservation, CREATING the state if
+   * none exists. Unlike addReservation/lockEOA (which no-op on an absent state), this must
+   * work against the freshly-constructed, empty lock manager a cold-started DO builds — that
+   * is precisely when the anti-double-spend lock + reservation would otherwise be silently
+   * lost. The placeholder nonces are overwritten by the next initEOA (health loop / recovery).
+   */
+  restorePending(address: `0x${string}`, reservedBalance: bigint): void {
+    const k = this.key(address);
+    const existing = this.states.get(k);
+    if (existing) {
+      if (existing.status !== "LOCKED_PENDING_UNKNOWN") existing.lockedSince = Date.now();
+      existing.status = "LOCKED_PENDING_UNKNOWN";
+      if (reservedBalance > existing.reservedBalance) existing.reservedBalance = reservedBalance;
+      return;
+    }
+    this.evictIfNeeded(k);
+    this.states.set(k, {
+      address: address.toLowerCase() as `0x${string}`,
+      status: "LOCKED_PENDING_UNKNOWN",
+      latestNonce: 0,
+      pendingNonce: 0,
+      reservedBalance,
+      bundleLock: false,
+      lockedSince: Date.now(),
+    });
   }
 
   getLockedEOAs(): EOAState[] {
     return Array.from(this.states.values()).filter(
       (s) => s.status === "LOCKED_PENDING_UNKNOWN",
     );
+  }
+
+  /** Age (ms) of the EOA that has been LOCKED_PENDING_UNKNOWN the longest, or 0 if none.
+   *  A large value means a user's funds have been unmovable for that long → operator alert. */
+  oldestLockedAgeMs(now: number = Date.now()): number {
+    let oldest = 0;
+    for (const s of this.states.values()) {
+      if (s.status !== "LOCKED_PENDING_UNKNOWN") continue;
+      const age = now - (s.lockedSince ?? now);
+      if (age > oldest) oldest = age;
+    }
+    return oldest;
   }
 
   async tryRecoverEOA(

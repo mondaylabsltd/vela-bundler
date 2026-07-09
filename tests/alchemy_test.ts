@@ -2,7 +2,7 @@
  * Unit tests for Alchemy RPC support.
  */
 
-import { assertEquals, assert, assertNotEquals } from "@std/assert";
+import { assertEquals, assert } from "@std/assert";
 import {
   isAlchemySupported,
   buildAlchemyRpcUrl,

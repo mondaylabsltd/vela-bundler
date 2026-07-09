@@ -24,6 +24,7 @@ import {
   TEMPO_SPONSOR_TARGET,
   TEMPO_TREASURY_FLOOR,
 } from "../tempo.ts";
+import { redactError } from "../reliability/log.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -153,20 +154,26 @@ export class SponsorService {
   ): Promise<SponsorResult> {
     const client = getPublicClient(rpcUrl);
 
-    // 3. Nonce check — only sponsor new relayers
-    const nonce = await client.getTransactionCount({ address: relayerAddress });
-    if (nonce > MAX_SPONSOR_NONCE) {
-      return { sponsored: false, reason: "nonce_exceeded" };
-    }
-
-    // Tempo has no native coin — sponsor a pathUSD float to the gas account via a 0x76
-    // (the native balance/gas math below doesn't apply). Same passkey gate.
+    // Tempo has no native coin — the gas account is a bundler-provided pathUSD FLOAT that is
+    // consumed as gas is fronted and (mostly) replenished by each tx's batched reimbursement.
+    // It legitimately needs RE-funding when it drains, so it must NOT be gated by the "new user"
+    // nonce heuristic below (a drained, actively-used gas account has nonce > MAX_SPONSOR_NONCE
+    // and would otherwise be un-refillable → the user is silently stuck, unable to submit). Abuse
+    // is bounded by the passkey gate + per-transfer cap (tops up only to TEMPO_SPONSOR_TARGET) +
+    // treasury floor (in _doSponsorTempo) + the 5-min per-safe cooldown (in sponsor()).
     if (isTempoChain(chainId)) {
       const hasPasskey = await this.checkWebAuthnRegistration(safeAddress);
       if (!hasPasskey) {
         return { sponsored: false, reason: "no_passkey_registered" };
       }
       return await this._doSponsorTempo(chainId, relayerAddress, rpcUrl);
+    }
+
+    // 3. Nonce check — only sponsor new relayers (native chains: the EOA is user-funded and
+    //    self-sustaining via the settlement split, so it should not need re-sponsoring).
+    const nonce = await client.getTransactionCount({ address: relayerAddress });
+    if (nonce > MAX_SPONSOR_NONCE) {
+      return { sponsored: false, reason: "nonce_exceeded" };
     }
 
     // 4. User wallet balance check — Safe must hold ≥ 2× the sponsor amount.
@@ -282,7 +289,7 @@ export class SponsorService {
         amount: "0x" + amount.toString(16),
       };
     } catch (err) {
-      console.error(`[Sponsor] Transfer failed:`, err);
+      console.error(`[Sponsor] Transfer failed:`, redactError(err));
       return {
         sponsored: false,
         reason: "transfer_failed",

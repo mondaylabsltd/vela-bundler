@@ -15,8 +15,8 @@ import type { RateLimitConfig } from "../shared/auth/index.ts";
 Deno.test("CORS_HEADERS - fully permissive (origin *, headers *, methods, max-age)", () => {
   assertEquals(CORS_HEADERS["Access-Control-Allow-Origin"], "*");
   assertEquals(CORS_HEADERS["Access-Control-Allow-Headers"], "*");
-  assert(CORS_HEADERS["Access-Control-Allow-Methods"].includes("POST"));
-  assert(CORS_HEADERS["Access-Control-Allow-Methods"].includes("OPTIONS"));
+  assert(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("POST"));
+  assert(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("OPTIONS"));
   assert(Number(CORS_HEADERS["Access-Control-Max-Age"]) > 0, "preflight should be cacheable");
 });
 

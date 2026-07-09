@@ -126,3 +126,34 @@ Deno.test("pickBestRpc - returns a working RPC for Ethereum mainnet", async () =
   const best = await pickBestRpc(publicRpcs, 1);
   assert(best.startsWith("https://"));
 });
+
+// --- ChainRegistry.dispose() — graceful-shutdown timer release (O-4) ---
+
+import { ChainRegistry } from "../shared/chain/index.ts";
+import { LocalKeyManager } from "../shared/keys/local.ts";
+import type { BundlerConfig } from "../shared/config/types.ts";
+
+function fullConfig(): BundlerConfig {
+  return {
+    chainId: 0, rpcUrl: "", publicRpcs: [], chainInfo: null,
+    entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+    port: 0, host: "", bundlingMode: "manual", maxBundleSize: 10, maxBundleGas: 5_000_000n,
+    minPriorityFeePerGas: 0n, minProfitMarginBps: 1000, maxProfitMarginBps: 15000, walletGasMarkup: 2,
+    useEip1559: true, baseFeeMultiplier: 1.25, bundlerTipGwei: 0.5, autoBundleIntervalMs: 10000,
+    operatorSecret: "0x" + "ab".repeat(32), oldOperatorSecrets: [],
+    treasuryAddress: "0x" + "cc".repeat(20) as `0x${string}`,
+    splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226" as `0x${string}`,
+    apiRateLimitPerMinute: 60, balanceReserveMultiplier: 1, alchemyApiKey: null,
+    telegramBotToken: null, telegramChatId: null, treasuryAlertThresholdWei: 0n, treasuryAlertThresholdPathUsd: 0n,
+  };
+}
+
+Deno.test("ChainRegistry.dispose - clears the health timer without leaking (idempotent)", () => {
+  // The Deno test resource sanitizer fails this test if the 30s health interval leaks —
+  // so a passing test proves dispose() released it. Also assert double-dispose is safe.
+  const config = fullConfig();
+  const keyManager = new LocalKeyManager({ operatorSecret: config.operatorSecret });
+  const registry = new ChainRegistry(config, keyManager);
+  registry.dispose();
+  registry.dispose();
+});

@@ -159,8 +159,8 @@ Deno.test("time range re-verification - combined validAfter+validUntil from vali
   const now = Math.floor(Date.now() / 1000);
   const validAfter = BigInt(now - 100);
   const validUntil = BigInt(now + 100);
-  // Pack into validationData format: aggregator(20) | validUntil(6) | validAfter(6)
-  const data = (validUntil << 48n) | validAfter;
+  // Canonical ERC-4337 v0.7 packing: aggregator(low 160) | validUntil<<160 | validAfter<<208.
+  const data = (validUntil << 160n) | (validAfter << 208n);
 
   const parsed = parseValidationData(data);
   assert(isValidTimeRange(parsed.validAfter, parsed.validUntil, 10));
@@ -170,7 +170,7 @@ Deno.test("time range re-verification - expired validationData detected", () => 
   const now = Math.floor(Date.now() / 1000);
   const validAfter = BigInt(now - 200);
   const validUntil = BigInt(now - 100); // expired 100 seconds ago
-  const data = (validUntil << 48n) | validAfter;
+  const data = (validUntil << 160n) | (validAfter << 208n);
 
   const parsed = parseValidationData(data);
   assert(!isValidTimeRange(parsed.validAfter, parsed.validUntil, 10));
@@ -187,7 +187,7 @@ Deno.test("paymaster validation - zero paymasterValidationData is always valid",
 });
 
 Deno.test("paymaster validation - sig failure aggregator detectable", () => {
-  const sigFail = 1n << 96n;
+  const sigFail = 1n; // canonical low-bit SIG_VALIDATION_FAILED
   const parsed = parseValidationData(sigFail);
   assertEquals(parsed.aggregator, "0x0000000000000000000000000000000000000001");
 });

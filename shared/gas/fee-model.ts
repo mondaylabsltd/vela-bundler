@@ -6,15 +6,28 @@
  *   userPrice    = networkPrice × markup                   // what the user is quoted & signs
  *   The wallet signs maxFeePerGas == maxPriorityFeePerGas == userPrice, so the EntryPoint
  *   charges the account EXACTLY `userPrice` per gas for ANY base fee
- *   (min(maxFee, baseFee + maxPriority) == userPrice). The bundler EOA is the beneficiary,
- *   so REVENUE per gas == userPrice — a constant, independent of base-fee volatility.
+ *   (min(maxFee, baseFee + maxPriority) == userPrice). The EntryPoint refunds this to the
+ *   beneficiary, so gross REVENUE per gas == userPrice — a constant, independent of base-fee
+ *   volatility.
  *
  * The bundler then submits the outer `handleOps` tx. Its COST per gas is
  * `min(outerMaxFee, baseFee_at_inclusion + outerPriority)`. Two invariants must hold:
  *
  *   (I1 — never a guaranteed loss) outerMaxFee ≤ userPrice. Then even if the base fee
- *        spikes all the way to outerMaxFee by inclusion, cost ≤ userPrice == revenue, i.e.
- *        worst case break-even. The bundler can never be forced to pay more than it earns.
+ *        spikes all the way to outerMaxFee by inclusion, cost ≤ userPrice == gross revenue,
+ *        i.e. worst case break-even for the beneficiary.
+ *
+ *   ⚠️ BENEFICIARY SPLIT (native chains): the `handleOps` beneficiary is NOT the EOA — it is
+ *   the VelaGasSettlementSplitter, which forwards only 50% of the refund to the EOA (tx.origin)
+ *   and 50% to the treasury (shared/contracts/splitter.ts). So the EOA's NET per gas is
+ *   0.5·userPrice − outerCost, which is ≥ 0 only when userPrice ≥ 2·outerCost, i.e. at ≥100%
+ *   effective margin. Below that (e.g. base fee rising post-quote so the 10% floor still
+ *   passes) the EOA is under-refunded and the user's prepaid float — not the operator — absorbs
+ *   the difference (the treasury still takes its 50%; operator aggregate stays positive). This
+ *   is a deliberate product tradeoff (let the prepaid float absorb spikes) rather than reject
+ *   the user's tx during volatility. If you want the EOA made whole every bundle, set
+ *   MIN_PROFIT_MARGIN_BPS ≥ 10000 (100%) for native chains. On Tempo the beneficiary IS the EOA
+ *   (in-band stablecoin reimbursement), so I1 holds as stated there.
  *
  *   (I2 — reliable inclusion) outerMaxFee must sit ABOVE the current base fee by a real
  *        margin, because base fee can rise up to 12.5% per block. With only `tip` of

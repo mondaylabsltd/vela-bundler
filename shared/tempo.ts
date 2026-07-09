@@ -170,10 +170,17 @@ export function parseTempoReimbursement(
     let off = 0;
     let sum = 0n;
     while (off < total) {
+      const operation = hexToNumber(slice(txs, off, off + 1)); // 0 = CALL, 1 = DELEGATECALL
       const callTo = slice(txs, off + 1, off + 21); // sub-call target = the token contract
       const dataLen = hexToNumber(slice(txs, off + 53, off + 85));
       const innerCall = slice(txs, off + 85, off + 85 + dataLen);
       off += 85 + dataLen;
+      // SECURITY: only a plain CALL actually moves feeToken. A DELEGATECALL (operation=1) to
+      // the token address with `transfer(EOA, amt)` calldata runs the token's code against the
+      // SAFE's storage — it does NOT transfer any feeToken to the bundler — yet its face value
+      // would otherwise be counted as reimbursement, letting a crafted op pass the gate while
+      // paying the bundler nothing (a Tempo gas drain). Count CALL entries only.
+      if (operation !== 0) continue;
       // Only the trusted feeToken counts — see SECURITY note above.
       let tokenTrusted = false;
       try {

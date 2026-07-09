@@ -145,28 +145,25 @@ Deno.test("body size — allows body within limit", () => {
 // ACTIVE_CHAINS parsing (scheduled handler)
 // ---------------------------------------------------------------------------
 
+// Typed helper mirrors the comma-separated chain-id parse; a typed `string` param avoids
+// the literal-type narrowing that made the empty-string case a `never`.
+const parseChainIds = (raw: string): number[] =>
+  raw.split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n));
+
 Deno.test("ACTIVE_CHAINS parsing — comma-separated chain IDs", () => {
-  const raw = "1,137,42161";
-  const chainIds = raw.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-  assertEquals(chainIds, [1, 137, 42161]);
+  assertEquals(parseChainIds("1,137,42161"), [1, 137, 42161]);
 });
 
 Deno.test("ACTIVE_CHAINS parsing — handles whitespace", () => {
-  const raw = " 1 , 137 , 42161 ";
-  const chainIds = raw.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-  assertEquals(chainIds, [1, 137, 42161]);
+  assertEquals(parseChainIds(" 1 , 137 , 42161 "), [1, 137, 42161]);
 });
 
 Deno.test("ACTIVE_CHAINS parsing — handles empty string", () => {
-  const raw = "";
-  const result = raw ? raw.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
-  assertEquals(result, []);
+  assertEquals(parseChainIds(""), []);
 });
 
 Deno.test("ACTIVE_CHAINS parsing — filters invalid entries", () => {
-  const raw = "1,abc,137,,42161";
-  const chainIds = raw.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-  assertEquals(chainIds, [1, 137, 42161]);
+  assertEquals(parseChainIds("1,abc,137,,42161"), [1, 137, 42161]);
 });
 
 // ---------------------------------------------------------------------------

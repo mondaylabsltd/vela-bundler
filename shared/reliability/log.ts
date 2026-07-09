@@ -65,6 +65,16 @@ export function redactUrl(url: string): string {
   }
 }
 
+/**
+ * Redact RPC URLs (which may embed an API key) from an arbitrary error's message before it is
+ * logged OR returned to a client. viem errors embed the request URL in their message, so a raw
+ * `console.error(err)` / returned `err.message` on the trusted-RPC path can leak the Alchemy key.
+ */
+export function redactError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.replace(/https?:\/\/[^\s"'`)]+/g, (m) => redactUrl(m));
+}
+
 /** Emit one structured JSON log line. `now` injectable for tests. */
 export function logEvent(ev: LogEvent, now: () => number = Date.now): void {
   const level = ev.level ?? "info";

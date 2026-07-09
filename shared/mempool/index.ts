@@ -178,10 +178,22 @@ export class Mempool {
     for (const [hash, entry] of this.entries) {
       if (now - entry.addedAt > MEMPOOL_ENTRY_TTL_MS) {
         this.removeEntry(hash);
+        // Notify (bundler stores a terminal success=false receipt) so a TTL-dropped op is NOT
+        // silently lost — the wallet gets a definitive "failed, resubmit" instead of polling null
+        // forever and mistaking a drop for a pending/successful inclusion. Non-fatal on error.
+        try {
+          this.onTtlEvict?.(entry);
+        } catch { /* hook must never break bundling */ }
       }
     }
     return Array.from(this.entries.values());
   }
+
+  /** Set a hook invoked with each entry evicted for exceeding its TTL (see getAll). */
+  setTtlEvictionHook(fn: (entry: MempoolEntry) => void): void {
+    this.onTtlEvict = fn;
+  }
+  private onTtlEvict?: (entry: MempoolEntry) => void;
 
   /**
    * Get the number of pending entries.
@@ -229,18 +241,23 @@ export class Mempool {
   }
 
   private checkEntityReputation(userOp: UserOperation): void {
-    if (this.reputation.isBanned(userOp.sender, "sender")) {
-      throw new UserOpValidationError(
-        "Sender is banned",
-        RPC_ERROR_CODES.THROTTLED_OR_BANNED,
-      );
-    }
-    if (this.reputation.isThrottled(userOp.sender, "sender")) {
-      // Throttled senders can have at most 1 pending op
+    // NOTE: senders are NOT hard-banned in this custodial model. Reputation bans exist to protect
+    // a SHARED public mempool from a griefing sender; here every sender is a user's own Safe bound
+    // to its own dedicated EOA, spending only its own funds — a "bad" sender can at most waste one
+    // simulation per cycle (bounded by the 1-pending-op throttle below). Banning it would instead
+    // fully block a real user from moving their money (the exact failure we must never cause), and
+    // that block would be invisible. So we keep only the (non-blocking) throttle for senders and
+    // surface a reputation-blocked alert from the operational monitor. Factory/paymaster — shared
+    // entities that CAN grief the mempool — remain bannable below.
+    if (
+      this.reputation.isBanned(userOp.sender, "sender") ||
+      this.reputation.isThrottled(userOp.sender, "sender")
+    ) {
+      // Throttled/penalized senders can have at most 1 pending op (rate limit, not a block).
       const senderOps = this.bySender.get(userOp.sender.toLowerCase());
       if (senderOps && senderOps.size > 0) {
         throw new UserOpValidationError(
-          "Sender is throttled and already has a pending UserOperation",
+          "Sender already has a pending UserOperation (rate-limited)",
           RPC_ERROR_CODES.THROTTLED_OR_BANNED,
         );
       }

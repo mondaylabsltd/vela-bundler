@@ -25,28 +25,33 @@
 </head>
 <body class="markdown-body">
 <h1>Vela Bundler</h1>
-<p>Private prepaid ERC-4337 / ERC-7769 bundler for EntryPoint v0.7, built with Deno 2 + TypeScript.</p>
+<p>ERC-4337 / ERC-7769 multi-chain bundler for EntryPoint v0.7.</p>
 <p>Supports any EVM network listed at <a href="https://ethereum-data.awesometools.dev/">ethereum-data.awesometools.dev</a>.</p>
+<p>Two deployment targets: <strong>Deno</strong> (self-hosted) and <strong>Cloudflare Workers</strong> (edge).</p>
 <h2>Quick Start</h2>
-<pre><code class="language-bash"># Only two required env vars:
-export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
-export TREASURY_ADDRESS=0x...  # Where excess EOA balance is swept
-
+<h3>Deno (self-hosted)</h3>
+<pre><code class="language-bash">export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
 deno task start
 </code></pre>
-<p>Everything else has sensible defaults (Ethereum mainnet, auto RPC, port 3300).</p>
+<h3>Cloudflare Workers</h3>
+<pre><code class="language-bash">npm install
+npx wrangler secret put OPERATOR_SECRET
+npx wrangler secret put ALCHEMY_API_KEY    # optional
+npm run deploy
+</code></pre>
+<p>Any EVM chain is supported automatically — the first request for a chain creates its Durable Object.</p>
 <h2>How It Works</h2>
 <ol>
 <li>Each user&#39;s <strong>safeAddress</strong> gets a <strong>dedicated bundler EOA</strong>, deterministically derived from <code>(chainId, entryPoint, safeAddress, operatorSecret)</code>.</li>
-<li>Users deposit native tokens to their dedicated EOA.</li>
+<li>Users deposit native tokens to their dedicated EOA (or a <code>pathUSD</code> stablecoin float on Tempo).</li>
 <li>The bundler submits <code>handleOps</code> when the EOA has sufficient balance.</li>
 <li>Each bundle contains ops from <strong>one safeAddress only</strong>, signed by its dedicated EOA.</li>
-<li>Every 30 bundles, excess balance is swept to the treasury.</li>
+<li>On native chains the <code>handleOps</code> <strong>beneficiary is the <code>VelaGasSettlementSplitter</code></strong>, whose <code>receive()</code> splits the EntryPoint gas refund 50/50 between the EOA and the treasury. On Tempo the bundler is repaid by an in-band stablecoin transfer. (There is no periodic treasury sweep — that mechanism was removed in favor of the on-chain splitter.)</li>
 </ol>
 <p>No database — all state is derived or in-memory.</p>
 <h2>Architecture</h2>
-<pre><code>src/
-├── config/          Configuration + chain registry (auto-resolve RPC)
+<pre><code>shared/              Platform-agnostic logic (used by both runtimes)
+├── config/          Configuration types + chain registry + Alchemy
 ├── keys/            Deterministic key derivation (HKDF-SHA256)
 ├── account/         Per-EOA balance, reservations, lock management
 ├── auth/            Rate limiting
@@ -55,10 +60,44 @@ deno task start
 ├── gas/             preVerificationGas, profitability model
 ├── simulation/      simulateValidation + bundle simulation
 ├── mempool/         In-memory mempool with reputation tracking
-├── bundler/         Bundle building, submission, treasury sweep
-├── rpc/             JSON-RPC (ERC-7769) + REST API
+├── bundler/         Bundle building, submission, receipt reconciliation
+├── chain/           Per-chain service registry (lazy init + health loop)
+├── rpc/             JSON-RPC handlers + REST API + request processing
 └── utils/           Hex utilities, RPC client factory
+
+deno/                Deno runtime
+├── main.ts          Entry point
+├── config.ts        Env-based config (Deno.env)
+└── server.ts        HTTP server (Deno.serve)
+
+worker/              Cloudflare Workers runtime
+├── index.ts         Fetch handler — routes by chainId to DO
+├── bundler-do.ts    BundlerDO — one Durable Object per chain
+├── config.ts        Env-based config (CF bindings)
+└── types.ts         Env interface
 </code></pre>
+<h2>Deployment</h2>
+<h3>Deno</h3>
+<pre><code class="language-bash">deno task dev              # Dev with watch mode
+deno task start            # Production
+deno task test             # Run tests
+deno task deploy           # Interactive SSH deploy to remote server
+deno task deploy status    # Check remote status
+deno task deploy rollback  # Rollback to previous release
+</code></pre>
+<p>Uses systemd on the remote server. See <code>deploy/systemd/vela-bundler.service</code>.</p>
+<h3>Cloudflare Workers</h3>
+<pre><code class="language-bash">npm install
+npm run dev                # Local dev (wrangler dev)
+npm run deploy             # Deploy to Cloudflare
+npm run test:worker        # Run worker tests (vitest + miniflare)
+</code></pre>
+<p><strong>Secrets</strong> (set via <code>npx wrangler secret put</code>):</p>
+<ul>
+<li><code>OPERATOR_SECRET</code> — required</li>
+<li><code>ALCHEMY_API_KEY</code> — optional, for preferred RPCs</li>
+</ul>
+<p><strong>How it works</strong>: Each chain gets its own Durable Object instance (<code>BundlerDO</code>), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces <code>setInterval</code>). Requests are routed by <code>POST /:chainId</code> → <code>env.BUNDLER.idFromName(&quot;chain-${chainId}&quot;)</code>. DO alarms persist across eviction — no cron or pre-configuration needed.</p>
 <h2>Key Derivation</h2>
 <pre><code>HKDF-SHA256(
   IKM  = operatorSecret,
@@ -67,12 +106,7 @@ deno task start
   L    = 32 bytes
 ) → secp256k1 private key → Ethereum address
 </code></pre>
-<ul>
-<li>HKDF-SHA256 with domain separation.</li>
-<li>Inputs canonicalized (lowercase, decimal chainId).</li>
-<li>Invalid keys auto-retry with counter.</li>
-<li><code>KeyManager</code> interface for future KMS/HSM/MPC.</li>
-</ul>
+<p>Treasury address is also derived from <code>operatorSecret</code> (same on all chains).</p>
 <h2>RPC URL Priority</h2>
 <table>
 <thead>
@@ -89,41 +123,17 @@ deno task start
 </tr>
 <tr>
 <td>2</td>
-<td><code>USER_RPC_URLS</code> env</td>
-<td>Startup (comma-separated)</td>
+<td>Alchemy RPC</td>
+<td>If <code>ALCHEMY_API_KEY</code> set + chain supported</td>
 </tr>
 <tr>
 <td>3</td>
-<td><code>RPC_URL</code> env</td>
-<td>Startup (operator override)</td>
-</tr>
-<tr>
-<td>4</td>
 <td>Chain registry</td>
-<td>Auto-resolved from CHAIN_ID</td>
+<td>Public RPCs, health-checked</td>
 </tr>
 </tbody></table>
-<p>User RPCs flow through the entire chain: simulation, submission, balance queries.</p>
-<h2>REST API</h2>
-<h3>GET /v1/account/:chainId/:safeAddress</h3>
-<p>No authentication. Rate limited per IP. Supports <code>X-Rpc-Url</code> header.</p>
-<pre><code class="language-json">{
-  &quot;chainId&quot;: 1,
-  &quot;entryPoint&quot;: &quot;0x0000000071727De22E5E9d8BAf0edAc6f37da032&quot;,
-  &quot;safeAddress&quot;: &quot;0x...&quot;,
-  &quot;activeDepositAddress&quot;: &quot;0x...&quot;,
-  &quot;oldDepositAddresses&quot;: [],
-  &quot;onchainBalance&quot;: &quot;0x...&quot;,
-  &quot;reservedBalance&quot;: &quot;0x0&quot;,
-  &quot;spendableBalance&quot;: &quot;0x...&quot;,
-  &quot;latestNonce&quot;: 0,
-  &quot;pendingNonce&quot;: 0,
-  &quot;status&quot;: &quot;ACTIVE&quot;,
-  &quot;rpcUsed&quot;: &quot;https://...&quot;
-}
-</code></pre>
-<p><strong>Status:</strong> <code>ACTIVE</code> | <code>INSUFFICIENT_BALANCE</code> | <code>LOCKED_PENDING_UNKNOWN</code> | <code>LOCKED_IN_MEMORY_PENDING</code></p>
-<h2>JSON-RPC Methods</h2>
+<h2>API</h2>
+<h3>JSON-RPC: <code>POST /:chainId</code></h3>
 <table>
 <thead>
 <tr>
@@ -156,31 +166,63 @@ deno task start
 <td>Chain ID</td>
 </tr>
 </tbody></table>
-<p>All methods support <code>X-Rpc-Url</code> header.</p>
-<h2>Treasury Sweep</h2>
-<p>Excess EOA balance is automatically swept to <code>TREASURY_ADDRESS</code>:</p>
-<ul>
-<li><strong>Trigger:</strong> before bundling, when <code>nonce % SWEEP_INTERVAL === 0</code></li>
-<li><strong>Retain:</strong> <code>currentGasPrice × 10M gas</code> (enough for future bundles)</li>
-<li><strong>Runs inside bundle lock</strong> — no nonce conflicts</li>
-<li><strong>Non-fatal:</strong> failure skips, retries next trigger</li>
-</ul>
+<p>All methods support <code>X-Rpc-Url</code> header. Batch requests capped at 20.</p>
+<h3>REST API</h3>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/v1/account/:chainId/:safeAddress</code></td>
+<td>GET</td>
+<td>Account info (balance, nonce, status)</td>
+</tr>
+<tr>
+<td><code>/v1/treasury</code></td>
+<td>GET</td>
+<td>Treasury address</td>
+</tr>
+<tr>
+<td><code>/v1/sponsor/:chainId/:safeAddress</code></td>
+<td>POST</td>
+<td>Request gas sponsorship</td>
+</tr>
+<tr>
+<td><code>/health</code></td>
+<td>GET</td>
+<td>Service health + stats</td>
+</tr>
+</tbody></table>
+<h3>Health Endpoint</h3>
+<pre><code class="language-json">{
+  &quot;service&quot;: &quot;vela-bundler&quot;,
+  &quot;status&quot;: &quot;ok&quot;,
+  &quot;activeChains&quot;: 3,
+  &quot;mempoolSize&quot;: 0,
+  &quot;lockedEOAs&quot;: 0,
+  &quot;entryPoint&quot;: &quot;0x0000000071727De22E5E9d8BAf0edAc6f37da032&quot;
+}
+</code></pre>
+<p>On CF Workers, global <code>/health</code> returns minimal info. Per-chain health available via the DO.</p>
 <h2>Secret Rotation</h2>
-<p>No <code>keyVersion</code>. Rotation = change <code>OPERATOR_SECRET</code>, put old one in <code>OLD_OPERATOR_SECRETS</code>.</p>
-<ul>
-<li>New secret → new EOAs for all users</li>
-<li>Old secret → old EOAs still derivable for balance queries + sweep</li>
-<li>Sweep clears old EOAs → remove old secret from config</li>
-</ul>
-<h2>Binding Rules</h2>
-<ul>
-<li>Dedicated EOA only serves its bound safeAddress</li>
-<li>One safeAddress per bundle</li>
-<li>Signer = beneficiary = dedicated EOA</li>
-<li>Only <code>handleOps</code> calldata to configured EntryPoint</li>
-</ul>
+<ol>
+<li>Generate new <code>OPERATOR_SECRET</code></li>
+<li>Put old one in <code>OLD_OPERATOR_SECRETS</code> (comma-separated)</li>
+<li>New secret → new EOAs; old secret → old EOAs still <strong>derivable</strong> (their addresses are surfaced on <code>GET /v1/account/...</code> as <code>oldDepositAddresses</code>)</li>
+<li>Remove old secret only once old EOAs are drained</li>
+</ol>
+<blockquote>
+<p>⚠️ There is <strong>no built-in drain tool</strong> in this repo — draining an old EOA is a manual,
+out-of-band step (derive its key from the retained old secret and sweep it). Do <strong>not</strong> discard
+the old secret until you have confirmed every old EOA is empty, or those funds become
+unrecoverable. See <code>docs/project-takeover/08-open-issues.md</code>.</p>
+</blockquote>
 <h2>Configuration</h2>
-<p>Only <code>OPERATOR_SECRET</code> and <code>TREASURY_ADDRESS</code> are required. See <a href=".env.example">.env.example</a>.</p>
+<p>Only <code>OPERATOR_SECRET</code> is required. Treasury address is derived from it.</p>
 <table>
 <thead>
 <tr>
@@ -195,34 +237,98 @@ deno task start
 <td><strong>Required.</strong> 32+ byte hex secret</td>
 </tr>
 <tr>
-<td><code>TREASURY_ADDRESS</code></td>
-<td>—</td>
-<td><strong>Required.</strong> Sweep destination</td>
+<td><code>PORT</code></td>
+<td><code>3300</code></td>
+<td>Server port (Deno only)</td>
 </tr>
 <tr>
-<td><code>CHAIN_ID</code></td>
-<td><code>1</code></td>
-<td>Chain ID</td>
+<td><code>HOST</code></td>
+<td><code>0.0.0.0</code></td>
+<td>Server bind address (Deno only)</td>
 </tr>
 <tr>
-<td><code>SWEEP_INTERVAL</code></td>
-<td><code>30</code></td>
-<td>Sweep every N bundles per EOA</td>
+<td><code>ENTRY_POINT_ADDRESS</code></td>
+<td><code>0x0000000071727De22E5E9d8BAf0edAc6f37da032</code></td>
+<td>EntryPoint v0.7</td>
+</tr>
+<tr>
+<td><code>BUNDLING_MODE</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> or <code>manual</code></td>
+</tr>
+<tr>
+<td><code>MAX_BUNDLE_SIZE</code></td>
+<td><code>10</code></td>
+<td>Max UserOps per bundle</td>
+</tr>
+<tr>
+<td><code>MAX_BUNDLE_GAS</code></td>
+<td><code>5000000</code></td>
+<td>Max gas per bundle</td>
+</tr>
+<tr>
+<td><code>AUTO_BUNDLE_INTERVAL_MS</code></td>
+<td><code>10000</code></td>
+<td>Auto-bundling interval (ms)</td>
 </tr>
 <tr>
 <td><code>OLD_OPERATOR_SECRETS</code></td>
 <td>—</td>
-<td>Old secrets for sweep (comma-separated)</td>
+<td>Old secrets for draining rotated EOAs (comma-separated)</td>
+</tr>
+<tr>
+<td><code>ALCHEMY_API_KEY</code></td>
+<td>—</td>
+<td>Alchemy API key for preferred RPCs</td>
+</tr>
+<tr>
+<td><code>USE_EIP1559</code></td>
+<td><code>true</code></td>
+<td>Enable EIP-1559 gas pricing</td>
+</tr>
+<tr>
+<td><code>BASE_FEE_MULTIPLIER</code></td>
+<td><code>1.25</code></td>
+<td>Base fee buffer multiplier</td>
+</tr>
+<tr>
+<td><code>BUNDLER_TIP_GWEI</code></td>
+<td><code>0.5</code></td>
+<td>Fallback priority fee (Gwei)</td>
+</tr>
+<tr>
+<td><code>MIN_PRIORITY_FEE_PER_GAS</code></td>
+<td><code>0</code></td>
+<td>Minimum priority fee (wei)</td>
+</tr>
+<tr>
+<td><code>MIN_PROFIT_MARGIN_BPS</code></td>
+<td><code>1000</code></td>
+<td>Minimum margin (10%)</td>
+</tr>
+<tr>
+<td><code>MAX_PROFIT_MARGIN_BPS</code></td>
+<td><code>15000</code></td>
+<td>Maximum margin cap</td>
+</tr>
+<tr>
+<td><code>API_RATE_LIMIT_PER_MINUTE</code></td>
+<td><code>60</code></td>
+<td>Rate limit per IP</td>
+</tr>
+<tr>
+<td><code>BALANCE_RESERVE_MULTIPLIER</code></td>
+<td><code>1</code></td>
+<td>Balance reserve multiplier</td>
 </tr>
 </tbody></table>
 <h2>Known Limitations</h2>
 <ul>
-<li><strong>No database</strong> — no billing history, profit reports. In-memory state lost on restart.</li>
-<li><strong>Single instance</strong> — no distributed locking.</li>
+<li><strong>No database</strong> — in-memory state lost on restart.</li>
+<li><strong>Single instance</strong> per deployment (Deno). CF Workers scale via Durable Objects.</li>
 <li><strong>No opcode tracing</strong> — ERC-7562 not implemented.</li>
 <li><strong>No aggregator support.</strong></li>
-<li><strong>Reorg risk</strong> — profitability checks apply to normal execution only.</li>
-<li><strong>Conservative restart</strong> — unknown pending nonce locks the EOA.</li>
+<li><strong>Conservative restart</strong> — unknown pending nonce locks the EOA until health loop recovers it.</li>
 </ul>
 <h2>License</h2>
 <p>MIT</p>

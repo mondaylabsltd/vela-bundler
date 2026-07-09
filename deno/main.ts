@@ -42,7 +42,32 @@ async function main() {
   const chainRegistry = new ChainRegistry(config, keyManager);
   const sponsorService = new SponsorService(config);
 
-  startRpcServer(config, chainRegistry, sponsorService);
+  const server = startRpcServer(config, chainRegistry, sponsorService);
+
+  // Graceful shutdown: stop accepting requests, stop all timers (no new bundles start while
+  // draining), then let in-flight HTTP requests finish. In-flight on-chain txs are recovered
+  // from chain nonce on next start (conservative-restart invariant), so we don't block on them.
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Vela Bundler] ${signal} received — draining…`);
+    chainRegistry.dispose();
+    try {
+      await server.shutdown();
+    } catch (err) {
+      console.error("[Vela Bundler] Error during server shutdown:", err);
+    }
+    console.log("[Vela Bundler] Shutdown complete.");
+  };
+  // SIGTERM: systemd stop/restart. SIGINT: Ctrl-C in a terminal.
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    try {
+      Deno.addSignalListener(sig, () => void shutdown(sig));
+    } catch {
+      // Some platforms don't support all signals — non-fatal.
+    }
+  }
 
   console.log(`[Vela Bundler] Ready — listening on ${config.host}:${config.port}`);
 }

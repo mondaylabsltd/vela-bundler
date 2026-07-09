@@ -155,11 +155,46 @@ Deno.test("validateUserOpFields - rejects zero callGasLimit", () => {
 });
 
 Deno.test("validateUserOpFields - rejects verificationGasLimit over MAX", () => {
+  // MAX_VERIFICATION_GAS is 5_000_000n (non-Tempo). Use a value strictly above it so the
+  // test tracks the constant instead of a hardcoded number that silently goes stale when
+  // the cap is raised.
   assertThrows(
-    () => validateUserOpFields(makeUserOp({ verificationGasLimit: 3_000_000n })),
+    () => validateUserOpFields(makeUserOp({ verificationGasLimit: 5_000_001n })),
     UserOpValidationError,
     "verificationGasLimit exceeds max",
   );
+});
+
+Deno.test("validateUserOpFields - accepts verificationGasLimit at MAX", () => {
+  // The boundary value must be accepted (regression guard against an off-by-one in the cap).
+  validateUserOpFields(makeUserOp({ verificationGasLimit: 5_000_000n }));
+});
+
+// uint128 packing bounds — a field ≥ 2^128 would throw inside packUint128; validation must
+// reject it cleanly (regression for O-20).
+const OVER_UINT128 = 1n << 128n;
+Deno.test("validateUserOpFields - rejects callGasLimit ≥ 2^128", () => {
+  assertThrows(() => validateUserOpFields(makeUserOp({ callGasLimit: OVER_UINT128 })), UserOpValidationError, "callGasLimit exceeds uint128");
+});
+Deno.test("validateUserOpFields - rejects maxFeePerGas ≥ 2^128", () => {
+  assertThrows(
+    () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128, maxPriorityFeePerGas: 0n })),
+    UserOpValidationError,
+    "maxFeePerGas exceeds uint128",
+  );
+});
+Deno.test("validateUserOpFields - rejects maxPriorityFeePerGas ≥ 2^128", () => {
+  // Keep priority ≤ maxFee so we reach the uint128 check rather than the ordering check;
+  // set both above the cap.
+  assertThrows(
+    () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128 + 1n, maxPriorityFeePerGas: OVER_UINT128 })),
+    UserOpValidationError,
+    "exceeds uint128",
+  );
+});
+Deno.test("validateUserOpFields - accepts fields at uint128 max boundary", () => {
+  const MAX = (1n << 128n) - 1n;
+  validateUserOpFields(makeUserOp({ callGasLimit: MAX, maxFeePerGas: MAX, maxPriorityFeePerGas: MAX }));
 });
 
 Deno.test("validateUserOpFields - rejects priority > maxFee", () => {
@@ -203,10 +238,22 @@ Deno.test("parseValidationData - zero means valid forever from zero aggregator",
 });
 
 Deno.test("parseValidationData - sig failure aggregator == 1", () => {
-  // aggregator = 1, validUntil = 0, validAfter = 0
-  const data = 1n << 96n;
+  // Canonical ERC-4337 v0.7: aggregator is the LOW 160 bits; SIG_VALIDATION_FAILED == 1.
+  const data = 1n;
   const result = parseValidationData(data);
   assertEquals(result.aggregator, "0x0000000000000000000000000000000000000001");
+});
+
+Deno.test("parseValidationData - time-bounded op has zero aggregator (accepted, not mis-read)", () => {
+  // Regression guard for the inverted-layout bug: a valid op with only validUntil set must
+  // parse aggregator == 0 (success), NOT a bogus nonzero value that would be rejected as
+  // "Aggregated signatures not supported".
+  const validUntil = 1893456000n; // 2030-01-01
+  const data = validUntil << 160n;
+  const result = parseValidationData(data);
+  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000000");
+  assertEquals(result.validUntil, 1893456000);
+  assertEquals(result.validAfter, 0);
 });
 
 Deno.test("isValidTimeRange - current time within range", () => {
