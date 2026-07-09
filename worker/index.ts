@@ -16,7 +16,7 @@ import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 export { BundlerDO } from "./bundler-do.ts";
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // CORS preflight
@@ -32,6 +32,13 @@ export default {
         `<p><a href="/health">/health</a></p></body></html>`,
         { headers: { "Content-Type": "text/html; charset=utf-8" } },
       );
+    }
+
+    // Per-chain health: GET /health/:chainId → the chain's DO (real degraded status: locked
+    // EOAs, pending receipts, circuit breaker). Read-only — does not force a chain init.
+    const perChainHealth = url.pathname.match(/^\/health\/(\d+)$/);
+    if (perChainHealth && request.method === "GET") {
+      return routeToDO(env, request, parseInt(perChainHealth[1]!), "/health");
     }
 
     // Global health

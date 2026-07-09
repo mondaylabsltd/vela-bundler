@@ -3,7 +3,7 @@
  * Convert README.md to deno/index.html for serving on "/".
  * Uses marked for markdown → HTML conversion + GitHub Markdown CSS.
  */
-import { marked } from "npm:marked@15";
+import { marked } from "marked";
 
 const markdown = await Deno.readTextFile(
   new URL("../README.md", import.meta.url),

@@ -77,5 +77,10 @@ export function loadConfig(treasuryAddress: `0x${string}`): BundlerConfig {
     apiRateLimitPerMinute: parseInt(env("API_RATE_LIMIT_PER_MINUTE", "60")),
     balanceReserveMultiplier: parseFloat(env("BALANCE_RESERVE_MULTIPLIER", "1")),
     alchemyApiKey: envOptional("ALCHEMY_API_KEY") ?? null,
+
+    telegramBotToken: envOptional("TELEGRAM_BOT_TOKEN") ?? null,
+    telegramChatId: envOptional("TELEGRAM_CHAT_ID") ?? null,
+    treasuryAlertThresholdWei: BigInt(env("TREASURY_ALERT_THRESHOLD_WEI", "20000000000000000")), // 0.02 ETH
+    treasuryAlertThresholdPathUsd: BigInt(env("TREASURY_ALERT_THRESHOLD_PATHUSD", "500000")), // 0.5 pathUSD (6-dec)
   };
 }

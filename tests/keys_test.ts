@@ -2,8 +2,8 @@
  * Tests for deterministic key derivation.
  */
 
-import { assertEquals, assert, assertNotEquals } from "@std/assert";
-import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { assertEquals, assert, assertNotEquals, assertRejects, assertThrows } from "@std/assert";
+import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress, validateOperatorSecret } from "../shared/keys/derive.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
 
 const TEST_SECRET =
@@ -201,4 +201,28 @@ Deno.test("deriveTreasuryAddress - different from per-user EOA", async () => {
   const treasury = await deriveTreasuryAddress(TEST_SECRET);
   const userEOA = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   assertNotEquals(treasury, userEOA);
+});
+
+// --- Secret validation (fail-closed on a malformed/weak OPERATOR_SECRET) ---
+
+Deno.test("validateOperatorSecret - rejects empty, non-hex, and too-short secrets", () => {
+  assertThrows(() => validateOperatorSecret(""), Error, "required");
+  assertThrows(() => validateOperatorSecret("0xnothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex__"), Error, "hex");
+  assertThrows(() => validateOperatorSecret("0x00"), Error, "at least 32 bytes");
+  // 31 bytes (62 hex chars) is below the floor.
+  assertThrows(() => validateOperatorSecret("0x" + "ab".repeat(31)), Error, "at least 32 bytes");
+  // Exactly 32 bytes is accepted (with and without 0x prefix).
+  validateOperatorSecret("0x" + "ab".repeat(32));
+  validateOperatorSecret("ab".repeat(32));
+});
+
+Deno.test("deriveTreasuryPrivateKey - rejects a malformed secret instead of deriving from zero bytes", async () => {
+  // Before the fix, non-hex chars were coerced to 0 bytes, silently deriving a WRONG-but-
+  // non-erroring treasury key on the public /v1/treasury path. Must now fail closed.
+  await assertRejects(() => deriveTreasuryPrivateKey("0xzz" + "ab".repeat(31)), Error);
+  await assertRejects(() => deriveTreasuryPrivateKey("0x1234"), Error, "at least 32 bytes");
+});
+
+Deno.test("deriveEOAPrivateKey - rejects a malformed secret", async () => {
+  await assertRejects(() => deriveEOAPrivateKey("0x1234", 1, ENTRY_POINT, SAFE_A), Error, "at least 32 bytes");
 });

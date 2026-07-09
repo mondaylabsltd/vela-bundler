@@ -8,7 +8,6 @@ import { isTempoChain } from "../shared/tempo.ts";
 import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
 
 const EOA_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
-const EOA_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
 
 // --- EOA Lock Manager ---
 

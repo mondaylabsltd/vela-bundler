@@ -29,10 +29,10 @@ Any EVM chain is supported automatically — the first request for a chain creat
 ## How It Works
 
 1. Each user's **safeAddress** gets a **dedicated bundler EOA**, deterministically derived from `(chainId, entryPoint, safeAddress, operatorSecret)`.
-2. Users deposit native tokens to their dedicated EOA.
+2. Users deposit native tokens to their dedicated EOA (or a `pathUSD` stablecoin float on Tempo).
 3. The bundler submits `handleOps` when the EOA has sufficient balance.
 4. Each bundle contains ops from **one safeAddress only**, signed by its dedicated EOA.
-5. Excess balance is periodically swept to the treasury.
+5. On native chains the `handleOps` **beneficiary is the `VelaGasSettlementSplitter`**, whose `receive()` splits the EntryPoint gas refund 50/50 between the EOA and the treasury. On Tempo the bundler is repaid by an in-band stablecoin transfer. (There is no periodic treasury sweep — that mechanism was removed in favor of the on-chain splitter.)
 
 No database — all state is derived or in-memory.
 
@@ -160,8 +160,13 @@ On CF Workers, global `/health` returns minimal info. Per-chain health available
 
 1. Generate new `OPERATOR_SECRET`
 2. Put old one in `OLD_OPERATOR_SECRETS` (comma-separated)
-3. New secret → new EOAs; old secret → old EOAs still derivable for draining
-4. Remove old secret once old EOAs are drained
+3. New secret → new EOAs; old secret → old EOAs still **derivable** (their addresses are surfaced on `GET /v1/account/...` as `oldDepositAddresses`)
+4. Remove old secret only once old EOAs are drained
+
+> ⚠️ There is **no built-in drain tool** in this repo — draining an old EOA is a manual,
+> out-of-band step (derive its key from the retained old secret and sweep it). Do **not** discard
+> the old secret until you have confirmed every old EOA is empty, or those funds become
+> unrecoverable. See `docs/project-takeover/08-open-issues.md`.
 
 ## Configuration
 
@@ -182,11 +187,11 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 | `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
 | `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |
 | `BUNDLER_TIP_GWEI` | `0.5` | Fallback priority fee (Gwei) |
-| `MIN_PRIORITY_FEE_PER_GAS` | `1000000` | Minimum priority fee (wei) |
+| `MIN_PRIORITY_FEE_PER_GAS` | `0` | Minimum priority fee (wei) |
 | `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum margin (10%) |
 | `MAX_PROFIT_MARGIN_BPS` | `15000` | Maximum margin cap |
 | `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
-| `BALANCE_RESERVE_MULTIPLIER` | `2` | Balance reserve multiplier |
+| `BALANCE_RESERVE_MULTIPLIER` | `1` | Balance reserve multiplier |
 
 ## Known Limitations
 

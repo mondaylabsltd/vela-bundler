@@ -47,5 +47,10 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     apiRateLimitPerMinute: parseInt(env.API_RATE_LIMIT_PER_MINUTE ?? "60"),
     balanceReserveMultiplier: parseFloat(env.BALANCE_RESERVE_MULTIPLIER ?? "1"),
     alchemyApiKey: env.ALCHEMY_API_KEY || null,
+
+    telegramBotToken: env.TELEGRAM_BOT_TOKEN || null,
+    telegramChatId: env.TELEGRAM_CHAT_ID || null,
+    treasuryAlertThresholdWei: BigInt(env.TREASURY_ALERT_THRESHOLD_WEI ?? "20000000000000000"), // 0.02 ETH
+    treasuryAlertThresholdPathUsd: BigInt(env.TREASURY_ALERT_THRESHOLD_PATHUSD ?? "500000"), // 0.5 pathUSD
   };
 }

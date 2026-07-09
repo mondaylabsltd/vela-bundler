@@ -15,6 +15,10 @@ import { BundlerService } from "../bundler/index.ts";
 import type { KeyManager } from "../keys/types.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { resolveRpcUrl, getPublicClient } from "../utils/rpc-client.ts";
+import { createAlerter, type Alerter } from "../monitoring/telegram.ts";
+import { checkTreasuryBalance } from "../monitoring/treasury.ts";
+import { checkOperationalHealth, DEFAULT_OPERATIONAL_THRESHOLDS } from "../monitoring/operational.ts";
+import { reliabilityHealth } from "../reliability/rpc-fetch.ts";
 
 export interface ChainServices {
   chainId: number;
@@ -52,16 +56,31 @@ const HEALTH_INTERVAL_MS = 30_000;
 /** Reputation decay interval — 1 hour (in ms). */
 const REPUTATION_DECAY_INTERVAL_MS = 60 * 60 * 1000;
 
+/**
+ * Max distinct chains retained. Each cached chain holds a mempool, account service, cached
+ * RPC client and TWO live setInterval timers (auto-bundle + receipt cleanup). Without a cap,
+ * an unauthenticated flood of bogus `POST /<chainId>` requests carrying a syntactically valid
+ * X-Rpc-Url (which resolveChain can't resolve, so it is cached under the user RPC) grows this
+ * map and the process timer count without bound → memory/CPU exhaustion of the fund-custody
+ * process. A real deployment serves a small, fixed set of chains, so this ceiling is generous;
+ * eviction only ever drops an IDLE chain (empty mempool, no pending receipts, no locked EOAs),
+ * whose state is losslessly re-derived from chain on next use.
+ */
+const MAX_CHAINS = 256;
+
 export class ChainRegistry {
   private chains: Map<number, ChainServices> = new Map();
   private initLocks: Map<number, Promise<ChainServices>> = new Map();
   private healthTimer?: ReturnType<typeof setInterval>;
   private lastDecayAt: number = Date.now();
+  private readonly alerter: Alerter;
 
   constructor(
     private readonly globalConfig: BundlerConfig,
     private readonly keyManager: KeyManager,
   ) {
+    // Telegram alerter (no-op unless TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are configured).
+    this.alerter = createAlerter(globalConfig);
     // Start global health loop
     this.healthTimer = setInterval(() => this.healthLoop(), HEALTH_INTERVAL_MS);
   }
@@ -80,11 +99,43 @@ export class ChainRegistry {
     this.initLocks.set(chainId, initPromise);
     try {
       const services = await initPromise;
+      this.evictIdleChainIfNeeded(chainId);
       this.chains.set(chainId, services);
       return services;
     } finally {
       this.initLocks.delete(chainId);
     }
+  }
+
+  /** True if a chain carries no in-flight work and can be evicted without losing custody state. */
+  private isChainIdle(chain: ChainServices): boolean {
+    return (
+      chain.mempool.size === 0 &&
+      chain.bundler.pendingReceiptCount === 0 &&
+      chain.accountService.lockManager.getLockedEOAs().length === 0
+    );
+  }
+
+  /**
+   * Before caching a new chain, if we are at capacity evict the oldest IDLE chain (Map iterates
+   * in insertion order) and dispose its timers. A busy chain (pending bundle/receipt/locked EOA)
+   * is never evicted — that would risk abandoning an in-flight settlement. If every chain is
+   * busy we keep them all and log; this is bounded in practice because a busy chain requires
+   * real on-chain activity (gas + balance) that a flood of bogus chainIds cannot manufacture.
+   */
+  private evictIdleChainIfNeeded(incomingChainId: number): void {
+    if (this.chains.size < MAX_CHAINS || this.chains.has(incomingChainId)) return;
+    for (const [id, chain] of this.chains) {
+      if (this.isChainIdle(chain)) {
+        chain.bundler.dispose();
+        this.chains.delete(id);
+        console.warn(`[ChainRegistry] Evicted idle chain ${id} at capacity (${MAX_CHAINS}).`);
+        return;
+      }
+    }
+    console.warn(
+      `[ChainRegistry] At capacity (${MAX_CHAINS}) with no idle chain to evict — possible resource pressure or chainId flood.`,
+    );
   }
 
   private async initChain(chainId: number, requestRpcUrl?: string): Promise<ChainServices> {
@@ -150,14 +201,72 @@ export class ChainRegistry {
    * - Decays reputation hourly.
    */
   private async healthLoop(): Promise<void> {
+    // Overlap guard: the loop is driven by setInterval, which does NOT wait for the async callback.
+    // Under RPC degradation one cycle (reconcile + recover + monitors, each with 5s RPC timeouts,
+    // across many chains) can exceed the interval; without this guard a second cycle would start and
+    // stack concurrent RPC work + risk racing the per-chain reconciler. Skip if one is still running.
+    if (this._healthRunning) return;
+    this._healthRunning = true;
+    try {
+      await this._healthLoopBody();
+    } finally {
+      this._healthRunning = false;
+    }
+  }
+  private _healthRunning = false;
+
+  private async _healthLoopBody(): Promise<void> {
     const now = Date.now();
     const shouldDecay = now - this.lastDecayAt >= REPUTATION_DECAY_INTERVAL_MS;
 
     for (const chain of this.chains.values()) {
+      // Durable reconciliation of in-flight bundles (unified with the Worker DO alarm): poll
+      // pending receipts, capture them, release reservations, and recover the EOA. Runs BEFORE
+      // recoverLockedEOAs so a just-confirmed bundle unlocks its EOA here rather than being chased
+      // by the nonce-based recovery.
+      try {
+        await chain.bundler.checkPendingReceipts();
+      } catch (err) {
+        console.error(`[Health] Chain ${chain.chainId} pending-receipt reconcile error:`, err);
+      }
+
       try {
         await this.recoverLockedEOAs(chain);
       } catch (err) {
         console.error(`[Health] Chain ${chain.chainId} recovery error:`, err);
+      }
+
+      // Treasury-balance monitor (deduped Telegram alert when low). No-op alerter if unconfigured.
+      try {
+        await checkTreasuryBalance({
+          chainId: chain.chainId,
+          chainName: chain.chainInfo?.name ?? null,
+          treasuryAddress: this.globalConfig.treasuryAddress,
+          client: getPublicClient(chain.rpcUrl),
+          thresholdWei: this.globalConfig.treasuryAlertThresholdWei,
+          thresholdPathUsd: this.globalConfig.treasuryAlertThresholdPathUsd,
+          alerter: this.alerter,
+        });
+      } catch (err) {
+        console.error(`[Health] Chain ${chain.chainId} treasury monitor error:`, err);
+      }
+
+      // Operational-health monitor: alert on any STUCK condition where a user's money can't move
+      // (stuck mempool op / unconfirmed bundle / locked EOA / degraded RPC). No-op if unconfigured.
+      try {
+        await checkOperationalHealth({
+          chainId: chain.chainId,
+          chainName: chain.chainInfo?.name ?? null,
+          oldestMempoolAgeMs: chain.mempool.oldestEntryAgeMs(),
+          lockedEoaCount: chain.accountService.lockManager.getLockedEOAs().length,
+          oldestLockedAgeMs: chain.accountService.lockManager.oldestLockedAgeMs(),
+          pendingReceiptCount: chain.bundler.pendingReceiptCount,
+          oldestPendingReceiptAgeMs: chain.bundler.oldestPendingReceiptAgeMs(),
+          circuitDegraded: reliabilityHealth().circuit.degraded,
+          reputationBannedSenders: chain.mempool.reputation.countPenalized("sender").banned,
+        }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
+      } catch (err) {
+        console.error(`[Health] Chain ${chain.chainId} operational monitor error:`, err);
       }
 
       // Hourly reputation decay
@@ -210,5 +319,21 @@ export class ChainRegistry {
 
   has(chainId: number): boolean {
     return this.chains.has(chainId);
+  }
+
+  /**
+   * Release all timers: the global health loop and every chain's bundler timers (auto-bundle
+   * + receipt cleanup). Called on graceful shutdown so no new bundle is started while the
+   * process is draining. In-flight on-chain txs are unaffected (recovered from chain nonce on
+   * the next start — see the "conservative restart" invariant). Safe to call more than once.
+   */
+  dispose(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
+    for (const chain of this.chains.values()) {
+      chain.bundler.dispose();
+    }
   }
 }

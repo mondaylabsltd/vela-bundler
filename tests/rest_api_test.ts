@@ -43,11 +43,15 @@ function mockConfig(): BundlerConfig {
     apiRateLimitPerMinute: 60,
     balanceReserveMultiplier: 1,
     alchemyApiKey: null,
+    telegramBotToken: null,
+    telegramChatId: null,
+    treasuryAlertThresholdWei: 0n,
+    treasuryAlertThresholdPathUsd: 0n,
   } as BundlerConfig;
 }
 
 function mockRateLimitConfig(): RateLimitConfig {
-  return { maxRequestsPerMinute: 1000 };
+  return { rateLimitPerMinute: 1000 };
 }
 
 function mockChainRegistry(): ChainRegistryLike {

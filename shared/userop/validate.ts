@@ -20,6 +20,11 @@ export class UserOpValidationError extends Error {
  *  ~3.9M gas — so it needs a higher verification-gas ceiling than the default 2M. */
 export const TEMPO_MAX_VERIFICATION_GAS = 8_000_000n;
 
+/** Largest value that fits in a packed uint128 slot (accountGasLimits / gasFees / paymaster
+ *  limits are each packed into 16 bytes via packUint128). A field at/above this would throw
+ *  deep inside packing; we reject it cleanly at validation instead. */
+export const MAX_UINT128 = (1n << 128n) - 1n;
+
 /**
  * Validate field-level constraints on a UserOperation before simulation.
  *
@@ -76,6 +81,19 @@ export function validateUserOpFields(userOp: UserOperation, tempo = false): void
     );
   }
 
+  // uint128 packing bounds — callGasLimit and the fee fields are each packed into a 16-byte
+  // slot; a value ≥ 2^128 would throw inside packUint128 and surface as a generic internal
+  // error. Reject cleanly here. (verificationGasLimit is already bounded well under this.)
+  if (userOp.callGasLimit > MAX_UINT128) {
+    throw new UserOpValidationError("callGasLimit exceeds uint128 range");
+  }
+  if (userOp.maxFeePerGas > MAX_UINT128) {
+    throw new UserOpValidationError("maxFeePerGas exceeds uint128 range");
+  }
+  if (userOp.maxPriorityFeePerGas > MAX_UINT128) {
+    throw new UserOpValidationError("maxPriorityFeePerGas exceeds uint128 range");
+  }
+
   // Signature
   if (!userOp.signature || userOp.signature === "0x") {
     throw new UserOpValidationError("signature is required");
@@ -104,12 +122,27 @@ export function validateUserOpFields(userOp: UserOperation, tempo = false): void
         `paymasterVerificationGasLimit exceeds MAX_VERIFICATION_GAS (${MAX_VERIFICATION_GAS})`,
       );
     }
+    if (
+      userOp.paymasterPostOpGasLimit !== null &&
+      userOp.paymasterPostOpGasLimit !== undefined &&
+      userOp.paymasterPostOpGasLimit > MAX_UINT128
+    ) {
+      throw new UserOpValidationError("paymasterPostOpGasLimit exceeds uint128 range");
+    }
   }
 }
 
 /**
  * Parse validationData into aggregator, validAfter, validUntil.
- * validationData format: 20-byte aggregator | 6-byte validUntil | 6-byte validAfter
+ *
+ * Canonical ERC-4337 v0.7 packing (EntryPoint `_packValidationData`), LSB-first:
+ *   validationData = uint160(aggregator)
+ *                  | (uint48(validUntil) << 160)
+ *                  | (uint48(validAfter) << 208)
+ * where aggregator == address(0) means SUCCESS and aggregator == address(1) means
+ * SIG_VALIDATION_FAILED. The aggregator therefore occupies the LOW 160 bits — an earlier
+ * revision read it from the high bits, which silently mis-parsed every signature-failure
+ * (0x01 → 0x00, read as success) and every time-bounded op (validUntil in the wrong bits).
  */
 export function parseValidationData(validationData: bigint): {
   aggregator: `0x${string}`;
@@ -117,9 +150,9 @@ export function parseValidationData(validationData: bigint): {
   validUntil: number;
 } {
   const aggregator = ("0x" +
-    (validationData >> 96n).toString(16).padStart(40, "0")) as `0x${string}`;
-  const validUntil = Number((validationData >> 48n) & 0xFFFFFFFFFFFFn);
-  const validAfter = Number(validationData & 0xFFFFFFFFFFFFn);
+    (validationData & ((1n << 160n) - 1n)).toString(16).padStart(40, "0")) as `0x${string}`;
+  const validUntil = Number((validationData >> 160n) & 0xFFFFFFFFFFFFn);
+  const validAfter = Number((validationData >> 208n) & 0xFFFFFFFFFFFFn);
 
   return {
     aggregator,

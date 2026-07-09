@@ -1,0 +1,60 @@
+# Minimal CI gate — mirrors the local checks documented in
+# docs/project-takeover/02-local-development.md.
+#
+# No deployment coupling: both runtimes deploy manually (`deno task deploy`
+# over SSH for the Deno server, `npx wrangler deploy` for the Worker — see
+# docs/project-takeover/05-deployment-runbook.md). CI green ≠ deployed; these
+# jobs are the merge gate only.
+#
+# Deliberately NOT included:
+#   - `deno task e2e`: boots a live server and runs load/perf dimensions, and
+#     fires a real Telegram alert when creds are present; run locally per the
+#     runbook. Promote to CI once it has a proven-stable record on a runner.
+#   - tests/integration_test.ts: self-skips ("ignored") when no bundler is
+#     listening on localhost — it never runs here, only against a live stack.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  deno:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Lint + typecheck
+        run: deno task lint
+      - name: Tests
+        run: deno task test
+      - name: Homepage build
+        run: deno task build
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Worker tests (vitest, workerd pool)
+        run: npm run test:worker
+
+  contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: evm_contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Forge tests
+        run: forge test

@@ -2,11 +2,13 @@
  * Tests for worker/config.ts — buildConfig from CF Worker env bindings.
  */
 
-import { assertEquals, assertNotEquals } from "@std/assert";
+import { assertEquals } from "@std/assert";
 
-// We can't import worker/config.ts directly (it uses CF types),
-// so we test the logic by reimplementing the config builder pattern.
-// These tests verify the shared config/types.ts contract.
+// worker/config.ts cannot be imported here: worker/types.ts references the Cloudflare
+// ambient type `DurableObjectNamespace`, which `deno check` cannot resolve. The AUTHORITATIVE
+// executable coverage of buildConfig lives in worker/tests/config.test.ts (vitest + miniflare,
+// where CF types exist). These Deno tests pin the shared config contract and the exact env
+// parse expressions worker/config.ts uses, via typed helpers (not dead literal expressions).
 
 import type { BundlerConfig } from "../shared/config/types.ts";
 
@@ -38,6 +40,10 @@ Deno.test("BundlerConfig defaults — all optional fields have sensible defaults
     apiRateLimitPerMinute: 60,
     balanceReserveMultiplier: 1,
     alchemyApiKey: null,
+    telegramBotToken: null,
+    telegramChatId: null,
+    treasuryAlertThresholdWei: 0n,
+    treasuryAlertThresholdPathUsd: 0n,
   };
 
   assertEquals(config.bundlingMode, "auto");
@@ -60,18 +66,20 @@ Deno.test("BundlerConfig — walletGasMarkup calculation matches formula", () =>
 });
 
 Deno.test("BundlerConfig — useEip1559 env parsing", () => {
-  // Simulate the logic: (env.USE_EIP1559 ?? "true") === "true"
-  assertEquals(("true" ?? "true") === "true", true);
-  assertEquals(("false" ?? "true") === "true", false);
-  assertEquals((undefined ?? "true") === "true", true);
+  // Mirrors worker/config.ts:37 `(env.USE_EIP1559 ?? "true") === "true"` — via a typed
+  // helper so it tests the real expression rather than a compile-time-constant literal.
+  const parseEip1559 = (v: string | undefined): boolean => (v ?? "true") === "true";
+  assertEquals(parseEip1559("true"), true);
+  assertEquals(parseEip1559("false"), false);
+  assertEquals(parseEip1559(undefined), true);
+  assertEquals(parseEip1559("anything-else"), false);
 });
 
 Deno.test("BundlerConfig — oldOperatorSecrets CSV parsing", () => {
-  const raw = "0xaa,0xbb, 0xcc ,";
-  const parsed = raw.split(",").map(s => s.trim()).filter(Boolean);
-  assertEquals(parsed, ["0xaa", "0xbb", "0xcc"]);
-
-  const empty = "";
-  const parsedEmpty = empty.split(",").map(s => s.trim()).filter(Boolean);
-  assertEquals(parsedEmpty, []);
+  // Mirrors worker/config.ts:44 / deno/config.ts:30 CSV parse.
+  const parseCsv = (v: string | undefined): string[] =>
+    (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  assertEquals(parseCsv("0xaa,0xbb, 0xcc ,"), ["0xaa", "0xbb", "0xcc"]);
+  assertEquals(parseCsv(""), []);
+  assertEquals(parseCsv(undefined), []);
 });

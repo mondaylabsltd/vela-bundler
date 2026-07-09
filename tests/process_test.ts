@@ -42,6 +42,10 @@ const mockConfig = {
   apiRateLimitPerMinute: 60,
   balanceReserveMultiplier: 1,
   alchemyApiKey: null,
+  telegramBotToken: null,
+  telegramChatId: null,
+  treasuryAlertThresholdWei: 0n,
+  treasuryAlertThresholdPathUsd: 0n,
 };
 
 const reqCtx: RequestContext = { chainId: 1 };

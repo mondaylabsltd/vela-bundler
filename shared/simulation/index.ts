@@ -388,7 +388,7 @@ export function createSimulator(config: BundlerConfig) {
 
       console.log(`[Simulator] simulateHandleOp OK: paid=${paid} targetSuccess=${targetSuccess}`);
       return { success: true, targetSuccess: true, targetResult, paid };
-    } catch (err) {
+    } catch {
       return {
         success: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
@@ -531,7 +531,7 @@ export function createSimulator(config: BundlerConfig) {
 
       console.log(`[Simulator] simulateValidation OK: preOpGas=${validationResult.preOpGas} prefund=${validationResult.prefund}`);
       return { valid: true, validationResult };
-    } catch (err) {
+    } catch {
       return {
         valid: false,
         errorCode: RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,

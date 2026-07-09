@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-explicit-any -- partial `as any` mocks of AccountService/Simulator/etc.
 /**
  * Tests for BundlerService (shared/bundler/index.ts).
  *
@@ -5,7 +6,7 @@
  * public API without requiring real RPC connections.
  */
 
-import { assertEquals, assert, assertExists } from "@std/assert";
+import { assertEquals, assertExists } from "@std/assert";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { Mempool } from "../shared/mempool/index.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
@@ -95,14 +96,14 @@ function mockAccountService(): AccountService {
 
 Deno.test("BundlerService - constructor sets manual mode", () => {
   const config = mockConfig({ bundlingMode: "manual" });
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
   assertExists(service);
 });
 
 Deno.test("BundlerService - tryBundle returns empty mempool error", async () => {
   const config = mockConfig();
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const result = await service.tryBundle();
@@ -113,7 +114,7 @@ Deno.test("BundlerService - tryBundle returns empty mempool error", async () => 
 
 Deno.test("BundlerService - getReceipt returns undefined for unknown hash", () => {
   const config = mockConfig();
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const receipt = service.getReceipt("0x" + "ab".repeat(32));
@@ -122,7 +123,7 @@ Deno.test("BundlerService - getReceipt returns undefined for unknown hash", () =
 
 Deno.test("BundlerService - getUserOpByHash returns undefined for unknown hash", () => {
   const config = mockConfig();
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const result = service.getUserOpByHash("0x" + "ab".repeat(32));
@@ -131,7 +132,7 @@ Deno.test("BundlerService - getUserOpByHash returns undefined for unknown hash",
 
 Deno.test("BundlerService - cleanExpiredReceipts is callable", () => {
   const config = mockConfig();
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   // Should not throw even with empty receipt store
@@ -140,7 +141,7 @@ Deno.test("BundlerService - cleanExpiredReceipts is callable", () => {
 
 Deno.test("BundlerService - setBundlingMode to auto then manual", () => {
   const config = mockConfig({ bundlingMode: "manual" });
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   // Switch to auto — with disableTimers this won't start real timers
@@ -152,7 +153,7 @@ Deno.test("BundlerService - setBundlingMode to auto then manual", () => {
 
 Deno.test("BundlerService - stopAutoBundling is idempotent", () => {
   const config = mockConfig({ bundlingMode: "manual" });
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   // Calling stop when not started should be safe
@@ -160,9 +161,22 @@ Deno.test("BundlerService - stopAutoBundling is idempotent", () => {
   service.stopAutoBundling();
 });
 
+Deno.test("BundlerService - dispose() releases timers and is idempotent (chain-eviction safety)", () => {
+  // A chain evicted from the registry calls bundler.dispose() to release BOTH the auto-bundle
+  // and the receipt-cleanup interval, so a flood of distinct chainIds can't leak timers.
+  const config = mockConfig({ bundlingMode: "auto" });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
+  // disableTimers:false so the receipt-cleanup interval is actually created (then disposed).
+  const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: false });
+  service.startAutoBundling();
+  // Must not throw and must be safe to call twice (leaves no live intervals to leak the test runner).
+  service.dispose();
+  service.dispose();
+});
+
 Deno.test("BundlerService - checkPendingReceipts does nothing when empty", async () => {
   const config = mockConfig();
-  const mempool = new Mempool({ maxMempoolSize: 100, maxPendingPerSender: 5, maxStakedPendingPerSender: 10, entryPointAddress: ENTRY_POINT });
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   // Should complete without error

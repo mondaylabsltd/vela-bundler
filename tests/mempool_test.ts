@@ -236,18 +236,17 @@ Deno.test("ReputationManager - decay reduces counts", () => {
   assertEquals(entry!.opsSeen, 50); // halved
 });
 
-Deno.test("Mempool - rejects banned sender", () => {
+Deno.test("Mempool - does NOT reject a banned sender (custodial: reputation is a rate limit, not a block)", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const sender = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
-  // Force ban
+  // Force "banned" reputation. In this per-Safe custodial model the sender must still be able to
+  // move its money — a banned sender is rate-limited (1 pending op), never hard-blocked.
   mempool.reputation.setReputation(sender, "sender", 100, 0, "banned");
 
-  assertThrows(
-    () => mempool.add(makeUserOp({ sender })),
-    UserOpValidationError,
-    "banned",
-  );
+  const hash = mempool.add(makeUserOp({ sender }));
+  assertEquals(typeof hash, "string");
+  assertEquals(mempool.size, 1);
 });
 
 Deno.test("Mempool - rejects banned paymaster", () => {

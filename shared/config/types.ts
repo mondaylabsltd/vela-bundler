@@ -60,4 +60,14 @@ export interface BundlerConfig {
 
   /** Alchemy API key. When set, Alchemy RPCs are preferred for supported chains. */
   readonly alchemyApiKey: string | null;
+
+  // --- Monitoring / alerting (optional; all disabled when unset) ---
+  /** Telegram bot token for operational alerts. Alerts are disabled when null. */
+  readonly telegramBotToken: string | null;
+  /** Telegram chat id that alerts are sent to. Alerts are disabled when null. */
+  readonly telegramChatId: string | null;
+  /** Alert when a chain's treasury native balance falls below this (wei). Default 0.02 ETH. */
+  readonly treasuryAlertThresholdWei: bigint;
+  /** Alert when a Tempo chain's treasury pathUSD balance falls below this (6-dec units). Default 0.5 pathUSD. */
+  readonly treasuryAlertThresholdPathUsd: bigint;
 }

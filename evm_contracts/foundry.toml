@@ -4,13 +4,18 @@ out = "out"
 libs = ["lib"]
 
 # Deterministic, cross-chain-portable creation code for CREATE2 deployment.
-# - bytecode_hash = "none": drop the trailing solc metadata (IPFS) CBOR so the
-#   creation code is a pure function of (source, solc, optimizer, evm_version).
-#   The VelaGasSettlementSplitter address is derived off-chain in BOTH the bundler
-#   and the wallet from this exact creation code; a metadata drift would change the
-#   address and silently misroute the beneficiary payout.
-# - evm_version = "paris": no PUSH0, so the same bytecode deploys on every chain
-#   (including pre-Shanghai) via the deterministic CREATE2 factory.
+# The creation code is a pure function of (source, solc, optimizer, evm_version), and the
+# VelaGasSettlementSplitter address is derived off-chain in BOTH the bundler and the wallet from
+# this exact creation code — so ALL of those inputs must be PINNED, or the bytecode (and the
+# splitter address) drifts and beneficiary payouts are silently misrouted.
+# - solc: PINNED to 0.8.28 — the version the pinned SPLITTER_CREATION_CODE + golden vectors were
+#   built with. Without this, CI/toolchains float to the latest solc (e.g. 0.8.35), which emits
+#   different bytecode and fails the golden-vector tests.
+# - optimizer = false: pinned explicitly (matches the golden build) — optimizer settings change bytecode.
+# - bytecode_hash = "none": drop the trailing solc metadata (IPFS) CBOR.
+# - evm_version = "paris": no PUSH0, so the same bytecode deploys on every chain (incl. pre-Shanghai).
+solc = "0.8.28"
+optimizer = false
 bytecode_hash = "none"
 evm_version = "paris"
 

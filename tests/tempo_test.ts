@@ -46,6 +46,20 @@ function buildBatch(calls: { to: Hex; data: Hex }[]): Hex {
   });
 }
 
+/** Pack a MultiSend leg with an explicit operation byte (0 = CALL, 1 = DELEGATECALL). */
+function packTxOp(to: Hex, data: Hex, operation: number): Hex {
+  const len = BigInt((data.length - 2) / 2);
+  return encodePacked(
+    ["uint8", "address", "uint256", "uint256", "bytes"],
+    [operation, to, 0n, len, data],
+  );
+}
+function buildBatchOps(calls: { to: Hex; data: Hex; operation: number }[]): Hex {
+  const packed = concat(calls.map((c) => packTxOp(c.to, c.data, c.operation)));
+  const msData = encodeFunctionData({ abi: multiSend, functionName: "multiSend", args: [packed] });
+  return encodeFunctionData({ abi: execUserOp, functionName: "executeUserOp", args: [MULTI_SEND, 0n, msData, 1] });
+}
+
 const transfer = (to: Hex, amount: bigint): Hex =>
   encodeFunctionData({ abi: erc20, functionName: "transfer", args: [to, amount] });
 
@@ -118,6 +132,24 @@ Deno.test("parseTempoReimbursement matches a LOWERCASE recipient (bundler passes
 Deno.test("parseTempoReimbursement returns 0 for non-batch callData (no crash)", () => {
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
   assertEquals(parseTempoReimbursement("0xdeadbeef", eoa, PATHUSD), 0n);
+});
+
+Deno.test("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no-op-reimbursement drain)", () => {
+  const eoa = getAddress("0x1111111111111111111111111111111111111111");
+  // A DELEGATECALL (operation=1) to the feeToken with transfer(EOA, amt) calldata runs the
+  // token's code against the SAFE's storage — it does NOT move any feeToken to the bundler —
+  // yet its face value would be counted as reimbursement if the operation byte were ignored.
+  const delegatecallOnly = buildBatchOps([
+    { to: PATHUSD, data: transfer(eoa, 9_999_999n), operation: 1 },
+  ]);
+  assertEquals(parseTempoReimbursement(delegatecallOnly, eoa, PATHUSD), 0n);
+
+  // Mixed batch: only the real CALL leg counts; the delegatecall leg is ignored.
+  const mixed = buildBatchOps([
+    { to: PATHUSD, data: transfer(eoa, 9_999_999n), operation: 1 }, // fake (delegatecall)
+    { to: PATHUSD, data: transfer(eoa, 1234n), operation: 0 }, // real (call)
+  ]);
+  assertEquals(parseTempoReimbursement(mixed, eoa, PATHUSD), 1234n);
 });
 
 // --- tempoHandleOpsGasLimit: the outer-0x76 gas must cover declared op limits ---

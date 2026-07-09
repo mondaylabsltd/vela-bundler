@@ -28,4 +28,10 @@ export interface Env {
   AUTO_BUNDLE_INTERVAL_MS?: string;
   API_RATE_LIMIT_PER_MINUTE?: string;
   BALANCE_RESERVE_MULTIPLIER?: string;
+
+  // Monitoring / alerting (optional)
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
+  TREASURY_ALERT_THRESHOLD_WEI?: string;
+  TREASURY_ALERT_THRESHOLD_PATHUSD?: string;
 }

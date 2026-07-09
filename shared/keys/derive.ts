@@ -21,6 +21,25 @@ const SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0
 const DOMAIN_SEPARATOR = "vela-bundler-dedicated-eoa-v1";
 
 /**
+ * Validate an operator secret before it is used to derive any key. Fails closed on a
+ * malformed or too-short secret. This is the single guard every derivation path passes
+ * through, so the public treasury/EOA derivations (which run BEFORE any KeyManager is
+ * constructed — e.g. the /v1/treasury endpoint) can never silently derive from garbage.
+ */
+export function validateOperatorSecret(secret: string, label = "operatorSecret"): void {
+  if (!secret) throw new Error(`${label} is required`);
+  const clean = secret.startsWith("0x") ? secret.slice(2) : secret;
+  if (!/^[0-9a-fA-F]+$/.test(clean)) {
+    throw new Error(`${label} must be a hex string (with or without 0x prefix)`);
+  }
+  if (clean.length < 64) {
+    throw new Error(
+      `${label} must be at least 32 bytes (64 hex chars), got ${Math.floor(clean.length / 2)} bytes`,
+    );
+  }
+}
+
+/**
  * Derive a valid secp256k1 private key deterministically.
  *
  * @param operatorSecret - High-entropy master secret (hex string).
@@ -35,6 +54,8 @@ export async function deriveEOAPrivateKey(
   entryPoint: `0x${string}`,
   safeAddress: `0x${string}`,
 ): Promise<`0x${string}`> {
+  validateOperatorSecret(operatorSecret);
+
   // Normalize inputs
   const normalizedEntryPoint = entryPoint.toLowerCase();
   const normalizedSafeAddress = safeAddress.toLowerCase();
@@ -83,6 +104,7 @@ const TREASURY_INFO = "treasury";
 export async function deriveTreasuryPrivateKey(
   operatorSecret: string,
 ): Promise<`0x${string}`> {
+  validateOperatorSecret(operatorSecret);
   const ikm = hexToBytes(operatorSecret);
   const salt = new TextEncoder().encode(DOMAIN_SEPARATOR);
   const infoBytes = new TextEncoder().encode(TREASURY_INFO);
@@ -173,7 +195,13 @@ function hexToBytes(hex: string): Uint8Array {
   }
   const bytes = new Uint8Array(clean.length / 2);
   for (let i = 0; i < clean.length; i += 2) {
-    bytes[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+    const byte = parseInt(clean.slice(i, i + 2), 16);
+    // Never silently coerce a non-hex pair to 0 — that would derive keys from a corrupted
+    // secret without any error. Fail closed instead.
+    if (Number.isNaN(byte)) {
+      throw new Error("Invalid hex string: contains non-hex characters");
+    }
+    bytes[i / 2] = byte;
   }
   return bytes;
 }

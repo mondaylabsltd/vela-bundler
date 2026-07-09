@@ -4,7 +4,7 @@
  * not free text, and that the transient/permanent/poison split is correct.
  */
 
-import { assertEquals } from "@std/assert";
+import { assertEquals, assert } from "@std/assert";
 import {
   classifyError,
   classifyHttpStatus,
@@ -14,6 +14,30 @@ import {
   CircuitOpenError,
   DeadlineExceededError,
 } from "../shared/reliability/errors.ts";
+import { redactError } from "../shared/reliability/log.ts";
+
+// --- redactError (O-15: don't leak the Alchemy key via a viem error message) ---
+
+Deno.test("redactError - strips the API key from an Alchemy URL in an error message", () => {
+  const err = new Error("HTTP request failed. URL: https://eth-mainnet.g.alchemy.com/v2/SECRETKEY1234567890abcdef");
+  const out = redactError(err);
+  assert(!out.includes("SECRETKEY1234567890abcdef"), `key leaked: ${out}`);
+  assert(out.includes("eth-mainnet.g.alchemy.com"), "host should be kept for debuggability");
+});
+
+Deno.test("redactError - redacts a query-string key and handles non-Error input", () => {
+  const out = redactError(new Error("failed calling https://rpc.example.com/?apikey=topsecretvalue now"));
+  assert(!out.includes("topsecretvalue"), `query key leaked: ${out}`);
+  assertEquals(typeof redactError("plain string, no url"), "string");
+});
+
+Deno.test("redactError - strips a Telegram bot token from a fetch error (O-15 / monitoring leak)", () => {
+  // The Telegram sendMessage URL embeds the bot token as a path segment.
+  const err = new Error("error sending request for url (https://api.telegram.org/bot7654321:AAExampleBotTokenValue/sendMessage): connection refused");
+  const out = redactError(err);
+  assert(!out.includes("7654321:AAExampleBotTokenValue"), `bot token leaked: ${out}`);
+  assert(out.includes("api.telegram.org"), "host kept for debuggability");
+});
 
 Deno.test("classifyHttpStatus - 429 is transient + rate-limited reason", () => {
   const c = classifyHttpStatus(429);
