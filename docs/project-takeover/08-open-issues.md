@@ -51,23 +51,93 @@ money; any intervention-worthy state must Telegram-alert.**
   ([bundler/index.ts:632](../../shared/bundler/index.ts#L632)), so a submitted-but-stuck bundle alerts
   via stuck-eoa at 3 min regardless of runtime. Coverage is complete; only the alert's specificity differs.
 
+## Closed — round 4: total-alerting + robustness pass (2026-07-10)
+A 42-agent audit (6 finder dimensions → dedup → adversarial verify: 34 confirmed / 1 refuted)
+followed by a full implementation pass. Operator requirement: **every developer-intervention
+state (code bug OR needs top-up) must reach Telegram; no more silent stuck money; performance
+is a money property (5-min trading windows).** Each fix has a regression test
+(`tests/hardening_round4_test.ts`, `tests/monitoring_test.ts` additions).
+
+**Money-stuck correctness:**
+- **#9 CLOSED** — broadcast pins the outer nonce (trusted RPC) and the dropped verdict is
+  PROOF-based: only `latestNonce > txNonce` for 3 consecutive probes counts; the "pending"
+  tag can no longer fabricate failed receipts for in-flight txs. EOA recovery is equally
+  proof-gated (`inFlightNonce` on the lock; blind/failed reads never unlock).
+- **#3 CLOSED** — mempool age + TTL measured from `firstSeenAt` (survives fee-bump replacement).
+- **#6 CLOSED** — automatic same-nonce fee-bump for stuck txs: ≥12.5% raise toward current
+  base fee, max 2 bumps, hard ceiling 2× the bundle's revenue cap (bounded loss, inclusion-first
+  per O-1); all broadcast hashes polled for the receipt.
+- **Ambiguous broadcast outcomes** (timeout / "already known" / raced retry) are now tracked as
+  pending receipts under a PRE-COMPUTED tx hash (sign-locally + sendRawTransaction split) instead
+  of being declared failed — closes the double-position vector for the trading bot.
+- **All definitive drops store terminal receipts** (re-validation, bundle-sim, expiry — same as
+  the TTL hook), and initEOA carries a version stamp so a concurrent refresh can't clobber a
+  fresh lock (await-overwrite race). `/v1/account` no longer lets a user RPC write lock state.
+- **Worker persistence**: accepted-unbundled mempool ops and terminal receipts now persist to DO
+  storage (per-hash keys) — a deploy/eviction can no longer vanish accepted ops or regress
+  receipt polls; `feeToken` survives the round-trip.
+
+**Alert coverage (Telegram):**
+- Broadcast failure streak (`submit-failing`) + insufficient-funds EOA (`eoa-underfunded`, names
+  the address) — submit failures used to delete their ops and reset every age-based alert.
+- Balance gate re-based on the node's actual prefund rule (estimatedGas × maxFeePerGas) so the
+  silent bounce band is gone (ops stay in the mempool where stuck-mempool sees them).
+- Sponsor: `sponsor-depleted` (with shortfall), `sponsor-transfer-failed`,
+  `sponsor-passkey-index-down` (outage now distinct from "not registered" → REST 503 retryable);
+  Tempo empty-float refills bypass the 5-min cooldown (60s floor).
+- Treasury: dynamic threshold (raised to the sponsor's fail-closed floor at current gas price —
+  the 0.02 ETH dead zone is gone) + `treasury-unreadable` after 10 failed read cycles.
+- Code errors: `RepeatedErrorEscalator` pages when the SAME phase fails 3 consecutive cycles
+  (both runtimes); Deno global `unhandledrejection`/`error` hooks page + keep the process alive;
+  Worker DO alarm re-arms FIRST and any body error pages; chain-init failure streak pages
+  (alerter now built in the DO constructor — init errors were unalertable before).
+- Alerting misconfig: loud startup log + `alerting: "telegram"|"disabled"` in /health;
+  money-stuck alerts re-fire every 10 min with "STILL FIRING — reminder #N" escalation.
+- Dead-man switch, 3 layers: ✅ alive heartbeat every 6h (both runtimes; silence = dead),
+  systemd `OnFailure=vela-bundler-alert.service` Telegram push (Deno), and a 5-min Workers cron
+  that probes ACTIVE_CHAINS DOs and re-arms + alerts on a broken alarm chain.
+
+**Performance / resilience:**
+- **Ingress bundle kick**: `eth_sendUserOperation` triggers bundling immediately (Deno inline,
+  Worker `setAlarm(now)`) — up to a full alarm interval of latency removed per op.
+- **O-6 mitigated**: Deno health loop runs chains CONCURRENTLY (60s per-chain cap); broadcast
+  transport tuned (10s timeout, 1 retry); `simulateBundle` now honours its deadline (the
+  estimateGas leg escaped it entirely); Worker honours AUTO_BUNDLE_INTERVAL_MS (O-12 remainder).
+- getGasPrices throws (retryable degraded) when ALL price reads fail instead of quoting 0x0.
+- RATE_LIMIT_ALLOWLIST exempts the operator's own bot; 429s log structured.
+- process.ts forwards ONLY factory-built errors (marker symbol) — unmarked upstream objects are
+  redacted internal errors. Strict numeric env validation fails fast at startup (Deno).
+
 ## Remaining — documented limitations (mitigated; recommended follow-ups)
-- **Deno reconciliation is less durable than Worker** (#5/#8): Deno reconciles via a background
-  promise, Worker via durable pending-receipts + alarm. Mitigated (10-min poll + stuck-eoa alert +
-  health-loop EOA recovery), but for heavy Deno production use, unify Deno onto the pending-receipt
-  model. **Production target is Cloudflare Workers, where reconciliation is already durable.**
-- **#9 RPC without reliable `pending` nonce** can prematurely mark an EOA ACTIVE / falsely declare a
-  tx dropped ([eoa-lock.ts:104](../../shared/account/eoa-lock.ts#L104)). Mitigation: the config prefers
-  Alchemy (which supports `pending`). Recommend: gate the "dropped" verdict on a proven `latestNonce`
-  advance rather than an absent `pending` read.
-- **#3 fee-bump replacement resets the mempool-age clock**, so a wallet that keeps replacing an op can
-  mask the stuck-mempool alert. Low impact (a higher-fee replacement usually clears the stuck cause);
-  recommend tracking age from the first (sender,nonce) sighting.
-- **#6 no automatic rebroadcast/cancel** for a stuck underpriced tx — recovery is operator-manual
-  (the stuck-eoa alert points them at the tx). Recommend an operator-triggered same-nonce replace.
-- **#10 per-user Tempo gas-account "empty" alert** — the treasury-low alert covers the funding source
-  and the wallet gets a failed receipt to trigger re-sponsor; a dedicated per-gas-account alert needs
-  Tempo integration testing before shipping.
+- **Deno reconciliation is less durable than Worker** (#5/#8): Deno keeps pending receipts
+  in-memory (Worker persists them + mempool + terminal receipts to DO storage). Mitigated
+  (nonce-proof recovery + stuck-eoa alert + boot ping makes restarts visible), but for heavy
+  Deno production use add a file-backed `setPersistPendingHook`. **Production target is
+  Cloudflare Workers, where reconciliation, mempool and receipts are all durable.**
+- **Tempo ambiguous submit** (sync-submit timeout): no pre-computed 0x76 hash (viem's Tempo
+  extension owns the serialization), so the ops are removed with NO receipt (honest unknown,
+  never a fabricated failure). The outer nonce IS pinned pre-submit, so the EOA locks with
+  nonce proof (no heuristic unlock while the 0x76 may still land) and `submit-failing` alerts.
+  Follow-up: split sign/broadcast in `submitTempoBundle` to pre-compute the hash and
+  reconcile like native.
+- **Post-review accepted trade-offs** (adversarial review 2026-07-10, documented not fixed):
+  submit-failure/underfunded signals are per-chain single cells (a busy multi-user chain can
+  mask one EOA's failures behind another's successes — the stuck-mempool alert still covers
+  the ops themselves); fee-bump policy constants (45s / 2 bumps / 2× revenue cap) are
+  compile-time, not config; the Workers liveness cron
+  enumerates a self-registering chain-registry DO (no manual list; ACTIVE_CHAINS was
+  removed), probes are storage-only, and fully-idle chains stop their own alarm (the
+  ingress kick re-arms on the next accepted op) so abandoned user-RPC testnets go quiet
+  instead of self-alarming forever; the per-chain monitor sequence
+  is duplicated between the Deno registry and the Worker DO (new snapshot fields must be
+  threaded through both).
+- **#10 per-user Tempo gas-account "empty" alert** — the refill path now bypasses the cooldown
+  for a verifiably-empty float and `sponsor-depleted` covers the funding source; a dedicated
+  per-gas-account low-float alert still needs Tempo integration testing before shipping.
+- **O-5 (viem calls bypass the circuit breaker)**: narrowed, not closed — the broadcast leg is
+  timeout-tuned and `simulateBundle`'s estimateGas now rides `rpcCall` (breaker + deadline), but
+  balance/nonce/receipt reads still use plain viem transports (bounded 5s timeout + 2 retries).
+  Full closure = a viem `custom()` transport over `rpcCall`; do it as its own reviewed change.
 
 ## Evidence-based decisions — NOT changed (with rationale)
 - **O-1** (splitter 50% haircut vs profit floor) — **RESOLVED as a correct design choice, not a blocker.**

@@ -621,52 +621,57 @@ export function createSimulator(config: BundlerConfig) {
     beneficiary: `0x${string}`,
     from?: `0x${string}`,
     rpcUrlOverride?: string,
-    _deadline?: Deadline,
+    deadline?: Deadline,
   ): Promise<BundleSimulationResult> {
-    const client = clientFor(rpcUrlOverride);
     // `beneficiary` is only the encoded handleOps arg; `from` is the actual outer-tx sender
     // (the bundler EOA / tx.origin). They differ once the beneficiary is the splitter — the
     // splitter distributes to tx.origin, so simulating with from=splitter would self-reference.
     const caller = from ?? beneficiary;
     const calldata = encodeHandleOps(packedOps, beneficiary);
+    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
 
-    // Step 1: eth_estimateGas for gas estimation
+    // Step 1: eth_estimateGas for gas estimation — via rpcCall so it HONOURS the per-sender
+    // deadline (the plain viem client here used to escape the budget entirely, letting one
+    // slow RPC stretch a "20s-bounded" sender cycle into minutes).
     let estimatedGas: bigint;
     try {
-      estimatedGas = await client.estimateGas({
-        to: config.entryPointAddress,
-        data: calldata,
-        account: caller,
-      });
-    } catch (err: unknown) {
-      const revertData = extractRevertData(err);
-      let failedOpIndex: number | undefined;
-      let errorMessage = err instanceof Error ? err.message : String(err);
-
-      if (revertData) {
-        try {
-          const decoded = decodeErrorResult({
-            abi: ENTRYPOINT_V07_ABI,
-            data: revertData,
-          });
-          if (decoded.errorName === "FailedOp") {
-            const [opIndex, reason] = decoded.args as unknown as [bigint, string];
-            failedOpIndex = Number(opIndex);
-            errorMessage = `FailedOp at index ${failedOpIndex}: ${reason}`;
+      const estJson = await rpcCall(
+        rpcUrl,
+        {
+          jsonrpc: "2.0", id: 1,
+          method: "eth_estimateGas",
+          params: [{ to: config.entryPointAddress, data: calldata, from: caller }],
+        },
+        { dependency: "rpc", operation: "simulateBundle.estimateGas", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
+      );
+      if (estJson.error) {
+        let failedOpIndex: number | undefined;
+        let errorMessage = estJson.error.message ?? "eth_estimateGas failed";
+        const revertData = revertDataFromRpcError(estJson.error);
+        if (revertData) {
+          try {
+            const decoded = decodeErrorResult({ abi: ENTRYPOINT_V07_ABI, data: revertData });
+            if (decoded.errorName === "FailedOp") {
+              const [opIndex, reason] = decoded.args as unknown as [bigint, string];
+              failedOpIndex = Number(opIndex);
+              errorMessage = `FailedOp at index ${failedOpIndex}: ${reason}`;
+            }
+          } catch {
+            // Could not decode
           }
-        } catch {
-          // Could not decode
         }
+        return { success: false, errorMessage, failedOpIndex };
       }
-
-      return { success: false, errorMessage, failedOpIndex };
+      estimatedGas = BigInt(estJson.result as string);
+    } catch (err: unknown) {
+      // Transport-level failure (timeout / deadline / network) — no revert data available.
+      return { success: false, errorMessage: err instanceof Error ? err.message : String(err) };
     }
 
     // Step 2: eth_call to detect individual UserOp execution failures
     // (EntryPoint handleOps doesn't revert on individual op failures — it emits
     // UserOperationEvent with success=false and UserOperationRevertReason)
     try {
-      const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
       const callJson = await rpcCall(
         rpcUrl,
         {
@@ -677,16 +682,12 @@ export function createSimulator(config: BundlerConfig) {
             "latest",
           ],
         },
-        { dependency: "rpc", operation: "simulateBundle.ethCall", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1 },
+        { dependency: "rpc", operation: "simulateBundle.ethCall", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
       );
 
       // If eth_call itself reverts, the whole bundle fails (FailedOp during validation)
       if (callJson.error) {
-        let revertData: `0x${string}` | undefined;
-        const errData = callJson.error.data;
-        if (typeof errData === "string" && errData.startsWith("0x") && errData.length > 2) {
-          revertData = errData as `0x${string}`;
-        }
+        const revertData = revertDataFromRpcError(callJson.error);
         if (revertData) {
           try {
             const decoded = decodeErrorResult({ abi: ENTRYPOINT_V07_ABI, data: revertData });
@@ -852,6 +853,15 @@ export function createSimulator(config: BundlerConfig) {
       call(2, "eth_maxPriorityFeePerGas"),
       call(3, "eth_gasPrice"),
     ]);
+
+    // ALL THREE reads failed → the RPC is unreachable, not "gas is free". Rethrow (the
+    // reason is already classified by rpcCall) so callers surface a retryable degraded
+    // error instead of quoting maxFeePerGas=0x0 to the wallet — a zero quote gets SIGNED
+    // by the user and then rejected/stuck at submission. Rejection-count only, no zero-value
+    // check: Tempo (maxFee=0 by design) and other legitimately-zero chains are unaffected.
+    if (blockRes.status === "rejected" && tipRes.status === "rejected" && gpRes.status === "rejected") {
+      throw blockRes.reason;
+    }
 
     let baseFee = 0n;
     const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
@@ -1074,25 +1084,23 @@ export function isExecutionRevertError(error?: { code?: number; message?: string
   return false;
 }
 
-function extractRevertData(err: unknown): `0x${string}` | null {
-  if (!err || typeof err !== "object") return null;
-  const anyErr = err as Record<string, unknown>;
-
-  if (anyErr.data && typeof anyErr.data === "string" && anyErr.data.startsWith("0x")) {
-    return anyErr.data as `0x${string}`;
+/**
+ * Extract EVM revert bytes from a JSON-RPC error envelope. Providers disagree on the
+ * shape: geth puts hex in `error.data`, Nethermind/Besu/some gateways nest it as
+ * `error.data.data` or embed it in the message text — missing any of them leaves
+ * failedOpIndex undecodable, so a permanently-reverting op is never evicted and blocks
+ * its sender's slot for the full mempool TTL.
+ */
+function revertDataFromRpcError(error: { message?: string; data?: unknown }): `0x${string}` | undefined {
+  const d = error.data;
+  if (typeof d === "string" && d.startsWith("0x") && d.length > 10) return d as `0x${string}`;
+  if (d && typeof d === "object") {
+    const inner = (d as { data?: unknown }).data;
+    if (typeof inner === "string" && inner.startsWith("0x") && inner.length > 10) return inner as `0x${string}`;
   }
-  if (anyErr.cause && typeof anyErr.cause === "object") {
-    return extractRevertData(anyErr.cause);
-  }
-  if (anyErr.details && typeof anyErr.details === "string") {
-    const match = anyErr.details.match(/0x[0-9a-fA-F]+/);
-    if (match) return match[0] as `0x${string}`;
-  }
-  if (anyErr.message && typeof anyErr.message === "string") {
-    const match = anyErr.message.match(/data: (0x[0-9a-fA-F]+)/);
-    if (match?.[1]) return match[1] as `0x${string}`;
-  }
-  return null;
+  const m = error.message?.match(/0x[0-9a-fA-F]{10,}/);
+  if (m) return m[0] as `0x${string}`;
+  return undefined;
 }
 
 function classifyFailedOpReason(reason: string): number {

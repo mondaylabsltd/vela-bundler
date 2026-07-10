@@ -14,6 +14,7 @@
 import type { MempoolEntry, UserOperation } from "../userop/types.ts";
 import { packUserOp } from "../userop/pack.ts";
 import { getUserOpHash } from "../userop/hash.ts";
+import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
 import { ReputationManager } from "./reputation.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { UserOpValidationError } from "../userop/validate.ts";
@@ -31,6 +32,44 @@ export interface MempoolConfig {
 }
 
 const MIN_REPLACEMENT_FEE_INCREASE_PERCENT = 10n; // 10% minimum increase
+
+/** JSON-safe form of a MempoolEntry for DO storage. The op round-trips through its RPC hex
+ *  form (userOpToRpc → normalizeUserOp); `packed` and the hash are re-derived on restore. */
+export interface SerializedMempoolEntry {
+  rpcUserOp: Record<string, unknown>;
+  prefund: string;
+  addedAt: number;
+  firstSeenAt: number;
+  rpcUrlOverride?: string;
+}
+
+export function serializeMempoolEntry(e: MempoolEntry): SerializedMempoolEntry {
+  return {
+    rpcUserOp: userOpToRpc(e.userOp),
+    prefund: e.prefund.toString(),
+    addedAt: e.addedAt,
+    firstSeenAt: e.firstSeenAt ?? e.addedAt,
+    rpcUrlOverride: e.rpcUrlOverride,
+  };
+}
+
+export function deserializeMempoolEntry(
+  s: SerializedMempoolEntry,
+  entryPointAddress: `0x${string}`,
+  chainId: number,
+): MempoolEntry {
+  const userOp = normalizeUserOp(s.rpcUserOp);
+  const packed = packUserOp(userOp);
+  return {
+    userOp,
+    packed,
+    userOpHash: getUserOpHash(packed, entryPointAddress, chainId),
+    prefund: BigInt(s.prefund),
+    addedAt: s.addedAt,
+    firstSeenAt: s.firstSeenAt,
+    rpcUrlOverride: s.rpcUrlOverride,
+  };
+}
 
 /** Mempool entry TTL — 5 minutes. Stale ops are evicted to prevent unbounded buildup. */
 const MEMPOOL_ENTRY_TTL_MS = 5 * 60 * 1000;
@@ -73,11 +112,17 @@ export class Mempool {
     const senderNonceKey = `${senderKey}:${userOp.nonce.toString()}`;
     const existingHash = this.bySenderNonce.get(senderNonceKey);
 
+    // Preserved across replacements: the stuck-mempool age and the TTL are measured from the
+    // FIRST sighting of this (sender,nonce), so a perpetually fee-bumping wallet can neither
+    // mask the stuck alert nor keep an unbundleable op alive past the TTL.
+    let firstSeenAt = Date.now();
+
     if (existingHash) {
       // Replacement: validate fee increase
       const existing = this.entries.get(existingHash);
       if (existing) {
         this.validateReplacement(existing.userOp, userOp, existingHash);
+        firstSeenAt = existing.firstSeenAt ?? existing.addedAt;
         // Remove old entry
         this.removeEntry(existingHash);
       }
@@ -109,6 +154,7 @@ export class Mempool {
       userOpHash: hash,
       prefund,
       addedAt: Date.now(),
+      firstSeenAt,
       rpcUrlOverride,
     };
     this.entries.set(hash, entry);
@@ -130,6 +176,10 @@ export class Mempool {
       // Reserve paymaster deposit
       this.reservePaymasterDeposit(userOp);
     }
+
+    try {
+      this.persistHooks?.put(entry);
+    } catch { /* persistence must never break acceptance */ }
 
     return hash;
   }
@@ -160,6 +210,10 @@ export class Mempool {
       this.releasePaymasterDeposit(entry.userOp);
     }
 
+    try {
+      this.persistHooks?.delete(userOpHash);
+    } catch { /* persistence must never break removal */ }
+
     return true;
   }
 
@@ -176,7 +230,9 @@ export class Mempool {
   getAll(): MempoolEntry[] {
     const now = Date.now();
     for (const [hash, entry] of this.entries) {
-      if (now - entry.addedAt > MEMPOOL_ENTRY_TTL_MS) {
+      // TTL from the FIRST sighting of this (sender,nonce): a replacement must not be able
+      // to keep an unbundleable op alive forever (each bump would otherwise reset the clock).
+      if (now - (entry.firstSeenAt ?? entry.addedAt) > MEMPOOL_ENTRY_TTL_MS) {
         this.removeEntry(hash);
         // Notify (bundler stores a terminal success=false receipt) so a TTL-dropped op is NOT
         // silently lost — the wallet gets a definitive "failed, resubmit" instead of polling null
@@ -196,6 +252,41 @@ export class Mempool {
   private onTtlEvict?: (entry: MempoolEntry) => void;
 
   /**
+   * Durable-storage hooks (CF Worker mode): every accepted op is persisted and every
+   * removal deletes it, so a DO eviction / deploy cannot silently vanish an accepted,
+   * not-yet-bundled op (the wallet would poll null forever — worse than any failure).
+   * Hooks are fire-and-forget and must never break mempool operations.
+   */
+  setPersistenceHooks(hooks: {
+    put: (entry: MempoolEntry) => void;
+    delete: (userOpHash: string) => void;
+  }): void {
+    this.persistHooks = hooks;
+  }
+  private persistHooks?: { put: (entry: MempoolEntry) => void; delete: (userOpHash: string) => void };
+
+  /**
+   * Re-insert a previously-accepted entry after a DO cold start — bypasses reputation and
+   * sender-limit checks (the op already passed them when first accepted) but re-runs the
+   * structural indexing. Returns false when a fresher entry for the same (sender,nonce)
+   * already exists (e.g. the wallet re-submitted while the DO was cold).
+   */
+  restoreEntry(entry: MempoolEntry): boolean {
+    const senderKey = entry.userOp.sender.toLowerCase();
+    const senderNonceKey = `${senderKey}:${entry.userOp.nonce.toString()}`;
+    if (this.bySenderNonce.has(senderNonceKey) || this.entries.has(entry.userOpHash)) return false;
+    if (this.entries.size >= this.config.maxMempoolSize) return false;
+    this.entries.set(entry.userOpHash, entry);
+    if (!this.bySender.has(senderKey)) this.bySender.set(senderKey, new Set());
+    this.bySender.get(senderKey)!.add(entry.userOpHash);
+    this.bySenderNonce.set(senderNonceKey, entry.userOpHash);
+    if (entry.userOp.paymaster && !isEmptyHex(entry.userOp.paymaster)) {
+      this.reservePaymasterDeposit(entry.userOp);
+    }
+    return true;
+  }
+
+  /**
    * Get the number of pending entries.
    */
   get size(): number {
@@ -209,7 +300,9 @@ export class Mempool {
   oldestEntryAgeMs(now: number = Date.now()): number {
     let oldest = 0;
     for (const entry of this.entries.values()) {
-      const age = now - entry.addedAt;
+      // Age from the FIRST sighting (survives replacements) — a fee-bumping wallet must not
+      // be able to mask the stuck-mempool alert by resetting the clock every bump.
+      const age = now - (entry.firstSeenAt ?? entry.addedAt);
       if (age > oldest) oldest = age;
     }
     return oldest;
@@ -328,6 +421,9 @@ export class Mempool {
     const maxCost = calcUserOpMaxGas(userOp) * userOp.maxFeePerGas;
     const current = this.paymasterReservations.get(pmKey) ?? 0n;
     const newVal = current > maxCost ? current - maxCost : 0n;
-    this.paymasterReservations.set(pmKey, newVal);
+    // Delete on zero — a long-lived process would otherwise accumulate one dead key per
+    // paymaster ever seen.
+    if (newVal === 0n) this.paymasterReservations.delete(pmKey);
+    else this.paymasterReservations.set(pmKey, newVal);
   }
 }

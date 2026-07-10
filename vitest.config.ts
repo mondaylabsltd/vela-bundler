@@ -5,7 +5,10 @@ export default defineWorkersConfig({
     include: ["worker/tests/**/*.test.ts"],
     poolOptions: {
       workers: {
-        isolatedStorage: true,
+        // Disabled: isolated-storage teardown chokes on Durable Object SQLite WAL files
+        // (miniflare "Expected .sqlite, got …-shm") once tests exercise DO storage (the
+        // chain-registry tests do). Tests that need isolation use distinct DO names.
+        isolatedStorage: false,
         main: "./worker/index.ts",
         miniflare: {
           compatibilityDate: "2024-09-23",

@@ -45,6 +45,7 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     treasuryAddress,
     splitterAddress: computeSplitterAddress(treasuryAddress),
     apiRateLimitPerMinute: parseInt(env.API_RATE_LIMIT_PER_MINUTE ?? "60"),
+    rateLimitAllowlist: (env.RATE_LIMIT_ALLOWLIST ?? "").split(",").map((s) => s.trim()).filter(Boolean),
     balanceReserveMultiplier: parseFloat(env.BALANCE_RESERVE_MULTIPLIER ?? "1"),
     alchemyApiKey: env.ALCHEMY_API_KEY || null,
 

@@ -127,6 +127,10 @@ export interface MempoolEntry {
   userOpHash: `0x${string}`;
   prefund: bigint;
   addedAt: number;
+  /** When this (sender,nonce) was FIRST accepted, preserved across fee-bump replacements.
+   *  The stuck-mempool age and the TTL both key off this — otherwise a wallet that keeps
+   *  replacing an op indefinitely masks the stuck alert and defeats the TTL. */
+  firstSeenAt: number;
   validationResult?: ValidationResultInfo;
   /** User-provided RPC URL to use for simulation/submission of this op. */
   rpcUrlOverride?: string;

@@ -16,7 +16,16 @@ import { buildConfig } from "./config.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import { resolveChain } from "../shared/config/chain-registry.ts";
 import { createSimulator } from "../shared/simulation/index.ts";
-import { Mempool } from "../shared/mempool/index.ts";
+import {
+  Mempool,
+  serializeMempoolEntry,
+  deserializeMempoolEntry,
+  type SerializedMempoolEntry,
+} from "../shared/mempool/index.ts";
+import type { SerializedReceipt } from "../shared/bundler/index.ts";
+import { redactError } from "../shared/reliability/log.ts";
+import { RepeatedErrorEscalator } from "../shared/monitoring/escalation.ts";
+import { maybeSendAliveHeartbeat } from "../shared/monitoring/operational.ts";
 import { AccountService } from "../shared/account/index.ts";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
@@ -44,8 +53,12 @@ import { createAlerter, type Alerter } from "../shared/monitoring/telegram.ts";
 import { checkTreasuryBalance } from "../shared/monitoring/treasury.ts";
 import { checkOperationalHealth, DEFAULT_OPERATIONAL_THRESHOLDS } from "../shared/monitoring/operational.ts";
 
-/** Auto-bundle alarm interval — 10 seconds. */
-const ALARM_INTERVAL_MS = 10_000;
+/** Fallback auto-bundle alarm interval (10s) — used only before config is loaded; once
+ *  initialized the DO honours AUTO_BUNDLE_INTERVAL_MS (floored at 2s). */
+const DEFAULT_ALARM_INTERVAL_MS = 10_000;
+
+/** Consecutive chain-init failures before alerting (each retry is one alarm interval). */
+const INIT_FAILURE_ALERT_STREAK = 3;
 
 /** Reputation decay interval — 1 hour (in ms). */
 const REPUTATION_DECAY_INTERVAL_MS = 60 * 60 * 1000;
@@ -64,6 +77,37 @@ const STORAGE_KEY_LAST_DECAY = "lastDecayAt";
 
 /** DO storage key for persisting in-flight pending receipts across evictions. */
 const STORAGE_KEY_PENDING_RECEIPTS = "pendingReceipts";
+
+/** DO storage key for the last alive-heartbeat timestamp (persisted so evictions neither
+ *  spam nor gap the heartbeat cadence). */
+const STORAGE_KEY_LAST_HEARTBEAT = "lastHeartbeatAt";
+
+/** Per-hash DO storage key prefixes: accepted-unbundled mempool ops and terminal receipts.
+ *  Per-hash (not one list key) so 4096 entries can't blow the 128KB per-value limit and
+ *  each write stays O(1). */
+const MEMPOOL_KEY_PREFIX = "mp:";
+const RECEIPT_KEY_PREFIX = "rc:";
+
+/** DO storage flag: the alarm was stopped DELIBERATELY (chain fully idle / abandoned) —
+ *  distinguishes "healthy idle" from "alarm chain broken" for the cron liveness probe. */
+const STORAGE_KEY_ALARM_IDLE = "alarmIdle";
+
+/** Consecutive fully-idle alarm cycles (no mempool ops, no pending receipts, no locked
+ *  EOAs) before the alarm stops re-arming. ~5 min at the 10s interval. The ingress kick
+ *  re-arms instantly on the next accepted op, so an idle stop can never strand an op —
+ *  and abandoned user-RPC testnet chains stop burning re-init cycles (and init-failure
+ *  alerts) forever. */
+const IDLE_STOP_CYCLES = 30;
+
+/** Consecutive failed alarm re-inits (evicted DO whose chain no longer resolves — e.g. a
+ *  dead user-supplied testnet) before the alarm gives up, PROVIDED nothing is in flight.
+ *  With in-flight state the alarm never gives up (money is at stake; keep paging). */
+const REINIT_GIVEUP_STREAK = 30;
+
+/** Registry-instance storage key prefix: one key per chain ever activated. The well-known
+ *  "chain-registry" DO instance serves ONLY /registry-* paths and never initializes chain
+ *  services — it lets the liveness cron enumerate real chains with zero manual config. */
+const REGISTRY_KEY_PREFIX = "chain:";
 
 /** Redact API keys from RPC URLs for safe logging. */
 function redactRpcUrl(url: string): string {
@@ -85,7 +129,9 @@ class SingleChainAdapter implements ChainRegistryLike {
 
   async getChain(chainId: number, _requestRpcUrl?: string): Promise<ChainServices> {
     if (chainId !== this.services.chainId) {
-      throw { code: -32602, message: `Chain ${chainId} not handled by this DO (handles ${this.services.chainId})` };
+      // Via the factory so it carries the deliberate-error marker (process.ts forwards ONLY
+      // marked errors to clients; unmarked ones are treated as internal and redacted).
+      throw invalidParams(`Chain ${chainId} not handled by this DO (handles ${this.services.chainId})`);
     }
     return this.services;
   }
@@ -106,20 +152,79 @@ export class BundlerDO implements DurableObject {
   private sponsorService: SponsorService | null = null;
   private chainId: number = 0;
   private initPromise: Promise<void> | null = null;
-  /** Telegram alerter — persistent so the per-alert cooldown survives across alarm cycles. */
-  private alerter: Alerter | null = null;
+  /** Telegram alerter — created in the CONSTRUCTOR (from env, no other dependencies) so a
+   *  persistently failing chain init can still page the operator; created inside _init it
+   *  would sit after the very calls (secret derivation, resolveChain) that throw. Persistent
+   *  instance so the per-alert cooldown survives across alarm cycles. */
+  private readonly alerter: Alerter;
+  /** Repeated-exception escalation (same phase failing N consecutive cycles → Telegram). */
+  private readonly escalator: RepeatedErrorEscalator;
+  /** Consecutive chain-init failures (alarm re-init + fetch path share it). */
+  private initFailureStreak = 0;
 
   // Health loop state
   private lastDecayAt: number = 0;
+  /** Cached heartbeat stamp — read from storage ONCE per isolate, not once per 10s alarm
+   *  (8,640 pointless storage reads/day for a value that changes 4×/day). */
+  private lastHeartbeatAt: number | null = null;
+  /** When the monitor half of the alarm last ran — ingress-kicked alarms skip it so a kick
+   *  costs only reconcile+bundle, not a treasury/balance RPC sweep per accepted op. */
+  private lastHealthLoopAt = 0;
+  /** Consecutive fully-idle alarm cycles — see IDLE_STOP_CYCLES. Reset by any activity;
+   *  an eviction resets it too (counting simply restarts — the safe direction). */
+  private idleCycles = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    this.alerter = createAlerter({
+      telegramBotToken: env.TELEGRAM_BOT_TOKEN || null,
+      telegramChatId: env.TELEGRAM_CHAT_ID || null,
+    }, { quiet: true });
+    this.escalator = new RepeatedErrorEscalator(this.alerter);
+  }
+
+  /** Effective alarm interval: honours AUTO_BUNDLE_INTERVAL_MS once config is loaded
+   *  (floored at 2s so a typo can't hot-loop the alarm), falls back to 10s before init. */
+  private alarmIntervalMs(): number {
+    const configured = this.config?.autoBundleIntervalMs;
+    return configured && Number.isFinite(configured) ? Math.max(2_000, configured) : DEFAULT_ALARM_INTERVAL_MS;
+  }
+
+  /** Rate-limit allowlist as a Set, built once per isolate (requests are hot-path). */
+  private _rateLimitAllowlist: Set<string> | null = null;
+  private rateLimitAllowlist(): Set<string> {
+    if (!this._rateLimitAllowlist) {
+      this._rateLimitAllowlist = new Set(this.config?.rateLimitAllowlist ?? []);
+    }
+    return this._rateLimitAllowlist;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const chainId = parseInt(url.searchParams.get("chainId") ?? "0");
+
+    // --- Chain-registry endpoints (the well-known "chain-registry" instance) ---
+    // Pure storage, no chain init: chain DOs self-register on first activation and the
+    // liveness cron enumerates the set — no operator-maintained chain list.
+    if (url.pathname === "/registry-add" && request.method === "POST") {
+      const id = parseInt(url.searchParams.get("chain") ?? "0");
+      if (id > 0) await this.state.storage.put(REGISTRY_KEY_PREFIX + id, Date.now());
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/registry-list") {
+      const listed = await this.state.storage.list({ prefix: REGISTRY_KEY_PREFIX });
+      const chains = [...listed.keys()].map((k) => parseInt(k.slice(REGISTRY_KEY_PREFIX.length))).filter((n) => n > 0);
+      return Response.json({ chains });
+    }
+
+    // --- Cron liveness probe: STORAGE-ONLY, never initializes the chain ---
+    // Force-initializing here would resurrect every abandoned user-RPC testnet each probe
+    // (resolveChain fetches + init-failure alerts, forever). setAlarm needs no init: the
+    // armed alarm re-initializes the chain itself on its next firing.
+    if (url.pathname === "/ensure-alarm") {
+      return await this.handleEnsureAlarm();
+    }
 
     if (chainId > 0) {
       if (url.pathname === "/health") {
@@ -141,7 +246,10 @@ export class BundlerDO implements DurableObject {
         try {
           await this.ensureInitialized(chainId);
         } catch (err) {
-          console.error(`[BundlerDO] Init failed for chain ${chainId}:`, err);
+          // Covers the never-successfully-initialized case too (no alarm armed yet — the
+          // alarm is only scheduled at the end of a successful _init), so the operator
+          // still gets paged when every user request is bouncing with 503.
+          await this.noteInitFailure(chainId, err);
           return Response.json(
             { jsonrpc: "2.0", id: null, error: internalError("Chain initialization failed") },
             { status: 503 },
@@ -174,48 +282,69 @@ export class BundlerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
-    // If chainServices is null (DO was evicted), try to re-initialize from stored chainId
-    if (!this.chainServices) {
-      const storedChainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
-      if (storedChainId) {
-        try {
-          await this.ensureInitialized(storedChainId);
-        } catch (err) {
-          console.error(`[BundlerDO] Alarm re-init failed for chain ${storedChainId}:`, err);
-        }
-      }
-      // Re-schedule even if init failed — retry next cycle
+    // Re-arm FIRST — the reschedule must never depend on the body completing. Cloudflare's
+    // automatic alarm retry budget is BOUNDED: an error thrown past the old end-of-body
+    // setAlarm could exhaust it and end auto-bundling for this chain FOREVER, silently,
+    // while the DO kept serving reads. (The ingress kick's setAlarm(now) may overwrite this
+    // with an earlier time — fine, every alarm run re-arms again.)
+    await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
+
+    try {
+      // If chainServices is null (DO was evicted), try to re-initialize from stored chainId
       if (!this.chainServices) {
-        await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
-        return;
+        const storedChainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+        if (storedChainId) {
+          try {
+            await this.ensureInitialized(storedChainId);
+          } catch (err) {
+            await this.noteInitFailure(storedChainId, err);
+            // A chain that no longer resolves (dead user-RPC testnet) with NOTHING in
+            // flight must not burn re-init cycles + init-failure pages forever: stop the
+            // alarm deliberately. A future user request re-initializes and re-arms; with
+            // in-flight state we NEVER give up (money at stake — keep trying + paging).
+            if (this.initFailureStreak >= REINIT_GIVEUP_STREAK && !(await this.hasPersistedInFlightState())) {
+              await this.state.storage.put(STORAGE_KEY_ALARM_IDLE, true);
+              await this.state.storage.deleteAlarm();
+              console.warn(`[BundlerDO] chain ${storedChainId} unresolvable for ${this.initFailureStreak} cycles with nothing in flight — alarm stopped (idle)`);
+              return;
+            }
+          }
+        }
+        // Alarm already re-armed — retry next cycle
+        if (!this.chainServices) return;
       }
-    }
 
-    // Check pending receipts from previous bundles (alarm-driven polling)
-    try {
-      await this.chainServices.bundler.checkPendingReceipts();
-    } catch (err) {
-      console.error(`[BundlerDO:${this.chainId}] Pending receipt check error:`, err);
-    }
-
-    // Auto-bundle
-    try {
-      if (this.chainServices.mempool.size > 0) {
-        await this.chainServices.bundler.tryBundle();
+      // Check pending receipts from previous bundles (alarm-driven polling)
+      try {
+        await this.chainServices.bundler.checkPendingReceipts();
+        this.escalator.ok("reconcile", this.chainId);
+      } catch (err) {
+        console.error(`[BundlerDO:${this.chainId}] Pending receipt check error:`, err);
+        await this.escalator.note("reconcile", this.chainId, err);
       }
-    } catch (err) {
-      console.error(`[BundlerDO:${this.chainId}] Auto-bundle error:`, err);
-    }
 
-    // Health loop: recover locked EOAs + reputation decay
-    await this.healthLoop();
+      // Auto-bundle (kickBundle collapses with any concurrent ingress kick)
+      try {
+        await this.chainServices.bundler.kickBundle();
+        this.escalator.ok("auto-bundle", this.chainId);
+      } catch (err) {
+        console.error(`[BundlerDO:${this.chainId}] Auto-bundle error:`, err);
+        await this.escalator.note("auto-bundle", this.chainId, err);
+      }
 
-    // Receipt cleanup
-    this.chainServices.bundler.cleanExpiredReceipts();
+      // Health loop: recover locked EOAs + monitors + reputation decay. Skipped when an
+      // ingress kick fired this alarm within seconds of the last pass — the kick exists to
+      // shave op latency, not to multiply treasury/balance RPC reads per accepted op.
+      if (Date.now() - this.lastHealthLoopAt >= 5_000) {
+        this.lastHealthLoopAt = Date.now();
+        await this.healthLoop();
+      }
 
-    // Observability: publish per-cycle gauges + one structured heartbeat so a slow
-    // backlog / stuck reconciliation is visible before in-memory state is evicted.
-    try {
+      // Receipt cleanup
+      this.chainServices.bundler.cleanExpiredReceipts();
+
+      // Observability: publish per-cycle gauges + one structured heartbeat so a slow
+      // backlog / stuck reconciliation is visible before in-memory state is evicted.
       const cs = this.chainServices;
       const lockedEOAs = cs.accountService.lockManager.getLockedEOAs().length;
       const mempoolSize = cs.mempool.size;
@@ -235,12 +364,60 @@ export class BundlerDO implements DurableObject {
         pending_receipts: pendingReceipts, pending_receipt_oldest_age_ms: oldestPendingMs,
         circuit_degraded: reliabilityHealth().circuit.degraded,
       });
-    } catch (err) {
-      console.error(`[BundlerDO:${this.chainId}] Heartbeat error:`, err);
-    }
 
-    // Re-schedule alarm
-    await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+      // Idle stop: a chain with NOTHING to do for IDLE_STOP_CYCLES stops its own alarm
+      // (flagged deliberate so the cron probe reads it as healthy, not broken). The ingress
+      // kick re-arms instantly on the next accepted op — no op can be stranded — and
+      // abandoned user-RPC testnets go permanently quiet instead of self-alarming forever.
+      if (mempoolSize === 0 && pendingReceipts === 0 && lockedEOAs === 0) {
+        this.idleCycles++;
+        if (this.idleCycles >= IDLE_STOP_CYCLES) {
+          // Re-check LIVE state synchronously right before stopping: an op accepted during
+          // this alarm body (its ingress kick already armed the alarm) must not have that
+          // alarm deleted from under it. No non-storage await sits between this check and
+          // the deleteAlarm, so the DO input gate excludes interleaved accepts.
+          const live = this.chainServices;
+          const stillIdle = live !== null &&
+            live.mempool.size === 0 &&
+            live.bundler.pendingReceiptCount === 0 &&
+            live.accountService.lockManager.getLockedEOAs().length === 0;
+          if (stillIdle) {
+            this.idleCycles = 0;
+            await this.state.storage.put(STORAGE_KEY_ALARM_IDLE, true);
+            await this.state.storage.deleteAlarm();
+            console.log(`[BundlerDO:${this.chainId}] fully idle for ${IDLE_STOP_CYCLES} cycles — alarm stopped (kick re-arms on next op)`);
+          }
+        }
+      } else {
+        this.idleCycles = 0;
+      }
+    } catch (err) {
+      // Nothing in the body may kill the alarm chain (already re-armed above) — but an
+      // escaped exception here is by definition a code bug: log AND page.
+      console.error(`[BundlerDO:${this.chainId}] Alarm cycle error:`, err);
+      await this.alerter.send(
+        `alarm-error-${this.chainId}`,
+        `🐛 Vela Bundler — Worker alarm cycle threw on chain ${this.chainId}: ` +
+          `${redactError(err).slice(0, 400)}\nAuto-bundling continues (alarm re-armed), but this is a code bug.`,
+      );
+    }
+  }
+
+  /** Shared accounting for chain-init failures (alarm re-init + fetch path): console always,
+   *  Telegram once the streak shows it is persistent — a DO that cannot init serves 503 to
+   *  every user request and leaves persisted pending receipts unmonitored. */
+  private async noteInitFailure(chainId: number, err: unknown): Promise<void> {
+    this.initFailureStreak++;
+    console.error(`[BundlerDO] Init failed for chain ${chainId} (${this.initFailureStreak}x):`, err);
+    if (this.initFailureStreak >= INIT_FAILURE_ALERT_STREAK) {
+      await this.alerter.send(
+        `init-failing-${chainId}`,
+        `🚨 Vela Bundler — Worker DO for chain ${chainId} CANNOT INITIALIZE ` +
+          `(${this.initFailureStreak} consecutive attempts): ${redactError(err).slice(0, 400)}\n` +
+          `Every user request is failing with 503 and any in-flight receipts/locked EOAs are ` +
+          `unmonitored until this is fixed. Check OPERATOR_SECRET / RPC resolution / chain registry.`,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -277,18 +454,18 @@ export class BundlerDO implements DurableObject {
   }
 
   private async _init(chainId: number): Promise<void> {
-    // Derive treasury from OPERATOR_SECRET
+    // Derive treasury from OPERATOR_SECRET. (The alerter already exists — constructor —
+    // so a throw anywhere in here is still alertable via noteInitFailure.)
     const treasuryAddress = await deriveTreasuryAddress(this.env.OPERATOR_SECRET);
     this.config = buildConfig(this.env, treasuryAddress);
-    // No-op unless TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are configured.
-    this.alerter = createAlerter(this.config);
 
     const keyManager = new LocalKeyManager({
       operatorSecret: this.config.operatorSecret,
       oldOperatorSecrets: this.config.oldOperatorSecrets,
     });
 
-    this.sponsorService = new SponsorService(this.config);
+    // Share the DO's alerter (one dedup map per chain isolate).
+    this.sponsorService = new SponsorService(this.config, this.alerter);
 
     // Resolve chain RPC + metadata (mirrors ChainRegistry.initChain)
     const resolved = await resolveChain(chainId, this.config.alchemyApiKey);
@@ -336,6 +513,63 @@ export class BundlerDO implements DurableObject {
       console.log(`[BundlerDO] Restored ${(savedPending as unknown[]).length} in-flight pending receipt(s) for chain ${chainId}`);
     }
 
+    // Ingress bundle kick: an accepted op fires the alarm NOW instead of waiting out the
+    // interval (the alarm serializes with any in-progress run; ~10s saved per op matters
+    // for 5-minute trading windows).
+    bundler.setKickHook(() => this.state.storage.setAlarm(Date.now()));
+
+    // Durably persist accepted-unbundled ops: a deploy/eviction used to wipe the in-memory
+    // mempool, silently vanishing accepted ops (the wallet polls null forever — worse than
+    // any failure). Per-hash keys; writes are fire-and-forget (never block acceptance).
+    mempool.setPersistenceHooks({
+      put: (entry) => {
+        void this.state.storage.put(MEMPOOL_KEY_PREFIX + entry.userOpHash, serializeMempoolEntry(entry))
+          .catch((err: unknown) => console.warn(`[BundlerDO] mempool persist failed: ${redactError(err)}`));
+      },
+      delete: (userOpHash) => {
+        void this.state.storage.delete(MEMPOOL_KEY_PREFIX + userOpHash)
+          .catch((err: unknown) => console.warn(`[BundlerDO] mempool unpersist failed: ${redactError(err)}`));
+      },
+    });
+    // Restore accepted ops from before the eviction. TTL-expired ones are dropped by the
+    // next getAll() sweep, which stores the honest terminal receipt via the TTL hook.
+    const savedOps = await this.state.storage.list<SerializedMempoolEntry>({ prefix: MEMPOOL_KEY_PREFIX });
+    let restoredOps = 0;
+    for (const [key, saved] of savedOps) {
+      try {
+        const entry = deserializeMempoolEntry(saved, chainConfig.entryPointAddress, chainId);
+        if (mempool.restoreEntry(entry)) restoredOps++;
+        else await this.state.storage.delete(key); // superseded/duplicate — drop the orphan
+      } catch (err) {
+        console.warn(`[BundlerDO] Skipped unrestorable mempool entry ${key}: ${redactError(err)}`);
+        await this.state.storage.delete(key);
+      }
+    }
+    if (restoredOps > 0) console.log(`[BundlerDO] Restored ${restoredOps} accepted op(s) for chain ${chainId}`);
+
+    // Durably persist terminal receipts so an eviction cannot regress a wallet's poll from
+    // "confirmed/failed" back to null. Same per-hash, fire-and-forget pattern.
+    bundler.setReceiptPersistHooks({
+      put: (userOpHash, receipt, expiresAt) => {
+        void this.state.storage.put(RECEIPT_KEY_PREFIX + userOpHash, { userOpHash, receipt, expiresAt })
+          .catch((err: unknown) => console.warn(`[BundlerDO] receipt persist failed: ${redactError(err)}`));
+      },
+      delete: (userOpHash) => {
+        void this.state.storage.delete(RECEIPT_KEY_PREFIX + userOpHash)
+          .catch((err: unknown) => console.warn(`[BundlerDO] receipt unpersist failed: ${redactError(err)}`));
+      },
+    });
+    const savedReceipts = await this.state.storage.list<{ userOpHash: string; receipt: SerializedReceipt; expiresAt: number }>({ prefix: RECEIPT_KEY_PREFIX });
+    if (savedReceipts.size > 0) {
+      const now = Date.now();
+      // Expired entries are deleted here (cheap, bounded by the list) — the in-memory
+      // cleanExpiredReceipts can't see keys that were never restored.
+      const expired = [...savedReceipts.entries()].filter(([, v]) => v.expiresAt <= now).map(([k]) => k);
+      for (const k of expired) await this.state.storage.delete(k);
+      bundler.importReceipts([...savedReceipts.values()]);
+      console.log(`[BundlerDO] Restored ${savedReceipts.size - expired.length} receipt(s) for chain ${chainId}`);
+    }
+
     this.chainServices = {
       chainId,
       chainInfo: resolved.chain,
@@ -347,9 +581,19 @@ export class BundlerDO implements DurableObject {
       bundler,
     };
     this.chainAdapter = new SingleChainAdapter(this.chainServices);
+    this.initFailureStreak = 0;
 
-    // Persist chainId so alarm can re-init after eviction
+    // Persist chainId so alarm can re-init after eviction. A FIRST-EVER activation (no
+    // stored chainId) is a rare, operator-relevant event — a new chain now custodies funds.
+    const priorChainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
     await this.state.storage.put(STORAGE_KEY_CHAIN_ID, chainId);
+    if (priorChainId === undefined) {
+      await this.alerter.send(
+        `chain-activated-${chainId}`,
+        `🆕 Vela Bundler — chain ${chainId} (${resolved.chain?.name ?? "unknown"}) activated on Workers ` +
+          `(first request). Auto-bundling armed.`,
+      );
+    }
 
     // Restore lastDecayAt from storage (survives eviction)
     const storedDecay = await this.state.storage.get<number>(STORAGE_KEY_LAST_DECAY);
@@ -359,10 +603,22 @@ export class BundlerDO implements DurableObject {
       `[BundlerDO] Initialized chain ${chainId} (${resolved.chain?.name ?? "unknown"}) — RPC: ${redactRpcUrl(effectiveRpc)}`,
     );
 
-    // Schedule first alarm if none exists
+    // Self-register with the chain-registry DO (fire-and-forget, idempotent) so the
+    // liveness cron can enumerate every activated chain with zero manual config.
+    try {
+      const registry = this.env.BUNDLER.get(this.env.BUNDLER.idFromName("chain-registry"));
+      void registry.fetch(new Request(`https://bundler-do/registry-add?chain=${chainId}`, { method: "POST" }))
+        .catch((err: unknown) => console.warn(`[BundlerDO] chain-registry registration failed (cron probe will miss this chain until retry): ${redactError(err)}`));
+    } catch (err) {
+      console.warn(`[BundlerDO] chain-registry registration failed: ${redactError(err)}`);
+    }
+
+    // Schedule first alarm if none exists; an init means the chain is ACTIVE again, so any
+    // deliberate-idle flag is stale.
+    await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     const existing = await this.state.storage.getAlarm();
     if (!existing) {
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+      await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
     }
   }
 
@@ -383,6 +639,7 @@ export class BundlerDO implements DurableObject {
     // Rate limit using CF-Connecting-IP (cannot be spoofed by clients)
     const rateLimitConfig: RateLimitConfig = {
       rateLimitPerMinute: this.config.apiRateLimitPerMinute,
+      allowlist: this.rateLimitAllowlist(),
     };
     const limited = rateLimitGuard(request, rateLimitConfig);
     if (limited) return limited;
@@ -462,6 +719,7 @@ export class BundlerDO implements DurableObject {
 
     const rateLimitConfig: RateLimitConfig = {
       rateLimitPerMinute: this.config.apiRateLimitPerMinute,
+      allowlist: this.rateLimitAllowlist(),
     };
 
     const response = await handleRestApi(
@@ -475,6 +733,49 @@ export class BundlerDO implements DurableObject {
     );
 
     return response ?? new Response("not found", { status: 404 });
+  }
+
+  /**
+   * Cron-driven liveness probe (external layer of the dead-man switch), STORAGE-ONLY:
+   *   - alarm scheduled                          → healthy (auto-bundling alive)
+   *   - no alarm + deliberate-idle flag + empty  → healthy idle (kick re-arms on next op)
+   *   - never activated                          → nothing to do
+   *   - no alarm otherwise (or idle flag but money in flight — inconsistent) → BROKEN:
+   *     re-arm + alert. The armed alarm re-initializes the chain itself when it fires.
+   */
+  private async handleEnsureAlarm(): Promise<Response> {
+    const alarmAt = await this.state.storage.getAlarm();
+    if (alarmAt !== null) {
+      return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
+    }
+    const knownChain = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+    if (knownChain === undefined) {
+      return Response.json({ rearmed: false, unknown: true });
+    }
+    const idle = await this.state.storage.get<boolean>(STORAGE_KEY_ALARM_IDLE);
+    const hasInFlight = await this.hasPersistedInFlightState();
+    if (idle && !hasInFlight) {
+      return Response.json({ rearmed: false, idle: true, chainId: knownChain });
+    }
+    await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
+    await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
+    console.error(`[BundlerDO:${knownChain}] alarm chain was BROKEN — re-armed by cron liveness check`);
+    await this.alerter.send(
+      `alarm-rearmed-${knownChain}`,
+      `🚑 Vela Bundler — chain ${knownChain}'s Worker alarm chain was BROKEN (auto-bundling had ` +
+        `stopped${hasInFlight ? " WITH in-flight state" : ""}) and has been re-armed by the cron ` +
+        `liveness check. Investigate why it died (logs around this time).`,
+    );
+    return Response.json({ rearmed: true, chainId: knownChain });
+  }
+
+  /** True when durable storage holds money-path state that reconciliation must finish:
+   *  persisted pending receipts or accepted-unbundled mempool ops. Readable without init. */
+  private async hasPersistedInFlightState(): Promise<boolean> {
+    const pending = await this.state.storage.get(STORAGE_KEY_PENDING_RECEIPTS);
+    if (pending !== undefined && Array.isArray(pending) && pending.length > 0) return true;
+    const ops = await this.state.storage.list({ prefix: MEMPOOL_KEY_PREFIX, limit: 1 });
+    return ops.size > 0;
   }
 
   private handleHealth(requestedChainId: number = this.chainId): Response {
@@ -492,11 +793,15 @@ export class BundlerDO implements DurableObject {
       chainId: this.chainId,
       chainName: cs.chainInfo?.name ?? "unknown",
       status: lockedEOAs > 0 || rel.circuit.degraded > 0 ? "degraded" : "ok",
+      // An operator who believes Telegram alerts are armed when they are not is the worst
+      // blind spot — make the state checkable from outside.
+      alerting: this.alerter.enabled ? "telegram" : "disabled",
       mempoolSize: cs.mempool.size,
       oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
       lockedEOAs,
       pendingReceipts: cs.bundler.pendingReceiptCount,
       oldestPendingReceiptAgeMs: cs.bundler.oldestPendingReceiptAgeMs(),
+      submitFailureStreak: cs.bundler.submitFailureStreak,
       reliability: rel,
     }, {
       headers: {
@@ -544,7 +849,7 @@ export class BundlerDO implements DurableObject {
     }
 
     // Treasury-balance monitor (deduped Telegram alert when low). No-op if unconfigured.
-    if (this.config && this.alerter) {
+    if (this.config) {
       try {
         await checkTreasuryBalance({
           chainId: this.chainId,
@@ -555,12 +860,15 @@ export class BundlerDO implements DurableObject {
           thresholdPathUsd: this.config.treasuryAlertThresholdPathUsd,
           alerter: this.alerter,
         });
+        this.escalator.ok("treasury-monitor", this.chainId);
       } catch (err) {
         console.error(`[BundlerDO:${this.chainId}] Treasury monitor error:`, err);
+        await this.escalator.note("treasury-monitor", this.chainId, err);
       }
 
       // Operational-health monitor: alert on any STUCK condition (mempool op / pending bundle /
-      // locked EOA / degraded RPC) — a user's money can't move and a developer must intervene.
+      // locked EOA / repeated broadcast failure / underfunded EOA / degraded RPC) — a user's
+      // money can't move and a developer must intervene.
       try {
         const cs = this.chainServices;
         await checkOperationalHealth({
@@ -573,9 +881,39 @@ export class BundlerDO implements DurableObject {
           oldestPendingReceiptAgeMs: cs.bundler.oldestPendingReceiptAgeMs(),
           circuitDegraded: reliabilityHealth().circuit.degraded,
           reputationBannedSenders: cs.mempool.reputation.countPenalized("sender").banned,
+          submitFailureStreak: cs.bundler.submitFailureStreak,
+          lastSubmitError: cs.bundler.lastSubmitError,
+          insufficientFundsEoa: cs.bundler.insufficientFundsEoa,
         }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
+        this.escalator.ok("operational-monitor", this.chainId);
       } catch (err) {
         console.error(`[BundlerDO:${this.chainId}] Operational monitor error:`, err);
+        await this.escalator.note("operational-monitor", this.chainId, err);
+      }
+
+      // Alive heartbeat (dead-man switch, in-process layer): a periodic per-chain "alive"
+      // message — SILENCE past the interval means this chain's alarm loop is dead. The
+      // last-sent timestamp is persisted so evictions neither spam nor gap the cadence.
+      try {
+        if (this.lastHeartbeatAt === null) {
+          this.lastHeartbeatAt = (await this.state.storage.get<number>(STORAGE_KEY_LAST_HEARTBEAT)) ?? 0;
+        }
+        const last = this.lastHeartbeatAt;
+        const cs = this.chainServices;
+        const sent = await maybeSendAliveHeartbeat({
+          alerter: this.alerter,
+          lastSentAt: last,
+          runtime: `workers chain ${this.chainId}`,
+          stats:
+            `mempool ${cs.mempool.size}, locked EOAs ${cs.accountService.lockManager.getLockedEOAs().length}, ` +
+            `pending receipts ${cs.bundler.pendingReceiptCount}`,
+        });
+        if (sent !== last) {
+          this.lastHeartbeatAt = sent;
+          await this.state.storage.put(STORAGE_KEY_LAST_HEARTBEAT, sent);
+        }
+      } catch (err) {
+        console.error(`[BundlerDO:${this.chainId}] Alive heartbeat error:`, err);
       }
     }
 

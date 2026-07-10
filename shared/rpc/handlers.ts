@@ -204,7 +204,11 @@ async function handleSendUserOperation(
     chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
   });
   const maxGas = calcUserOpMaxGas(userOp);
-  const estimatedCost = maxGas * outerGas.effectiveGasPrice;
+  // Gate on the node's PREFUND rule (gasLimit × maxFeePerGas), matching the bundler's
+  // submit-time gate — gating on the softer effective price here would accept ops whose
+  // EOA can never afford the actual broadcast, so the user gets "accepted" and then a
+  // guaranteed 5-min TTL miss instead of a synchronous "deposit to X" error.
+  const estimatedCost = maxGas * outerGas.maxFeePerGas;
 
   console.log(`[RPC] Balance check: eoa=${eoa.address} maxGas=${maxGas} effectiveGasPrice=${outerGas.effectiveGasPrice} estimatedCost=${estimatedCost} rpcOverride=${rpcOverride ?? 'none'}`);
   let balanceCheck;
@@ -309,6 +313,10 @@ async function handleSendUserOperation(
       simResult.validationResult?.prefund ?? 0n,
       rpcOverride,
     );
+    // Kick a bundle pass NOW (fire-and-forget) instead of waiting out the next 10s
+    // alarm/interval tick — for a 5-minute trading window those seconds are money.
+    // Never blocks or fails this response; the periodic tick remains the safety net.
+    chain.bundler.requestBundleKick();
     return userOpHash;
   } catch (err) {
     if (err instanceof UserOpValidationError) {
@@ -414,8 +422,15 @@ async function handleGetUserOperationGasPrice(
     rpcOverride = undefined;
   }
 
-  const { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice } =
-    await chain.simulator.getGasPrices(rpcOverride);
+  let baseFee: bigint, suggestedMaxPriorityFeePerGas: bigint, chainGasPrice: bigint;
+  try {
+    ({ baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice } =
+      await chain.simulator.getGasPrices(rpcOverride));
+  } catch (err) {
+    // All price reads failed — return a RETRYABLE degraded error, never a 0x0 quote the
+    // user would sign and then have rejected at submission.
+    throw degradedFromError(err, "gas price");
+  }
 
   // walletGasMarkup is a float (e.g. 2.0); scale to bps for integer math (single source
   // of truth: shared/gas/fee-model.ts — same scale the bundle uses to reverse it).

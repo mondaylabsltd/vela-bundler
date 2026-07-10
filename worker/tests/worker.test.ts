@@ -123,3 +123,28 @@ describe("worker/index.ts entry routing (network-free paths)", () => {
     expect(env.OPERATOR_SECRET).toMatch(/^0x[0-9a-fA-F]{64}$/);
   });
 });
+
+describe("chain-registry DO + storage-only liveness probe", () => {
+  it("registry-add is idempotent and registry-list enumerates activated chains", async () => {
+    const bundler = (env as unknown as Env).BUNDLER;
+    const registry = bundler.get(bundler.idFromName("chain-registry"));
+    await registry.fetch("https://bundler-do/registry-add?chain=137", { method: "POST" });
+    await registry.fetch("https://bundler-do/registry-add?chain=1", { method: "POST" });
+    await registry.fetch("https://bundler-do/registry-add?chain=137", { method: "POST" }); // replay
+    await registry.fetch("https://bundler-do/registry-add?chain=0", { method: "POST" });   // invalid → ignored
+    const res = await registry.fetch("https://bundler-do/registry-list");
+    const body = await res.json() as { chains: number[] };
+    expect(body.chains.sort((a, b) => a - b)).toEqual([1, 137]);
+  });
+
+  it("ensure-alarm on a never-activated DO reports unknown WITHOUT initializing the chain", async () => {
+    // The probe must be storage-only: force-initializing here would resurrect every
+    // abandoned user-RPC testnet on each cron pass (resolveChain fetches + alert noise).
+    const bundler = (env as unknown as Env).BUNDLER;
+    const stub = bundler.get(bundler.idFromName("chain-999999"));
+    const res = await stub.fetch("https://bundler-do/ensure-alarm");
+    const body = await res.json() as { rearmed: boolean; unknown?: boolean };
+    expect(body.rearmed).toBe(false);
+    expect(body.unknown).toBe(true);
+  });
+});

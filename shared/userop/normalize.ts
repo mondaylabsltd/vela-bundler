@@ -115,5 +115,8 @@ export function userOpToRpc(userOp: UserOperation): Record<string, unknown> {
       : null,
     paymasterData: userOp.paymasterData,
     signature: userOp.signature,
+    // Tempo extension — must survive the round-trip (mempool persistence serializes ops
+    // through this form; dropping it would break Tempo fee settlement after a DO restart).
+    feeToken: userOp.feeToken ?? null,
   };
 }

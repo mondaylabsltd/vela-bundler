@@ -222,9 +222,20 @@ async function main() {
         // (4) Confirm the PRODUCTION operational monitor fires a live "stuck-money" alert so the
         //     operator sees a real example of the intervention notification.
         let opAlertSent = false;
-        const opAlerter = { send: (id: string, msg: string) => { opAlertSent = true; return alerter.send(id, msg); } };
+        const opAlerter = {
+          enabled: alerter.enabled,
+          send: (id: string, msg: string, opts?: { cooldownMs?: number; noEscalation?: boolean }) => {
+            opAlertSent = true;
+            return alerter.send(id, msg, opts);
+          },
+        };
         await checkOperationalHealth(
-          { chainId: 1, chainName: "E2E-Test (synthetic stuck EOA)", oldestMempoolAgeMs: 0, lockedEoaCount: 1, oldestLockedAgeMs: 600_000, pendingReceiptCount: 0, oldestPendingReceiptAgeMs: 0, circuitDegraded: 0, reputationBannedSenders: 0 },
+          {
+            chainId: 1, chainName: "E2E-Test (synthetic stuck EOA)", oldestMempoolAgeMs: 0,
+            lockedEoaCount: 1, oldestLockedAgeMs: 600_000, pendingReceiptCount: 0,
+            oldestPendingReceiptAgeMs: 0, circuitDegraded: 0, reputationBannedSenders: 0,
+            submitFailureStreak: 0, lastSubmitError: null, insufficientFundsEoa: null,
+          },
           DEFAULT_OPERATIONAL_THRESHOLDS, opAlerter,
         );
         record("alerting", "operational monitor fires a live stuck-EOA alert", opAlertSent, "stuck-money → intervention alert delivered (live)");

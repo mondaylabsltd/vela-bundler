@@ -5,6 +5,10 @@
 export interface RateLimitConfig {
   /** Max requests per minute per IP. */
   rateLimitPerMinute: number;
+  /** Exact client IPs exempt from rate limiting — the operator's OWN bot must never
+   *  self-throttle its trading ops (receipt polls alone can eat a 60/min budget).
+   *  Built once at config parse (RATE_LIMIT_ALLOWLIST env), not per request. */
+  allowlist?: Set<string>;
 }
 
 /** In-memory rate limiter. */
@@ -43,6 +47,10 @@ export function rateLimitGuard(
 ): Response | null {
   const ip = extractClientIp(req, peerAddr);
 
+  // Allowlisted (trusted-source) IPs bypass counting entirely. "unknown" is never
+  // allowlistable — it is the shared fallback bucket, not a real client.
+  if (ip !== "unknown" && config.allowlist?.has(ip)) return null;
+
   const now = Date.now();
   const windowMs = 60_000;
 
@@ -64,6 +72,9 @@ export function rateLimitGuard(
   entry.count++;
 
   if (entry.count > config.rateLimitPerMinute) {
+    // Structured so self-throttling (the operator's own bot hitting the limit) is visible
+    // in Workers Logs / journald instead of silently 429ing user ops.
+    console.warn(JSON.stringify({ event: "rate_limited", ip, limit: config.rateLimitPerMinute }));
     return new Response(
       JSON.stringify({ error: "Rate limit exceeded" }),
       { status: 429, headers: { "Content-Type": "application/json" } },

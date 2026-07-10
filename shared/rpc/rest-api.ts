@@ -198,7 +198,10 @@ async function handleSponsor(
       requiredWei,
     );
 
-    return jsonResponse(result, 200, corsHeaders);
+    // An index/dependency OUTAGE is infrastructure, not a business rejection: answer 503 so
+    // generic clients (and the wallet) retry instead of treating the user as unregistered.
+    const status = result.reason === "passkey_index_unavailable" ? 503 : 200;
+    return jsonResponse(result, status, corsHeaders);
   } catch (err) {
     console.error(`[REST] Sponsor error for chain ${chainId} / ${safeAddress}:`, err);
     return jsonResponse({ sponsored: false, reason: "internal_error" }, 500, corsHeaders);

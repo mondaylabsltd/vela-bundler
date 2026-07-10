@@ -2,6 +2,10 @@
 Description=Vela Bundler — Private Prepaid ERC-4337 Bundler
 After=network-online.target
 Wants=network-online.target
+# Dead-man switch, host layer: when this unit FAILS (including start-limit exhaustion —
+# OnFailure fires on the final failure), push a Telegram alert. The process's in-band
+# alerting cannot report its own death; this unit can. See vela-bundler-alert.service.
+OnFailure=vela-bundler-alert.service
 
 [Service]
 Type=simple

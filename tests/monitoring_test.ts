@@ -94,10 +94,11 @@ Deno.test("NoopAlerter - send resolves without throwing", async () => {
 // --- Treasury monitor ---
 
 class RecordingAlerter implements Alerter {
-  readonly sent: { id: string; message: string }[] = [];
-  send(id: string, message: string): Promise<void> {
-    this.sent.push({ id, message });
-    return Promise.resolve();
+  readonly enabled = true;
+  readonly sent: { id: string; message: string; cooldownMs?: number }[] = [];
+  send(id: string, message: string, opts?: { cooldownMs?: number; noEscalation?: boolean }): Promise<boolean> {
+    this.sent.push({ id, message, cooldownMs: opts?.cooldownMs });
+    return Promise.resolve(true);
   }
 }
 
@@ -163,9 +164,52 @@ function healthySnap(overrides: Partial<OperationalSnapshot> = {}): OperationalS
     oldestMempoolAgeMs: 0, lockedEoaCount: 0, oldestLockedAgeMs: 0,
     pendingReceiptCount: 0, oldestPendingReceiptAgeMs: 0, circuitDegraded: 0,
     reputationBannedSenders: 0,
+    submitFailureStreak: 0, lastSubmitError: null, insufficientFundsEoa: null,
     ...overrides,
   };
 }
+
+Deno.test("checkOperationalHealth - repeated broadcast failures fire submit-failing", async () => {
+  const alerter = new RecordingAlerter();
+  await checkOperationalHealth(
+    healthySnap({ submitFailureStreak: 3, lastSubmitError: "nonce too low" }),
+    DEFAULT_OPERATIONAL_THRESHOLDS, alerter,
+  );
+  assertEquals(alerter.sent.length, 1);
+  assertEquals(alerter.sent[0]!.id, "submit-failing-1");
+  assert(alerter.sent[0]!.message.includes("nonce too low"));
+});
+
+Deno.test("checkOperationalHealth - a streak below the threshold stays quiet", async () => {
+  const alerter = new RecordingAlerter();
+  await checkOperationalHealth(
+    healthySnap({ submitFailureStreak: 2, lastSubmitError: "blip" }),
+    DEFAULT_OPERATIONAL_THRESHOLDS, alerter,
+  );
+  assertEquals(alerter.sent.length, 0);
+});
+
+Deno.test("checkOperationalHealth - an underfunded EOA fires eoa-underfunded with the address", async () => {
+  const alerter = new RecordingAlerter();
+  const eoa = ("0x" + "ab".repeat(20)) as `0x${string}`;
+  await checkOperationalHealth(
+    healthySnap({ insufficientFundsEoa: eoa, lastSubmitError: "insufficient funds" }),
+    DEFAULT_OPERATIONAL_THRESHOLDS, alerter,
+  );
+  assertEquals(alerter.sent.length, 1);
+  assertEquals(alerter.sent[0]!.id, `eoa-underfunded-1-${eoa}`);
+  assert(alerter.sent[0]!.message.includes(eoa), "the alert must name the address to top up");
+});
+
+Deno.test("checkOperationalHealth - money-stuck alerts use the shorter cooldown", async () => {
+  const alerter = new RecordingAlerter();
+  await checkOperationalHealth(
+    healthySnap({ oldestMempoolAgeMs: 200_000 }),
+    DEFAULT_OPERATIONAL_THRESHOLDS, alerter,
+  );
+  assertEquals(alerter.sent.length, 1);
+  assertEquals(alerter.sent[0]!.cooldownMs, 10 * 60 * 1000);
+});
 
 Deno.test("checkOperationalHealth - no alerts when everything is healthy", async () => {
   const alerter = new RecordingAlerter();
