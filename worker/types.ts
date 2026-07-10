@@ -34,4 +34,6 @@ export interface Env {
   TELEGRAM_CHAT_ID?: string;
   TREASURY_ALERT_THRESHOLD_WEI?: string;
   TREASURY_ALERT_THRESHOLD_PATHUSD?: string;
+  /** Comma-separated client IPs exempt from rate limiting (the operator's own bot). */
+  RATE_LIMIT_ALLOWLIST?: string;
 }

@@ -74,6 +74,7 @@ export function startRpcServer(
 ): Deno.HttpServer {
   const rateLimitConfig: RateLimitConfig = {
     rateLimitPerMinute: config.apiRateLimitPerMinute,
+    allowlist: new Set(config.rateLimitAllowlist),
   };
 
   const server = Deno.serve(
@@ -108,6 +109,9 @@ export function startRpcServer(
         return Response.json({
           service: "vela-bundler",
           status: totalLockedEOAs > 0 || rel.circuit.degraded > 0 ? "degraded" : "ok",
+          // Checkable from outside — an operator who BELIEVES Telegram alerts are armed
+          // when the secrets are unset is the worst blind spot.
+          alerting: chainRegistry.alertingEnabled ? "telegram" : "disabled",
           activeChains: chains.length,
           mempoolSize: totalMempoolSize,
           oldestMempoolAgeMs,

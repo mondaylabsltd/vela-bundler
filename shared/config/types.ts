@@ -56,6 +56,9 @@ export interface BundlerConfig {
    *  shared/contracts/splitter.ts. */
   readonly splitterAddress: `0x${string}`;
   readonly apiRateLimitPerMinute: number;
+  /** Client IPs exempt from rate limiting (comma-separated env RATE_LIMIT_ALLOWLIST) —
+   *  the operator's own bot must never self-throttle its trading ops. */
+  readonly rateLimitAllowlist: string[];
   readonly balanceReserveMultiplier: number;
 
   /** Alchemy API key. When set, Alchemy RPCs are preferred for supported chains. */

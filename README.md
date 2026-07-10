@@ -94,7 +94,7 @@ npm run test:worker        # Run worker tests (vitest + miniflare)
 - `OPERATOR_SECRET` — required
 - `ALCHEMY_API_KEY` — optional, for preferred RPCs
 
-**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. DO alarms persist across eviction — no cron or pre-configuration needed.
+**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. DO alarms persist across eviction, every activated chain self-registers with a `chain-registry` DO, and a 5-minute cron probes each registered chain (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains (e.g. one-off testnets someone activated via `X-Rpc-Url`) stop their own alarm after ~5 minutes and wake instantly on the next accepted op.
 
 ## Key Derivation
 
@@ -191,7 +191,11 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 | `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum margin (10%) |
 | `MAX_PROFIT_MARGIN_BPS` | `15000` | Maximum margin cap |
 | `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
+| `RATE_LIMIT_ALLOWLIST` | — | Comma-separated client IPs exempt from rate limiting (your own bot) |
 | `BALANCE_RESERVE_MULTIPLIER` | `1` | Balance reserve multiplier |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | **Set both in production.** Telegram alerts for every intervention-worthy state (stuck money, broadcast failures, treasury low, code errors) + 6h alive heartbeat. Unset = disabled (loud warning; `alerting` field in `/health`) |
+| `TREASURY_ALERT_THRESHOLD_WEI` | `0.02 ETH` | Treasury alert floor (auto-raised to the sponsor's dynamic fail-closed floor on native chains) |
+| `TREASURY_ALERT_THRESHOLD_PATHUSD` | `0.5` | Tempo treasury alert floor (6-dec units) |
 
 ## Known Limitations
 

@@ -9,8 +9,20 @@ export interface JsonRpcError {
   data?: unknown;
 }
 
+/** Marker distinguishing errors DELIBERATELY built for the client (via these factories)
+ *  from arbitrary upstream objects that merely duck-type {code,message} — forwarding the
+ *  latter verbatim can leak provider internals (an Alchemy URL embeds the API key). */
+export const RPC_ERROR_MARKER = Symbol.for("vela.rpcError");
+
+export function isDeliberateRpcError(err: unknown): err is JsonRpcError {
+  return typeof err === "object" && err !== null &&
+    (err as Record<PropertyKey, unknown>)[RPC_ERROR_MARKER] === true;
+}
+
 export function rpcError(code: number, message: string, data?: unknown): JsonRpcError {
-  return { code, message, data };
+  const err: JsonRpcError = { code, message, data };
+  Object.defineProperty(err, RPC_ERROR_MARKER, { value: true, enumerable: false });
+  return err;
 }
 
 export function invalidRequest(message: string): JsonRpcError {

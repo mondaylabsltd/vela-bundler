@@ -117,8 +117,10 @@ export class AccountService {
       ? onchainBalance - reservedBalance
       : 0n;
 
-    // Init/refresh EOA state (nonce check)
-    const eoaState = await this.lockManager.initEOA(activeEOA.address, queryClient);
+    // Init/refresh EOA state (nonce check). ALWAYS via the trusted RPC: initEOA WRITES the
+    // custody-critical lock state, and a user-supplied X-Rpc-Url (queryClient) could feed
+    // lying nonces to unlock an in-flight EOA. The override only affects the balance VIEW above.
+    const eoaState = await this.lockManager.initEOA(activeEOA.address, this.client);
 
     // Determine status
     let status: EOAStatus = eoaState.status;

@@ -38,6 +38,7 @@ Deno.test("BundlerConfig defaults — all optional fields have sensible defaults
     treasuryAddress: "0x" + "00".repeat(20) as `0x${string}`,
     splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226",
     apiRateLimitPerMinute: 60,
+    rateLimitAllowlist: [],
     balanceReserveMultiplier: 1,
     alchemyApiKey: null,
     telegramBotToken: null,

@@ -11,8 +11,10 @@ import { handleRpcMethod } from "./handlers.ts";
 import {
   invalidRequest,
   internalError,
+  isDeliberateRpcError,
   type JsonRpcError,
 } from "./errors.ts";
+import { redactError } from "../reliability/log.ts";
 
 export interface JsonRpcResponse {
   jsonrpc: "2.0";
@@ -69,10 +71,14 @@ export async function processRequest(
     const result = await handleRpcMethod(req.method, params, config, chainRegistry, reqCtx);
     return { jsonrpc: "2.0", id, result };
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && "message" in err) {
-      return { jsonrpc: "2.0", id, error: err as JsonRpcError };
+    // ONLY errors deliberately built via the errors.ts factories are forwarded to the
+    // client. A {code,message} duck-type check would forward arbitrary upstream objects
+    // verbatim — a viem/provider error can embed the RPC URL (Alchemy key) in its message.
+    if (isDeliberateRpcError(err)) {
+      return { jsonrpc: "2.0", id, error: err };
     }
-    console.error(`[RPC] Error handling ${req.method}:`, err);
+    // Redacted: the raw error may carry an RPC URL with an embedded API key.
+    console.error(`[RPC] Internal error handling ${req.method}: ${redactError(err)}`);
     return {
       jsonrpc: "2.0",
       id,

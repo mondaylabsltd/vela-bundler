@@ -25,6 +25,7 @@ import {
   TEMPO_TREASURY_FLOOR,
 } from "../tempo.ts";
 import { redactError } from "../reliability/log.ts";
+import { createAlerter, type Alerter } from "../monitoring/telegram.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,8 +34,10 @@ import { redactError } from "../reliability/log.ts";
 /** Max relayer EOA nonce to qualify for sponsorship. */
 const MAX_SPONSOR_NONCE = 6;
 
-/** Gas units used to calculate the max sponsor amount per transfer. */
-const MAX_SPONSOR_GAS = 5_000_000n;
+/** Gas units used to calculate the max sponsor amount per transfer.
+ *  Exported: the treasury monitor derives its DYNAMIC low-balance threshold from the same
+ *  numbers the sponsor gates on, so "alert" always fires before "sponsorship fails closed". */
+export const MAX_SPONSOR_GAS = 5_000_000n;
 
 /**
  * Volatility margin applied to the *server-side* funding estimate (150% = +50%).
@@ -49,14 +52,22 @@ const SPONSOR_VOLATILITY_BUFFER_BPS = 15_000n;
 /** Minimum sponsor target balance (0.0001 ETH) — matches wallet client MIN_BALANCE_WEI. */
 const MIN_SPONSOR_BALANCE = 100_000_000_000_000n;
 
-/** Minimum treasury balance to keep (0.01 ETH). Won't sponsor below this. */
-const TREASURY_FLOOR = 10_000_000_000_000_000n;
+/** Minimum treasury balance to keep (0.01 ETH). Won't sponsor below this. Exported for the
+ *  treasury monitor's dynamic threshold (see MAX_SPONSOR_GAS). */
+export const TREASURY_FLOOR = 10_000_000_000_000_000n;
 
 /** Cooldown between sponsorship attempts for the same Safe address (5 min). */
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 
-/** Fallback gas limit for ETH transfers (L2s like Arbitrum need more than 21k). */
-const TRANSFER_GAS_FALLBACK = 100_000n;
+/** Short cooldown floor for a VERIFIABLY EMPTY Tempo gas float. The normal 5-min success
+ *  cooldown would strand an active user whose float just drained mid-session (fix #10's
+ *  refill path is useless if it's cooldown-blocked); 60s still bounds a hostile drain to
+ *  ~TEMPO_SPONSOR_TARGET per minute, further capped by the treasury floor. */
+const TEMPO_EMPTY_FLOAT_COOLDOWN_MS = 60 * 1000;
+
+/** Fallback gas limit for ETH transfers (L2s like Arbitrum need more than 21k). Exported for
+ *  the treasury monitor's dynamic threshold. */
+export const TRANSFER_GAS_FALLBACK = 100_000n;
 
 /** Timeout for waiting on tx confirmation. */
 const CONFIRM_TIMEOUT_MS = 15_000;
@@ -99,8 +110,14 @@ export class SponsorService {
    */
   private treasuryTxChain: Promise<unknown> = Promise.resolve();
 
-  constructor(config: BundlerConfig) {
+  /** Telegram alerter for intervention-worthy sponsor failures (treasury depleted / transfer
+   *  failing / passkey index down). Injectable for tests; defaults from config (no-op when
+   *  Telegram is unconfigured). `quiet` — the runtime already logged the enabled/disabled state. */
+  private readonly alerter: Alerter;
+
+  constructor(config: BundlerConfig, alerter?: Alerter) {
     this.config = config;
+    this.alerter = alerter ?? createAlerter(config, { quiet: true });
   }
 
   /** Run `fn` exclusively against the treasury nonce (serialized across all callers). */
@@ -121,9 +138,21 @@ export class SponsorService {
     const safeLower = safeAddress.toLowerCase();
     const relayerLower = relayerAddress.toLowerCase();
 
-    // 1. Rate limit — only blocks if a previous sponsorship SUCCEEDED recently
+    // 1. Rate limit — only blocks if a previous sponsorship SUCCEEDED recently.
+    // Tempo: a VERIFIABLY EMPTY float bypasses the 5-min success-cooldown (down to a 60s
+    // floor) — an active user whose float drained mid-session must be refillable NOW, not
+    // in five minutes (that stall is exactly a "user's money can't move" incident).
     const lastTime = this.lastAttempt.get(safeLower);
-    if (lastTime && Date.now() - lastTime < RATE_LIMIT_COOLDOWN_MS) {
+    let cooldownMs = RATE_LIMIT_COOLDOWN_MS;
+    if (lastTime && isTempoChain(chainId) && Date.now() - lastTime < RATE_LIMIT_COOLDOWN_MS) {
+      try {
+        const floatBalance = await tempoPathUsdBalance(getPublicClient(rpcUrl), relayerAddress);
+        if (floatBalance < TEMPO_SPONSOR_TARGET / 5n) cooldownMs = TEMPO_EMPTY_FLOAT_COOLDOWN_MS;
+      } catch {
+        // Balance read failed — keep the default cooldown (fail closed).
+      }
+    }
+    if (lastTime && Date.now() - lastTime < cooldownMs) {
       return { sponsored: false, reason: "rate_limited" };
     }
 
@@ -162,8 +191,11 @@ export class SponsorService {
     // is bounded by the passkey gate + per-transfer cap (tops up only to TEMPO_SPONSOR_TARGET) +
     // treasury floor (in _doSponsorTempo) + the 5-min per-safe cooldown (in sponsor()).
     if (isTempoChain(chainId)) {
-      const hasPasskey = await this.checkWebAuthnRegistration(safeAddress);
-      if (!hasPasskey) {
+      const passkey = await this.checkWebAuthnRegistration(safeAddress);
+      if (passkey === "unavailable") {
+        return await this.passkeyIndexUnavailable(chainId);
+      }
+      if (passkey === "not_registered") {
         return { sponsored: false, reason: "no_passkey_registered" };
       }
       return await this._doSponsorTempo(chainId, relayerAddress, rpcUrl);
@@ -195,15 +227,27 @@ export class SponsorService {
     }
 
     // 5. WebAuthn public key check — must be a registered Vela user
-    const hasPasskey = await this.checkWebAuthnRegistration(safeAddress);
-    if (!hasPasskey) {
+    const passkey = await this.checkWebAuthnRegistration(safeAddress);
+    if (passkey === "unavailable") {
+      return await this.passkeyIndexUnavailable(chainId);
+    }
+    if (passkey === "not_registered") {
       return { sponsored: false, reason: "no_passkey_registered" };
     }
 
-    // 6. Treasury balance check
+    // 6. Treasury balance check. Failing closed here blocks ALL new-user onboarding, so it
+    // must never be silent: alert with the address + computed shortfall (actionable top-up).
     const treasuryAddress = this.config.treasuryAddress;
     const treasuryBalance = await client.getBalance({ address: treasuryAddress });
-    if (treasuryBalance < TREASURY_FLOOR + maxSponsorAmount + TRANSFER_GAS_FALLBACK * gasPrice) {
+    const required = TREASURY_FLOOR + maxSponsorAmount + TRANSFER_GAS_FALLBACK * gasPrice;
+    if (treasuryBalance < required) {
+      await this.alerter.send(
+        `sponsor-depleted-${chainId}`,
+        `💸 Vela Bundler — treasury DEPLETED for sponsorship on chain ${chainId}.\n` +
+          `balance ${treasuryBalance} wei < required ${required} wei (shortfall ${required - treasuryBalance} wei)\n` +
+          `address ${treasuryAddress}\n` +
+          `New-user onboarding is failing closed — top up the treasury.`,
+      );
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
@@ -289,12 +333,33 @@ export class SponsorService {
         amount: "0x" + amount.toString(16),
       };
     } catch (err) {
-      console.error(`[Sponsor] Transfer failed:`, redactError(err));
+      const msg = redactError(err);
+      console.error(`[Sponsor] Transfer failed:`, msg);
+      // A failing treasury transfer blocks onboarding just like depletion — page the operator.
+      await this.alerter.send(
+        `sponsor-transfer-failed-${chainId}`,
+        `🐛 Vela Bundler — sponsorship transfer FAILED on chain ${chainId}: ${msg.slice(0, 300)}\n` +
+          `New users cannot be funded until this is resolved.`,
+      );
       return {
         sponsored: false,
         reason: "transfer_failed",
       };
     }
+  }
+
+  /** Shared handling for a WebAuthn-index outage: alert (it disables ALL sponsorship, which is
+   *  indistinguishable from "not registered" without this) and return a DISTINCT retryable
+   *  reason so the REST layer can answer 503 instead of a business rejection. */
+  // The index is a GLOBAL dependency (one URL for every chain), so the dedup id is fixed.
+  private async passkeyIndexUnavailable(_chainId: number): Promise<SponsorResult> {
+    console.warn(`[Sponsor] WebAuthn index UNAVAILABLE — sponsorship temporarily disabled`);
+    await this.alerter.send(
+      "sponsor-passkey-index-down",
+      `⚠️ Vela Bundler — WebAuthn passkey index (${WEBAUTHN_INDEX_URL}) is UNREACHABLE. ` +
+        `ALL sponsorship (new-user onboarding + Tempo float refills) is failing closed until it recovers.`,
+    );
+    return { sponsored: false, reason: "passkey_index_unavailable" };
   }
 
   /**
@@ -317,6 +382,14 @@ export class SponsorService {
 
     const treasuryBalance = await tempoPathUsdBalance(client, this.config.treasuryAddress);
     if (treasuryBalance < amount + TEMPO_TREASURY_FLOOR) {
+      const required = amount + TEMPO_TREASURY_FLOOR;
+      await this.alerter.send(
+        `sponsor-depleted-${chainId}`,
+        `💸 Vela Bundler — treasury pathUSD DEPLETED for Tempo sponsorship on chain ${chainId}.\n` +
+          `balance ${treasuryBalance} < required ${required} (6-dec units, shortfall ${required - treasuryBalance})\n` +
+          `address ${this.config.treasuryAddress}\n` +
+          `Gas-float refills are failing closed — users with drained floats are STUCK. Top up the treasury.`,
+      );
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
@@ -337,9 +410,17 @@ export class SponsorService {
   }
 
   /**
-   * Check if a Safe address has a registered WebAuthn public key.
+   * Check whether a Safe address has a registered WebAuthn public key.
+   *
+   * Three outcomes, NOT two: an index OUTAGE (5xx / network error / timeout) must be
+   * distinguishable from "not registered" — conflating them silently disables all
+   * sponsorship for as long as the outage lasts, with every caller told "no passkey"
+   * (a business rejection the wallet won't retry). Callers map "unavailable" to a
+   * retryable failure + a Telegram alert.
    */
-  private async checkWebAuthnRegistration(safeAddress: `0x${string}`): Promise<boolean> {
+  private async checkWebAuthnRegistration(
+    safeAddress: `0x${string}`,
+  ): Promise<"registered" | "not_registered" | "unavailable"> {
     // walletRef = address left-padded to bytes32
     const stripped = safeAddress.replace(/^0x/, "").toLowerCase();
     const walletRef = "0x" + stripped.padStart(64, "0");
@@ -350,11 +431,14 @@ export class SponsorService {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), WEBAUTHN_QUERY_TIMEOUT_MS);
       const res = await fetch(url, { signal: ac.signal }).finally(() => clearTimeout(timer));
-      return res.ok; // 200 = registered, 404 = not found
+      if (res.ok) return "registered";
+      if (res.status === 404) return "not_registered";
+      console.warn(`[Sponsor] WebAuthn index returned ${res.status} for ${safeAddress}`);
+      return "unavailable"; // 5xx / unexpected status — the index is broken, not the user
     } catch {
-      // Network error or timeout — deny sponsorship
+      // Network error or timeout — the index is unreachable, not the user unregistered.
       console.warn(`[Sponsor] WebAuthn index query failed for ${safeAddress}`);
-      return false;
+      return "unavailable";
     }
   }
 }

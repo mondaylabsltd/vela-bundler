@@ -11,12 +11,28 @@ import {
   SPLITTER_SALT,
 } from "../shared/contracts/splitter.ts";
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
+import { redactError } from "../shared/reliability/log.ts";
 
 // Re-export BundlerDO for wrangler to discover
 export { BundlerDO } from "./bundler-do.ts";
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    // Nothing in here may escape as an unhandled exception: a throw (bad OPERATOR_SECRET in
+    // deriveTreasuryAddress, a stub.fetch rejection mid-deploy) would surface as an opaque
+    // CF 1101 error page instead of a JSON-RPC error the wallet can handle.
+    try {
+      return await this.route(request, env);
+    } catch (err) {
+      console.error("[Worker] fetch error:", redactError(err));
+      return Response.json(
+        { jsonrpc: "2.0", id: null, error: { code: -32603, message: "Internal error" } },
+        { status: 500, headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
+      );
+    }
+  },
+
+  async route(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     // CORS preflight
@@ -91,10 +107,41 @@ export default {
     );
   },
 
-  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
-    // No-op. DO alarms are persisted by Cloudflare and survive eviction,
-    // so no external cron is needed to keep them alive. Once a chain's DO
-    // is initialized by the first request, its alarm chain is self-sustaining.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Liveness cron (external layer of the dead-man switch). DO alarms are self-sustaining
+    // in NORMAL operation — but a storage error during setAlarm or an exhausted CF alarm
+    // retry budget can break the chain permanently, and a dead alarm cannot report itself.
+    // Every 5 minutes, enumerate the chain-registry DO (every chain DO self-registers on
+    // activation — NO manual chain list) and probe each chain's DO with a storage-only
+    // check that re-arms + alerts if the alarm chain was broken. Deliberately-idle chains
+    // (drained testnets) read as healthy and are left asleep.
+    ctx.waitUntil(
+      (async () => {
+        let chainIds: number[] = [];
+        try {
+          const registry = env.BUNDLER.get(env.BUNDLER.idFromName("chain-registry"));
+          const res = await registry.fetch("https://bundler-do/registry-list");
+          const body = await res.json().catch(() => null) as { chains?: number[] } | null;
+          chainIds = (body?.chains ?? []).filter((n) => Number.isFinite(n) && n > 0);
+        } catch (err) {
+          console.error(`[Worker] cron could not enumerate the chain registry: ${redactError(err)}`);
+          return;
+        }
+        await Promise.allSettled(chainIds.map(async (chainId) => {
+          try {
+            const doId = env.BUNDLER.idFromName(`chain-${chainId}`);
+            const stub = env.BUNDLER.get(doId);
+            const res = await stub.fetch(new Request("https://bundler-do/ensure-alarm"));
+            const body = await res.json().catch(() => null) as { rearmed?: boolean } | null;
+            if (body?.rearmed) {
+              console.error(`[Worker] cron re-armed a broken alarm chain for chain ${chainId}`);
+            }
+          } catch (err) {
+            console.error(`[Worker] cron liveness probe failed for chain ${chainId}: ${redactError(err)}`);
+          }
+        }));
+      })(),
+    );
   },
 };
 

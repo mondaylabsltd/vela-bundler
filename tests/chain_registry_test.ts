@@ -144,6 +144,7 @@ function fullConfig(): BundlerConfig {
     treasuryAddress: "0x" + "cc".repeat(20) as `0x${string}`,
     splitterAddress: "0x3979be163bFb74Dce66F8E0839577807C2197226" as `0x${string}`,
     apiRateLimitPerMinute: 60, balanceReserveMultiplier: 1, alchemyApiKey: null,
+    rateLimitAllowlist: [],
     telegramBotToken: null, telegramChatId: null, treasuryAlertThresholdWei: 0n, treasuryAlertThresholdPathUsd: 0n,
   };
 }

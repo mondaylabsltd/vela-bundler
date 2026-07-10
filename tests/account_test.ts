@@ -22,6 +22,7 @@ Deno.test("EOALockManager - acquireBundleLock and release", () => {
     pendingNonce: 0,
     reservedBalance: 0n,
     bundleLock: false,
+    version: 0,
   });
 
   assert(lm.isAvailable(EOA_A));
@@ -42,6 +43,7 @@ Deno.test("EOALockManager - bundle lock sets status to LOCKED_IN_MEMORY_PENDING"
     pendingNonce: 5,
     reservedBalance: 0n,
     bundleLock: false,
+    version: 0,
   });
 
   lm.acquireBundleLock(EOA_A);
@@ -60,6 +62,7 @@ Deno.test("EOALockManager - cannot acquire lock on LOCKED_PENDING_UNKNOWN", () =
     pendingNonce: 6, // pending > latest
     reservedBalance: 0n,
     bundleLock: true,
+    version: 0,
   });
 
   assert(!lm.isAvailable(EOA_A));
@@ -75,6 +78,7 @@ Deno.test("EOALockManager - reservation tracking", () => {
     pendingNonce: 0,
     reservedBalance: 0n,
     bundleLock: false,
+    version: 0,
   });
 
   assertEquals(lm.getReservedBalance(EOA_A), 0n);
@@ -101,6 +105,7 @@ Deno.test("EOALockManager - lockEOA forces lock", () => {
     pendingNonce: 5,
     reservedBalance: 0n,
     bundleLock: false,
+    version: 0,
   });
 
   lm.lockEOA(EOA_A, "LOCKED_PENDING_UNKNOWN");
@@ -117,6 +122,7 @@ Deno.test("EOALockManager - clear resets all state", () => {
     pendingNonce: 0,
     reservedBalance: 100n,
     bundleLock: false,
+    version: 0,
   });
 
   lm.clear();

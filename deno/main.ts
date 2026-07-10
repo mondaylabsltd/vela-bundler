@@ -18,6 +18,8 @@ import { ChainRegistry } from "../shared/chain/index.ts";
 import { startRpcServer } from "./server.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
+import { createAlerter } from "../shared/monitoring/telegram.ts";
+import { redactError } from "../shared/reliability/log.ts";
 
 async function main() {
   // Treasury address is always derived from OPERATOR_SECRET (same address on all chains).
@@ -25,6 +27,33 @@ async function main() {
   if (!secret) throw new Error("Missing required environment variable: OPERATOR_SECRET");
   const treasuryAddress = await deriveTreasuryAddress(secret);
   const config = loadConfig(treasuryAddress);
+
+  // One process-level alerter, shared with the registry/sponsor so every alert id dedups
+  // against a single map. Logs loudly whether alerting is ENABLED or DISABLED.
+  const alerter = createAlerter(config);
+
+  // A code bug escaping every inner catch must NOT kill the fund-custody process silently:
+  // keep the process alive (preventDefault), page the operator, and log. Timers, server and
+  // in-memory state remain coherent — an unhandled rejection here is by definition a bug in
+  // a background promise, not a corrupted core loop.
+  globalThis.addEventListener("unhandledrejection", (ev) => {
+    ev.preventDefault();
+    console.error("[Fatal] unhandled rejection:", redactError(ev.reason));
+    void alerter.send(
+      "fatal-unhandled",
+      `🐛 Vela Bundler (deno) — UNHANDLED REJECTION (code bug):\n${redactError(ev.reason).slice(0, 500)}\n` +
+        `Process kept alive; investigate immediately.`,
+    );
+  });
+  globalThis.addEventListener("error", (ev) => {
+    ev.preventDefault();
+    console.error("[Fatal] uncaught error:", redactError(ev.error ?? ev.message));
+    void alerter.send(
+      "fatal-uncaught",
+      `🐛 Vela Bundler (deno) — UNCAUGHT ERROR (code bug):\n${redactError(ev.error ?? ev.message).slice(0, 500)}\n` +
+        `Process kept alive; investigate immediately.`,
+    );
+  });
 
   console.log(`[Vela Bundler] Starting...`);
   console.log(`  EntryPoint:      ${config.entryPointAddress}`);
@@ -39,10 +68,19 @@ async function main() {
     oldOperatorSecrets: config.oldOperatorSecrets,
   });
 
-  const chainRegistry = new ChainRegistry(config, keyManager);
-  const sponsorService = new SponsorService(config);
+  const chainRegistry = new ChainRegistry(config, keyManager, alerter);
+  const sponsorService = new SponsorService(config, alerter);
 
   const server = startRpcServer(config, chainRegistry, sponsorService);
+
+  // Boot ping: proves the Telegram pipe end-to-end on every start, and makes a systemd
+  // crash-restart loop VISIBLE as repeated boot messages (cooldownMs 0 — each restart has
+  // a fresh dedup map anyway; the explicit 0 documents the intent).
+  void alerter.send(
+    "startup",
+    `🟢 Vela Bundler (deno) started — ${config.host}:${config.port}, treasury ${config.treasuryAddress}`,
+    { cooldownMs: 0 },
+  );
 
   // Graceful shutdown: stop accepting requests, stop all timers (no new bundles start while
   // draining), then let in-flight HTTP requests finish. In-flight on-chain txs are recovered
@@ -73,7 +111,12 @@ async function main() {
 }
 
 if (import.meta.main) {
-  main();
+  // A startup failure must exit non-zero (systemd Restart= + OnFailure= alert unit key off
+  // it) instead of leaving a half-started process behind an unhandled rejection.
+  main().catch((err) => {
+    console.error("[Vela Bundler] fatal startup error:", err);
+    Deno.exit(1);
+  });
 }
 
 export { main };

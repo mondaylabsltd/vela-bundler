@@ -15,9 +15,15 @@ import { BundlerService } from "../bundler/index.ts";
 import type { KeyManager } from "../keys/types.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { resolveRpcUrl, getPublicClient } from "../utils/rpc-client.ts";
+import { withTimeout } from "../utils/timeout.ts";
 import { createAlerter, type Alerter } from "../monitoring/telegram.ts";
 import { checkTreasuryBalance } from "../monitoring/treasury.ts";
-import { checkOperationalHealth, DEFAULT_OPERATIONAL_THRESHOLDS } from "../monitoring/operational.ts";
+import {
+  checkOperationalHealth,
+  DEFAULT_OPERATIONAL_THRESHOLDS,
+  maybeSendAliveHeartbeat,
+} from "../monitoring/operational.ts";
+import { RepeatedErrorEscalator } from "../monitoring/escalation.ts";
 import { reliabilityHealth } from "../reliability/rpc-fetch.ts";
 
 export interface ChainServices {
@@ -73,16 +79,28 @@ export class ChainRegistry {
   private initLocks: Map<number, Promise<ChainServices>> = new Map();
   private healthTimer?: ReturnType<typeof setInterval>;
   private lastDecayAt: number = Date.now();
+  private lastHeartbeatAt: number = Date.now();
   private readonly alerter: Alerter;
+  /** Repeated-exception escalation: the SAME phase failing N consecutive cycles is a code
+   *  bug / dead dependency and must reach Telegram, not just the console. */
+  private readonly escalator: RepeatedErrorEscalator;
 
   constructor(
     private readonly globalConfig: BundlerConfig,
     private readonly keyManager: KeyManager,
+    alerter?: Alerter,
   ) {
     // Telegram alerter (no-op unless TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are configured).
-    this.alerter = createAlerter(globalConfig);
+    // Injectable so the process-level alerter (deno/main.ts) shares one dedup map.
+    this.alerter = alerter ?? createAlerter(globalConfig);
+    this.escalator = new RepeatedErrorEscalator(this.alerter);
     // Start global health loop
     this.healthTimer = setInterval(() => this.healthLoop(), HEALTH_INTERVAL_MS);
+  }
+
+  /** Whether alerts actually deliver (surfaced in /health — see telegram.ts). */
+  get alertingEnabled(): boolean {
+    return this.alerter.enabled;
   }
 
   /**
@@ -219,68 +237,115 @@ export class ChainRegistry {
     const now = Date.now();
     const shouldDecay = now - this.lastDecayAt >= REPUTATION_DECAY_INTERVAL_MS;
 
-    for (const chain of this.chains.values()) {
-      // Durable reconciliation of in-flight bundles (unified with the Worker DO alarm): poll
-      // pending receipts, capture them, release reservations, and recover the EOA. Runs BEFORE
-      // recoverLockedEOAs so a just-confirmed bundle unlocks its EOA here rather than being chased
-      // by the nonce-based recovery.
-      try {
-        await chain.bundler.checkPendingReceipts();
-      } catch (err) {
-        console.error(`[Health] Chain ${chain.chainId} pending-receipt reconcile error:`, err);
-      }
-
-      try {
-        await this.recoverLockedEOAs(chain);
-      } catch (err) {
-        console.error(`[Health] Chain ${chain.chainId} recovery error:`, err);
-      }
-
-      // Treasury-balance monitor (deduped Telegram alert when low). No-op alerter if unconfigured.
-      try {
-        await checkTreasuryBalance({
-          chainId: chain.chainId,
-          chainName: chain.chainInfo?.name ?? null,
-          treasuryAddress: this.globalConfig.treasuryAddress,
-          client: getPublicClient(chain.rpcUrl),
-          thresholdWei: this.globalConfig.treasuryAlertThresholdWei,
-          thresholdPathUsd: this.globalConfig.treasuryAlertThresholdPathUsd,
-          alerter: this.alerter,
-        });
-      } catch (err) {
-        console.error(`[Health] Chain ${chain.chainId} treasury monitor error:`, err);
-      }
-
-      // Operational-health monitor: alert on any STUCK condition where a user's money can't move
-      // (stuck mempool op / unconfirmed bundle / locked EOA / degraded RPC). No-op if unconfigured.
-      try {
-        await checkOperationalHealth({
-          chainId: chain.chainId,
-          chainName: chain.chainInfo?.name ?? null,
-          oldestMempoolAgeMs: chain.mempool.oldestEntryAgeMs(),
-          lockedEoaCount: chain.accountService.lockManager.getLockedEOAs().length,
-          oldestLockedAgeMs: chain.accountService.lockManager.oldestLockedAgeMs(),
-          pendingReceiptCount: chain.bundler.pendingReceiptCount,
-          oldestPendingReceiptAgeMs: chain.bundler.oldestPendingReceiptAgeMs(),
-          circuitDegraded: reliabilityHealth().circuit.degraded,
-          reputationBannedSenders: chain.mempool.reputation.countPenalized("sender").banned,
-        }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
-      } catch (err) {
-        console.error(`[Health] Chain ${chain.chainId} operational monitor error:`, err);
-      }
-
-      // Hourly reputation decay
-      if (shouldDecay) {
-        try {
-          chain.mempool.reputation.decay();
-        } catch (err) {
-          console.error(`[Health] Chain ${chain.chainId} reputation decay error:`, err);
-        }
-      }
-    }
+    // Chains run CONCURRENTLY with a generous per-chain wall cap: one degraded chain's RPC
+    // stalls must not delay other chains' reconciliation, EOA recovery, or ALERTS (the old
+    // serialized loop made the alerting system itself non-live under a single bad chain).
+    // Inner awaits are individually 5–15.5s bounded, so 60s only trips on pathology; the
+    // per-chain sections keep their own try/catch and the reconciler its reentrancy guard.
+    await Promise.allSettled(
+      [...this.chains.values()].map((chain) =>
+        withTimeout(this.perChainHealth(chain, shouldDecay), 60_000, `health-chain-${chain.chainId}`)
+          .catch((err) => console.error(`[Health] Chain ${chain.chainId} cycle error:`, err)),
+      ),
+    );
 
     if (shouldDecay) {
       this.lastDecayAt = now;
+    }
+
+    // Alive heartbeat (dead-man switch, in-process layer): periodic "alive" so SILENCE on
+    // the Telegram channel means the bundler is down. Runs after the chain work so the
+    // stats reflect this cycle.
+    try {
+      let mempoolSize = 0, locked = 0, pending = 0;
+      for (const c of this.chains.values()) {
+        mempoolSize += c.mempool.size;
+        locked += c.accountService.lockManager.getLockedEOAs().length;
+        pending += c.bundler.pendingReceiptCount;
+      }
+      this.lastHeartbeatAt = await maybeSendAliveHeartbeat({
+        alerter: this.alerter,
+        lastSentAt: this.lastHeartbeatAt,
+        runtime: "deno",
+        stats: `${this.chains.size} chain(s), mempool ${mempoolSize}, locked EOAs ${locked}, pending receipts ${pending}`,
+      });
+    } catch (err) {
+      console.error(`[Health] heartbeat error:`, err);
+    }
+  }
+
+  /** One chain's health-cycle work. Every section reports to the escalator: transient noise
+   *  stays in the console, but the SAME section failing 3 consecutive cycles pages via
+   *  Telegram (a code bug or a dead dependency — developer intervention by definition). */
+  private async perChainHealth(chain: ChainServices, shouldDecay: boolean): Promise<void> {
+    // Durable reconciliation of in-flight bundles (unified with the Worker DO alarm): poll
+    // pending receipts, capture them, release reservations, and recover the EOA. Runs BEFORE
+    // recoverLockedEOAs so a just-confirmed bundle unlocks its EOA here rather than being chased
+    // by the nonce-based recovery.
+    try {
+      await chain.bundler.checkPendingReceipts();
+      this.escalator.ok("reconcile", chain.chainId);
+    } catch (err) {
+      console.error(`[Health] Chain ${chain.chainId} pending-receipt reconcile error:`, err);
+      await this.escalator.note("reconcile", chain.chainId, err);
+    }
+
+    try {
+      await this.recoverLockedEOAs(chain);
+      this.escalator.ok("eoa-recovery", chain.chainId);
+    } catch (err) {
+      console.error(`[Health] Chain ${chain.chainId} recovery error:`, err);
+      await this.escalator.note("eoa-recovery", chain.chainId, err);
+    }
+
+    // Treasury-balance monitor (deduped Telegram alert when low). No-op alerter if unconfigured.
+    try {
+      await checkTreasuryBalance({
+        chainId: chain.chainId,
+        chainName: chain.chainInfo?.name ?? null,
+        treasuryAddress: this.globalConfig.treasuryAddress,
+        client: getPublicClient(chain.rpcUrl),
+        thresholdWei: this.globalConfig.treasuryAlertThresholdWei,
+        thresholdPathUsd: this.globalConfig.treasuryAlertThresholdPathUsd,
+        alerter: this.alerter,
+      });
+      this.escalator.ok("treasury-monitor", chain.chainId);
+    } catch (err) {
+      console.error(`[Health] Chain ${chain.chainId} treasury monitor error:`, err);
+      await this.escalator.note("treasury-monitor", chain.chainId, err);
+    }
+
+    // Operational-health monitor: alert on any STUCK condition where a user's money can't move
+    // (stuck mempool op / unconfirmed bundle / locked EOA / repeated broadcast failure /
+    // underfunded EOA / degraded RPC). No-op if unconfigured.
+    try {
+      await checkOperationalHealth({
+        chainId: chain.chainId,
+        chainName: chain.chainInfo?.name ?? null,
+        oldestMempoolAgeMs: chain.mempool.oldestEntryAgeMs(),
+        lockedEoaCount: chain.accountService.lockManager.getLockedEOAs().length,
+        oldestLockedAgeMs: chain.accountService.lockManager.oldestLockedAgeMs(),
+        pendingReceiptCount: chain.bundler.pendingReceiptCount,
+        oldestPendingReceiptAgeMs: chain.bundler.oldestPendingReceiptAgeMs(),
+        circuitDegraded: reliabilityHealth().circuit.degraded,
+        reputationBannedSenders: chain.mempool.reputation.countPenalized("sender").banned,
+        submitFailureStreak: chain.bundler.submitFailureStreak,
+        lastSubmitError: chain.bundler.lastSubmitError,
+        insufficientFundsEoa: chain.bundler.insufficientFundsEoa,
+      }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
+      this.escalator.ok("operational-monitor", chain.chainId);
+    } catch (err) {
+      console.error(`[Health] Chain ${chain.chainId} operational monitor error:`, err);
+      await this.escalator.note("operational-monitor", chain.chainId, err);
+    }
+
+    // Hourly reputation decay
+    if (shouldDecay) {
+      try {
+        chain.mempool.reputation.decay();
+      } catch (err) {
+        console.error(`[Health] Chain ${chain.chainId} reputation decay error:`, err);
+      }
     }
   }
 

@@ -22,7 +22,13 @@
     }
   ],
 
-  // No cron needed — DO alarms persist across eviction and are self-sustaining.
+  // Liveness cron (dead-man switch, external layer): probes each ACTIVE_CHAINS DO every
+  // 5 minutes and re-arms (+ alerts) a broken alarm chain. DO alarms self-sustain in normal
+  // operation, but a break (storage error during setAlarm, exhausted CF alarm retry budget)
+  // cannot report itself — this is the only layer that catches it.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
 
   "observability": {
     "enabled": true,

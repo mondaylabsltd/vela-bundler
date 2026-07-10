@@ -60,8 +60,10 @@ Deno.test("mempool - a TTL-evicted op fires the eviction hook (feeds a terminal 
   mp.setTtlEvictionHook((e) => evicted.push(e.userOpHash));
   const hash = mp.add(makeOp());
   // Backdate the entry past the 5-min TTL (entries are live objects in the map).
+  // The TTL keys off firstSeenAt (age survives fee-bump replacements — open issue #3).
   const entry = mp.dump()[0]!;
   (entry as { addedAt: number }).addedAt = Date.now() - 10 * 60 * 1000;
+  (entry as { firstSeenAt: number }).firstSeenAt = Date.now() - 10 * 60 * 1000;
   mp.getAll(); // triggers TTL eviction + hook
   assertEquals(mp.size, 0);
   assertEquals(evicted, [hash]);
