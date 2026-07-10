@@ -75,7 +75,40 @@ const CONFIRM_TIMEOUT_MS = 15_000;
 /** Timeout for WebAuthn index query. */
 const WEBAUTHN_QUERY_TIMEOUT_MS = 5_000;
 
-const WEBAUTHN_INDEX_URL = "https://webauthnp256-publickey-index.biubiu.tools";
+/**
+ * MUST be the same deployment the wallet registers to (vela-wallet
+ * DEFAULT_SERVICE_ENDPOINTS.passkeyIndexURL). The old
+ * webauthnp256-publickey-index.biubiu.tools host is a SEPARATE deployment that
+ * only converges after the on-chain commit-reveal — querying it made every
+ * brand-new wallet fail the passkey gate ("no_passkey_registered") until its
+ * registration landed on Gnosis and synced across.
+ */
+const WEBAUTHN_INDEX_URL = "https://p256-index.getvela.app";
+
+/** Denial cache TTL: identical re-asks within this window get the cached
+ *  denial back without re-running RPC reads or index queries. Failed attempts
+ *  used to be free to spam (the success cooldown never armed); this bounds
+ *  their cost while staying shorter than the wallet's 30s auto-retry. */
+const DENIAL_CACHE_MS = 20_000;
+
+/** dryRun probe results are served from cache for this long (see lastProbe). */
+const PROBE_CACHE_MS = 10_000;
+
+/**
+ * Global per-chain sponsorship circuit breaker — bounds worst-case treasury
+ * drain per 24h window no matter how many distinct (sybil) Safes ask. The
+ * per-Safe gates (balance ≥ 2×, nonce, passkey index) raise the per-account
+ * cost of farming, but counterfactual Safe addresses are free to mint, so a
+ * global ceiling is the only hard bound. In-memory is correct here: the
+ * service lives in a per-chain Durable Object singleton, and an active drain
+ * keeps the DO alive (eviction resets only an idle window).
+ *
+ * The wei ceiling is denominated in native wei (18-dec); Tempo grants are
+ * 6-dec pathUSD units, so the grants ceiling is the binding one there.
+ */
+const SPONSOR_DAILY_MAX_GRANTS = 150;
+const SPONSOR_DAILY_MAX_WEI = 2_000_000_000_000_000_000n; // 2 native units / 24h
+const SPONSOR_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -86,6 +119,10 @@ export interface SponsorResult {
   txHash?: string;
   amount?: string; // hex wei
   reason?: string;
+  /** Set on dryRun responses: the request was an eligibility probe. */
+  dryRun?: boolean;
+  /** dryRun only: whether a real request would have been granted. */
+  eligible?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +138,20 @@ export class SponsorService {
   /** Rate limit: safeAddress (lowercase) → last attempt timestamp. */
   private readonly lastAttempt = new Map<string, number>();
 
+  /** Recent eligibility denials: safeAddress (lowercase) → cached result.
+   *  See DENIAL_CACHE_MS. */
+  private readonly lastDenial = new Map<string, { at: number; result: SponsorResult }>();
+
+  /** Recent dryRun probe results: safeAddress (lowercase) → cached result.
+   *  Denials are already covered by lastDenial; this additionally caches
+   *  ELIGIBLE probes so a spammer with a qualifying Safe can't burn 3-4 RPC
+   *  reads per request. Short TTL — eligibility must stay fresh enough for
+   *  the Continue→slide window. */
+  private readonly lastProbe = new Map<string, { at: number; result: SponsorResult }>();
+
+  /** Rolling 24h grant budget (see SPONSOR_DAILY_MAX_GRANTS). */
+  private budget = { windowStart: 0, grants: 0, totalWei: 0n };
+
   /**
    * Serializes all transactions sent FROM the single treasury EOA. Without this, two
    * concurrent sponsorships of DIFFERENT safes both auto-fetch the same `pending` nonce
@@ -115,9 +166,19 @@ export class SponsorService {
    *  Telegram is unconfigured). `quiet` — the runtime already logged the enabled/disabled state. */
   private readonly alerter: Alerter;
 
-  constructor(config: BundlerConfig, alerter?: Alerter) {
+  /** Effective budget ceilings — constants by default, injectable for tests. */
+  private readonly maxDailyGrants: number;
+  private readonly maxDailyWei: bigint;
+
+  constructor(
+    config: BundlerConfig,
+    alerter?: Alerter,
+    budgetLimits?: { maxGrants?: number; maxWei?: bigint },
+  ) {
     this.config = config;
     this.alerter = alerter ?? createAlerter(config, { quiet: true });
+    this.maxDailyGrants = budgetLimits?.maxGrants ?? SPONSOR_DAILY_MAX_GRANTS;
+    this.maxDailyWei = budgetLimits?.maxWei ?? SPONSOR_DAILY_MAX_WEI;
   }
 
   /** Run `fn` exclusively against the treasury nonce (serialized across all callers). */
@@ -128,15 +189,87 @@ export class SponsorService {
     return run;
   }
 
+  /** Roll the 24h budget window and report whether another grant fits. */
+  private budgetAllows(): boolean {
+    const now = Date.now();
+    if (now - this.budget.windowStart > SPONSOR_BUDGET_WINDOW_MS) {
+      this.budget = { windowStart: now, grants: 0, totalWei: 0n };
+    }
+    return this.budget.grants < this.maxDailyGrants &&
+      this.budget.totalWei < this.maxDailyWei;
+  }
+
+  /** Reserve budget BEFORE submitting — checked-then-consumed around an await
+   *  would let interleaved grants overshoot the ceiling. Refunded on failure. */
+  private consumeBudget(amountWei: bigint): void {
+    this.budget.grants += 1;
+    this.budget.totalWei += amountWei;
+  }
+
+  private refundBudget(amountWei: bigint): void {
+    if (this.budget.grants > 0) this.budget.grants -= 1;
+    this.budget.totalWei = this.budget.totalWei > amountWei ? this.budget.totalWei - amountWei : 0n;
+  }
+
+  /** Cache an eligibility denial so immediate identical re-asks are answered
+   *  without RPC/index work. Only stable eligibility outcomes are cached —
+   *  transient states (in-progress, pending, transfer errors) are not. */
+  private cacheDenial(safeLower: string, result: SponsorResult): SponsorResult {
+    // Only per-SAFE facts are cached. Global conditions are deliberately NOT:
+    // budget_exhausted is free to recompute (no RPC), and caching
+    // treasury_depleted per-safe would keep denying users for the TTL after
+    // the operator tops the treasury back up.
+    const CACHEABLE = new Set([
+      "nonce_exceeded",
+      "wallet_balance_too_low",
+      "no_passkey_registered",
+    ]);
+    if (result.reason && CACHEABLE.has(result.reason)) {
+      // Crude but safe size bound — the map lives in a per-chain DO.
+      if (this.lastDenial.size > 2_000) this.lastDenial.clear();
+      this.lastDenial.set(safeLower, { at: Date.now(), result });
+    }
+    return result;
+  }
+
   async sponsor(
     chainId: number,
     safeAddress: `0x${string}`,
     relayerAddress: `0x${string}`,
     rpcUrl: string,
     clientHintWei?: bigint,
+    dryRun = false,
   ): Promise<SponsorResult> {
     const safeLower = safeAddress.toLowerCase();
     const relayerLower = relayerAddress.toLowerCase();
+
+    // 0. Denial cache — a public, unauthenticated endpoint must not let failed
+    // attempts re-trigger RPC reads and index queries for free on every call.
+    const cached = this.lastDenial.get(safeLower);
+    if (cached && Date.now() - cached.at < DENIAL_CACHE_MS) {
+      return dryRun
+        ? { sponsored: false, dryRun: true, eligible: false, reason: cached.result.reason }
+        : cached.result;
+    }
+    // 0a. Probe cache — repeated dryRuns (incl. eligible ones) are answered
+    // from cache so probing is never a free RPC-amplification vector.
+    if (dryRun) {
+      const probed = this.lastProbe.get(safeLower);
+      if (probed && Date.now() - probed.at < PROBE_CACHE_MS) return probed.result;
+    }
+
+    // 0b. Global budget circuit breaker (see SPONSOR_DAILY_MAX_GRANTS).
+    if (!this.budgetAllows()) {
+      await this.alerter.send(
+        `sponsor-budget-${chainId}`,
+        `🚨 Vela Bundler — daily sponsorship budget EXHAUSTED on chain ${chainId} ` +
+          `(${this.budget.grants} grants / ${this.budget.totalWei} wei in the current window). ` +
+          `Legitimate new-user onboarding is failing closed. If this is organic growth, raise ` +
+          `SPONSOR_DAILY_MAX_*; if not, someone is farming the treasury.`,
+      );
+      const denied: SponsorResult = { sponsored: false, reason: "budget_exhausted" };
+      return dryRun ? { ...denied, dryRun: true, eligible: false } : this.cacheDenial(safeLower, denied);
+    }
 
     // 1. Rate limit — only blocks if a previous sponsorship SUCCEEDED recently.
     // Tempo: a VERIFIABLY EMPTY float bypasses the 5-min success-cooldown (down to a 60s
@@ -153,7 +286,8 @@ export class SponsorService {
       }
     }
     if (lastTime && Date.now() - lastTime < cooldownMs) {
-      return { sponsored: false, reason: "rate_limited" };
+      const limited: SponsorResult = { sponsored: false, reason: "rate_limited" };
+      return dryRun ? { ...limited, dryRun: true, eligible: false } : limited;
     }
 
     // 2. Concurrency guard
@@ -163,12 +297,26 @@ export class SponsorService {
     this.pending.add(relayerLower);
 
     try {
-      const result = await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl, clientHintWei);
+      const result = await this._doSponsor(chainId, safeLower as `0x${string}`, relayerLower as `0x${string}`, rpcUrl, clientHintWei, dryRun);
       // Only set cooldown on successful sponsorship — failed attempts can retry immediately
       if (result.sponsored) {
         this.lastAttempt.set(safeLower, Date.now());
+        this.lastDenial.delete(safeLower);
       }
-      return result;
+      if (dryRun) {
+        // already_funded / amount_too_small mean the account needs no grant —
+        // for a PROBE that is a green light (the send can proceed), not a
+        // denial; reporting them ineligible would bounce a payable user to
+        // the funding sheet.
+        const needsNoGrant = result.reason === "already_funded" || result.reason === "amount_too_small";
+        const probeResult: SponsorResult = result.dryRun
+          ? result // already decorated (eligible)
+          : { sponsored: false, dryRun: true, eligible: needsNoGrant, reason: result.reason };
+        if (this.lastProbe.size > 2_000) this.lastProbe.clear();
+        this.lastProbe.set(safeLower, { at: Date.now(), result: probeResult });
+        return probeResult;
+      }
+      return result.sponsored ? result : this.cacheDenial(safeLower, result);
     } finally {
       this.pending.delete(relayerLower);
     }
@@ -180,6 +328,7 @@ export class SponsorService {
     relayerAddress: `0x${string}`,
     rpcUrl: string,
     clientHintWei?: bigint,
+    dryRun = false,
   ): Promise<SponsorResult> {
     const client = getPublicClient(rpcUrl);
 
@@ -198,7 +347,7 @@ export class SponsorService {
       if (passkey === "not_registered") {
         return { sponsored: false, reason: "no_passkey_registered" };
       }
-      return await this._doSponsorTempo(chainId, relayerAddress, rpcUrl);
+      return await this._doSponsorTempo(chainId, relayerAddress, rpcUrl, dryRun);
     }
 
     // 3. Nonce check — only sponsor new relayers (native chains: the EOA is user-funded and
@@ -215,11 +364,16 @@ export class SponsorService {
     const gasBased = MAX_SPONSOR_GAS * gasPrice;
     const maxSponsorAmount = gasBased > MIN_SPONSOR_BALANCE ? gasBased : MIN_SPONSOR_BALANCE;
     // ×2 = gas-usage buffer; ×1.5 (15_000 bps) = volatility margin for gas-price
-    // spikes. The hint is compared raw and used as-is when it wins — it carries
-    // the wallet's own headroom, so it doesn't get the server-side volatility margin.
+    // spikes. The hint carries the wallet's own headroom, so it doesn't get the
+    // server-side volatility margin — but the endpoint is public, so an
+    // attacker-supplied requiredWei is capped at 3× our own estimate rather
+    // than being trusted up to the full per-transfer cap (5M gas × gasPrice is
+    // enormous on expensive chains).
     const serverEstimate = (gasPrice * 600_000n * 2n * SPONSOR_VOLATILITY_BUFFER_BPS) / 10_000n;
+    const hintCap = serverEstimate * 3n;
+    const boundedHint = clientHintWei && clientHintWei > hintCap ? hintCap : clientHintWei;
     let targetBalance = serverEstimate;
-    if (clientHintWei && clientHintWei > targetBalance) targetBalance = clientHintWei;
+    if (boundedHint && boundedHint > targetBalance) targetBalance = boundedHint;
     if (targetBalance < MIN_SPONSOR_BALANCE) targetBalance = MIN_SPONSOR_BALANCE;
     const sponsorAmount = targetBalance > maxSponsorAmount ? maxSponsorAmount : targetBalance;
     if (safeBalance < sponsorAmount * 2n) {
@@ -262,6 +416,14 @@ export class SponsorService {
       return { sponsored: false, reason: "amount_too_small" };
     }
 
+    // Eligibility probe stops here — every gate passed, no money moves. The
+    // wallet uses this to route denials to its funding sheet at Continue while
+    // deferring the real grant to the confirm slide (maximum-commitment
+    // moment, so grants are recouped by the settlement split within seconds).
+    if (dryRun) {
+      return { sponsored: false, dryRun: true, eligible: true };
+    }
+
     // 7. Execute transfer from treasury
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     const account = privateKeyToAccount(treasuryPrivateKey);
@@ -300,6 +462,7 @@ export class SponsorService {
       if (transferGas < 21_000n) transferGas = 21_000n;
     } catch { /* use fallback */ }
 
+    this.consumeBudget(amount);
     try {
       // Serialize the submit against the treasury nonce — concurrent sponsorships of
       // other safes must not pick the same nonce. The confirmation wait stays outside
@@ -333,6 +496,7 @@ export class SponsorService {
         amount: "0x" + amount.toString(16),
       };
     } catch (err) {
+      this.refundBudget(amount);
       const msg = redactError(err);
       console.error(`[Sponsor] Transfer failed:`, msg);
       // A failing treasury transfer blocks onboarding just like depletion — page the operator.
@@ -371,6 +535,7 @@ export class SponsorService {
     chainId: number,
     relayerAddress: `0x${string}`,
     rpcUrl: string,
+    dryRun = false,
   ): Promise<SponsorResult> {
     const client = getPublicClient(rpcUrl);
 
@@ -393,20 +558,31 @@ export class SponsorService {
       return { sponsored: false, reason: "treasury_depleted" };
     }
 
+    // Eligibility probe stops here — gates passed, no pathUSD moves.
+    if (dryRun) {
+      return { sponsored: false, dryRun: true, eligible: true };
+    }
+
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     console.log(
       `[Sponsor][Tempo] treasury → ${relayerAddress} (chain ${chainId}): ${amount} pathUSD units`,
     );
-    // Serialized against the treasury nonce (see runTreasuryExclusive).
-    const txHash = await this.runTreasuryExclusive(() => sponsorTempoPathUsd({
-      chainId,
-      privateKey: treasuryPrivateKey,
-      rpcUrl,
-      to: relayerAddress,
-      amount,
-    }));
-    console.log(`[Sponsor][Tempo] Confirmed: ${txHash}`);
-    return { sponsored: true, txHash, amount: "0x" + amount.toString(16) };
+    this.consumeBudget(amount);
+    try {
+      // Serialized against the treasury nonce (see runTreasuryExclusive).
+      const txHash = await this.runTreasuryExclusive(() => sponsorTempoPathUsd({
+        chainId,
+        privateKey: treasuryPrivateKey,
+        rpcUrl,
+        to: relayerAddress,
+        amount,
+      }));
+      console.log(`[Sponsor][Tempo] Confirmed: ${txHash}`);
+      return { sponsored: true, txHash, amount: "0x" + amount.toString(16) };
+    } catch (err) {
+      this.refundBudget(amount);
+      throw err;
+    }
   }
 
   /**

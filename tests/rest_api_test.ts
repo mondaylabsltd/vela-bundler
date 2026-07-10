@@ -164,3 +164,50 @@ Deno.test("handleRestApi - CORS headers present on all v1 responses", async () =
   assert(result!.headers.get("Access-Control-Allow-Methods")!.includes("GET"));
   assert(result!.headers.get("Access-Control-Allow-Methods")!.includes("POST"));
 });
+
+Deno.test("handleRestApi - POST /v1/sponsor parses dryRun + requiredWei and passes them through", async () => {
+  const safeAddr = "0x" + "22".repeat(20);
+  const captured: { args?: unknown[] } = {};
+  const stubSponsor = {
+    sponsor(...args: unknown[]) {
+      captured.args = args;
+      return Promise.resolve({ sponsored: false, dryRun: true, eligible: true });
+    },
+  };
+  const registry: ChainRegistryLike = {
+    getChain() {
+      return Promise.resolve({
+        rpcUrl: "https://trusted.example.com",
+        accountService: {
+          deriveEOA: () => Promise.resolve({ address: "0x" + "33".repeat(20) }),
+        },
+      } as never);
+    },
+  } as unknown as ChainRegistryLike;
+
+  const req = new Request(`http://localhost/v1/sponsor/1/${safeAddr}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requiredWei: "0x3e8", dryRun: true }),
+  });
+  const url = new URL(req.url);
+  const result = await handleRestApi(
+    req,
+    url,
+    registry,
+    mockConfig(),
+    mockRateLimitConfig(),
+    undefined,
+    stubSponsor as never,
+  );
+  assert(result !== null);
+  assertEquals(result!.status, 200);
+  const body = await result!.json();
+  assertEquals(body, { sponsored: false, dryRun: true, eligible: true });
+  // sponsor(chainId, safe, relayer, trustedRpc, requiredWei, dryRun)
+  assertEquals(captured.args![0], 1);
+  assertEquals(captured.args![1], safeAddr.toLowerCase());
+  assertEquals(captured.args![3], "https://trusted.example.com");
+  assertEquals(captured.args![4], 1000n);
+  assertEquals(captured.args![5], true);
+});

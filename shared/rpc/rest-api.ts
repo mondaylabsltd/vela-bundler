@@ -76,11 +76,15 @@ export async function handleRestApi(
     /^\/v1\/sponsor\/(\d+)\/(0x[0-9a-fA-F]{40})$/,
   );
   if (sponsorMatch && req.method === "POST" && sponsorService) {
-    // Parse optional requiredWei from request body
+    // Parse optional requiredWei + dryRun from request body. dryRun runs the
+    // eligibility gates without moving money — the wallet probes at Continue
+    // and defers the real grant to the confirm slide.
     let requiredWei: bigint | undefined;
+    let dryRun = false;
     try {
-      const body = await req.json() as { requiredWei?: string };
+      const body = await req.json() as { requiredWei?: string; dryRun?: boolean };
       if (body.requiredWei) requiredWei = BigInt(body.requiredWei);
+      dryRun = body.dryRun === true;
     } catch { /* no body or invalid JSON — use server-side calculation */ }
 
     return await handleSponsor(
@@ -92,6 +96,7 @@ export async function handleRestApi(
       sponsorService,
       requestRpcUrl,
       requiredWei,
+      dryRun,
     );
   }
 
@@ -172,6 +177,7 @@ async function handleSponsor(
   sponsorService: SponsorService,
   requestRpcUrl?: string,
   requiredWei?: bigint,
+  dryRun = false,
 ): Promise<Response> {
   if (!/^0x[0-9a-f]{40}$/.test(safeAddress)) {
     return jsonResponse({ error: "Invalid safeAddress" }, 400, corsHeaders);
@@ -196,6 +202,7 @@ async function handleSponsor(
       eoa.address,
       trustedRpc,
       requiredWei,
+      dryRun,
     );
 
     // An index/dependency OUTAGE is infrastructure, not a business rejection: answer 503 so
