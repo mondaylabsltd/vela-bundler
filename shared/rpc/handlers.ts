@@ -438,6 +438,16 @@ async function handleGetUserOperationGasPrice(
 
   // Speed tiers scale the priority tip only (as a percentage). Faster tier →
   // higher tip → faster inclusion; the relayer markup stays the same.
+  // Never quote 0: validateUserOpFields rejects maxFeePerGas = 0, so a 0x0 quote is
+  // self-refuting — the wallet would display "~0", sign it, and be rejected right
+  // here at submit. The catch above only covers THROWN price failures, but the reads
+  // can RESOLVE to all-zeros (an HTTP-200 rate-limit/error envelope on the forwarded
+  // X-Rpc-Url, or a zero-gas dev fork). All-zero signals = no usable price → the same
+  // retryable degraded error, so the wallet falls back to its own local estimate.
+  if (baseFee <= 0n && suggestedMaxPriorityFeePerGas <= 0n && chainGasPrice <= 0n) {
+    throw degradedFromError(new Error("all gas price signals are zero"), "gas price");
+  }
+
   function quote(tipMulPercent: number): Record<string, string> {
     const tip = (suggestedMaxPriorityFeePerGas * BigInt(tipMulPercent)) / 100n;
     // Real on-chain cost at this speed, floored at eth_gasPrice so legacy /

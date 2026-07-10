@@ -180,6 +180,25 @@ Deno.test("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost wi
   assert(BigInt(result.standard!.maxFeePerGas) > BigInt(result.slow!.maxFeePerGas));
 });
 
+Deno.test("pimlico_getUserOperationGasPrice - all-zero price signals → retryable degraded error, never a 0x0 quote", async () => {
+  // Price reads can RESOLVE to zeros without throwing (HTTP-200 rate-limit envelope
+  // on the forwarded RPC, zero-gas dev fork). A 0x0 quote is self-refuting — our own
+  // validateUserOpFields rejects maxFeePerGas = 0 — so the handler must degrade
+  // (retryable) and let the wallet fall back to its local estimate instead.
+  const config = mockConfig({ walletGasMarkup: 2.0 });
+  const registry = mockChainRegistry({
+    gasPrices: { baseFee: 0n, suggestedMaxPriorityFeePerGas: 0n, chainGasPrice: 0n },
+  });
+
+  const result = await processRequest(
+    { jsonrpc: "2.0", id: 1, method: "pimlico_getUserOperationGasPrice", params: [] },
+    config, registry, mockReqCtx(),
+  );
+  assert(result.error !== undefined, "expected a degraded error, got a quote");
+  assertEquals(result.error!.code, -32000);
+  assertEquals((result.error!.data as { retryable?: boolean })?.retryable, true);
+});
+
 Deno.test("handleRpcMethod - eth_supportedEntryPoints returns config entry point", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
