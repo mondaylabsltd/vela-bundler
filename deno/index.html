@@ -97,7 +97,7 @@ npm run test:worker        # Run worker tests (vitest + miniflare)
 <li><code>OPERATOR_SECRET</code> — required</li>
 <li><code>ALCHEMY_API_KEY</code> — optional, for preferred RPCs</li>
 </ul>
-<p><strong>How it works</strong>: Each chain gets its own Durable Object instance (<code>BundlerDO</code>), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces <code>setInterval</code>). Requests are routed by <code>POST /:chainId</code> → <code>env.BUNDLER.idFromName(&quot;chain-${chainId}&quot;)</code>. DO alarms persist across eviction — no cron or pre-configuration needed.</p>
+<p><strong>How it works</strong>: Each chain gets its own Durable Object instance (<code>BundlerDO</code>), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces <code>setInterval</code>). Requests are routed by <code>POST /:chainId</code> → <code>env.BUNDLER.idFromName(&quot;chain-${chainId}&quot;)</code>. DO alarms persist across eviction, every activated chain self-registers with a <code>chain-registry</code> DO, and a 5-minute cron probes each registered chain (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains (e.g. one-off testnets someone activated via <code>X-Rpc-Url</code>) stop their own alarm after ~5 minutes and wake instantly on the next accepted op.</p>
 <h2>Key Derivation</h2>
 <pre><code>HKDF-SHA256(
   IKM  = operatorSecret,
@@ -317,9 +317,29 @@ unrecoverable. See <code>docs/project-takeover/08-open-issues.md</code>.</p>
 <td>Rate limit per IP</td>
 </tr>
 <tr>
+<td><code>RATE_LIMIT_ALLOWLIST</code></td>
+<td>—</td>
+<td>Comma-separated client IPs exempt from rate limiting (your own bot)</td>
+</tr>
+<tr>
 <td><code>BALANCE_RESERVE_MULTIPLIER</code></td>
 <td><code>1</code></td>
 <td>Balance reserve multiplier</td>
+</tr>
+<tr>
+<td><code>TELEGRAM_BOT_TOKEN</code> / <code>TELEGRAM_CHAT_ID</code></td>
+<td>—</td>
+<td><strong>Set both in production.</strong> Telegram alerts for every intervention-worthy state (stuck money, broadcast failures, treasury low, code errors) + 6h alive heartbeat. Unset = disabled (loud warning; <code>alerting</code> field in <code>/health</code>)</td>
+</tr>
+<tr>
+<td><code>TREASURY_ALERT_THRESHOLD_WEI</code></td>
+<td><code>0.02 ETH</code></td>
+<td>Treasury alert floor (auto-raised to the sponsor&#39;s dynamic fail-closed floor on native chains)</td>
+</tr>
+<tr>
+<td><code>TREASURY_ALERT_THRESHOLD_PATHUSD</code></td>
+<td><code>0.5</code></td>
+<td>Tempo treasury alert floor (6-dec units)</td>
 </tr>
 </tbody></table>
 <h2>Known Limitations</h2>

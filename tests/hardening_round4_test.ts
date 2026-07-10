@@ -14,7 +14,7 @@
  *  - process.ts: unmarked {code,message} objects are NOT forwarded to clients
  */
 
-import { assertEquals, assert, assertThrows } from "@std/assert";
+import { assertEquals, assert } from "@std/assert";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   BundlerService,
@@ -376,7 +376,7 @@ Deno.test("checkPendingReceipts - legacy (unpinned) dropped verdict is debounced
 // ---------------------------------------------------------------------------
 
 function feeBumpFetchStub(sentRaw: string[]) {
-  return (input: string | URL | Request, init?: RequestInit) => {
+  return (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? "{}"));
     const answer = (result: unknown) =>
       new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
