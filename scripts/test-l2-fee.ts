@@ -2,7 +2,7 @@
  * Manual verification script: query real L2 nodes to test DA fee estimation.
  *
  * Usage:
- *   deno run --allow-net scripts/test-l2-fee.ts
+ *   node --experimental-strip-types scripts/test-l2-fee.ts
  */
 
 import { estimateArbitrumL1Gas, estimateOpStackL1Gas } from "../shared/gas/l2-data-fee.ts";
@@ -79,7 +79,7 @@ async function main() {
 
   if (arbGas === 0n && opGas === 0n && baseGas === 0n) {
     console.error("\n⚠ All estimates returned 0 — check RPC connectivity");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   console.log("\n✓ Estimates are non-zero — oracle calls working");

@@ -4,23 +4,14 @@ ERC-4337 / ERC-7769 multi-chain bundler for EntryPoint v0.7.
 
 Supports any EVM network listed at [ethereum-data.awesometools.dev](https://ethereum-data.awesometools.dev/).
 
-Two deployment targets: **Deno** (self-hosted) and **Cloudflare Workers** (edge).
+Runs on **Cloudflare Workers** (Durable Objects, edge).
 
 ## Quick Start
 
-### Deno (self-hosted)
-
-```bash
-export OPERATOR_SECRET=0x...   # 32+ byte hex secret for key derivation
-deno task start
-```
-
-### Cloudflare Workers
-
 ```bash
 npm install
-npx wrangler secret put OPERATOR_SECRET
-npx wrangler secret put ALCHEMY_API_KEY    # optional
+npx wrangler secret put OPERATOR_SECRET     # 32+ byte hex secret for key derivation
+npx wrangler secret put ALCHEMY_API_KEY     # optional
 npm run deploy
 ```
 
@@ -34,12 +25,12 @@ Any EVM chain is supported automatically — the first request for a chain creat
 4. Each bundle contains ops from **one safeAddress only**, signed by its dedicated EOA.
 5. On native chains the `handleOps` **beneficiary is the `VelaGasSettlementSplitter`**, whose `receive()` splits the EntryPoint gas refund 50/50 between the EOA and the treasury. On Tempo the bundler is repaid by an in-band stablecoin transfer. (There is no periodic treasury sweep — that mechanism was removed in favor of the on-chain splitter.)
 
-No database — all state is derived or in-memory.
+No external database — money-path state (accepted ops, in-flight receipts, terminal receipts) is persisted in per-chain Durable Object storage; the rest is derived or in-memory.
 
 ## Architecture
 
 ```
-shared/              Platform-agnostic logic (used by both runtimes)
+shared/              Platform-agnostic bundler logic (consumed by the worker)
 ├── config/          Configuration types + chain registry + Alchemy
 ├── keys/            Deterministic key derivation (HKDF-SHA256)
 ├── account/         Per-EOA balance, reservations, lock management
@@ -54,40 +45,26 @@ shared/              Platform-agnostic logic (used by both runtimes)
 ├── rpc/             JSON-RPC handlers + REST API + request processing
 └── utils/           Hex utilities, RPC client factory
 
-deno/                Deno runtime
-├── main.ts          Entry point
-├── config.ts        Env-based config (Deno.env)
-└── server.ts        HTTP server (Deno.serve)
-
 worker/              Cloudflare Workers runtime
 ├── index.ts         Fetch handler — routes by chainId to DO
 ├── bundler-do.ts    BundlerDO — one Durable Object per chain
 ├── config.ts        Env-based config (CF bindings)
 └── types.ts         Env interface
+
+tests/               shared/ unit tests (vitest, node project)
+worker/tests/        worker/ runtime tests (vitest, workerd pool)
 ```
 
 ## Deployment
 
-### Deno
-
-```bash
-deno task dev              # Dev with watch mode
-deno task start            # Production
-deno task test             # Run tests
-deno task deploy           # Interactive SSH deploy to remote server
-deno task deploy status    # Check remote status
-deno task deploy rollback  # Rollback to previous release
-```
-
-Uses systemd on the remote server. See `deploy/systemd/vela-bundler.service`.
-
-### Cloudflare Workers
-
 ```bash
 npm install
 npm run dev                # Local dev (wrangler dev)
-npm run deploy             # Deploy to Cloudflare
-npm run test:worker        # Run worker tests (vitest + miniflare)
+npm run deploy             # Deploy to Cloudflare (wrangler deploy)
+npm run typecheck          # tsc --noEmit
+npm test                   # All tests (node + workers vitest projects)
+npm run test:node          # shared/ unit tests only
+npm run test:worker        # worker/ runtime tests only (vitest + miniflare)
 ```
 
 **Secrets** (set via `npx wrangler secret put`):
@@ -143,18 +120,15 @@ All methods support `X-Rpc-Url` header. Batch requests capped at 20.
 
 ### Health Endpoint
 
+Global `/health` is intentionally minimal (no chain init):
+
 ```json
-{
-  "service": "vela-bundler",
-  "status": "ok",
-  "activeChains": 3,
-  "mempoolSize": 0,
-  "lockedEOAs": 0,
-  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
-}
+{ "service": "vela-bundler", "runtime": "cloudflare-workers", "status": "ok" }
 ```
 
-On CF Workers, global `/health` returns minimal info. Per-chain health available via the DO.
+Per-chain `GET /health/:chainId` reports real degraded state (locked EOAs, pending receipts,
+mempool age, circuit breaker, alerting) from that chain's Durable Object — read-only, does not
+force a chain init.
 
 ## Secret Rotation
 
@@ -175,8 +149,6 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPERATOR_SECRET` | — | **Required.** 32+ byte hex secret |
-| `PORT` | `3300` | Server port (Deno only) |
-| `HOST` | `0.0.0.0` | Server bind address (Deno only) |
 | `ENTRY_POINT_ADDRESS` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7 |
 | `BUNDLING_MODE` | `auto` | `auto` or `manual` |
 | `MAX_BUNDLE_SIZE` | `10` | Max UserOps per bundle |
@@ -199,11 +171,11 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 
 ## Known Limitations
 
-- **No database** — in-memory state lost on restart.
-- **Single instance** per deployment (Deno). CF Workers scale via Durable Objects.
+- **No external database** — money-path state persists in Durable Object storage and survives eviction; ephemeral caches (reputation decay, circuit-breaker state) reset on cold start.
+- **One Durable Object per chain** — each chain's throughput is bounded by its single DO (auto-bundling serialized per chain by design; the fund-custody EOA locking requires it).
 - **No opcode tracing** — ERC-7562 not implemented.
 - **No aggregator support.**
-- **Conservative restart** — unknown pending nonce locks the EOA until health loop recovers it.
+- **Conservative restart** — unknown pending nonce locks the EOA until the alarm health loop recovers it.
 
 ## License
 

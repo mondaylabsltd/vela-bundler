@@ -2,7 +2,7 @@
  * Tests for deterministic key derivation.
  */
 
-import { assertEquals, assert, assertNotEquals, assertRejects, assertThrows } from "@std/assert";
+import { it, expect } from "vitest";
 import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress, validateOperatorSecret } from "../shared/keys/derive.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
 
@@ -20,75 +20,75 @@ const SECP256K1_N =
 
 // --- Determinism ---
 
-Deno.test("deriveEOAPrivateKey - same inputs produce same key", async () => {
+it("deriveEOAPrivateKey - same inputs produce same key", async () => {
   const key1 = await deriveEOAPrivateKey(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const key2 = await deriveEOAPrivateKey(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
-  assertEquals(key1, key2);
+  expect(key1).toEqual(key2);
 });
 
-Deno.test("deriveEOAAddress - same inputs produce same address", async () => {
+it("deriveEOAAddress - same inputs produce same address", async () => {
   const addr1 = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const addr2 = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
-  assertEquals(addr1, addr2);
+  expect(addr1).toEqual(addr2);
 });
 
 // --- Uniqueness per parameter ---
 
-Deno.test("different chainId produces different address", async () => {
+it("different chainId produces different address", async () => {
   const addr1 = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const addr137 = await deriveEOAAddress(TEST_SECRET, 137, ENTRY_POINT, SAFE_A);
-  assertNotEquals(addr1, addr137);
+  expect(addr1).not.toEqual(addr137);
 });
 
-Deno.test("different entryPoint produces different address", async () => {
+it("different entryPoint produces different address", async () => {
   const ep2 = "0x1111111111111111111111111111111111111111" as const;
   const addr1 = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const addr2 = await deriveEOAAddress(TEST_SECRET, 1, ep2, SAFE_A);
-  assertNotEquals(addr1, addr2);
+  expect(addr1).not.toEqual(addr2);
 });
 
-Deno.test("different safeAddress produces different address", async () => {
+it("different safeAddress produces different address", async () => {
   const addrA = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const addrB = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_B);
-  assertNotEquals(addrA, addrB);
+  expect(addrA).not.toEqual(addrB);
 });
 
-Deno.test("different operatorSecret produces different address", async () => {
+it("different operatorSecret produces different address", async () => {
   const addr1 = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   const addr2 = await deriveEOAAddress(TEST_SECRET_2, 1, ENTRY_POINT, SAFE_A);
-  assertNotEquals(addr1, addr2);
+  expect(addr1).not.toEqual(addr2);
 });
 
 // --- Valid secp256k1 key ---
 
-Deno.test("derived private key is a valid secp256k1 key", async () => {
+it("derived private key is a valid secp256k1 key", async () => {
   const key = await deriveEOAPrivateKey(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
-  assert(key.startsWith("0x"));
-  assertEquals(key.length, 66); // 0x + 64 hex chars
+  expect(key.startsWith("0x")).toBeTruthy();
+  expect(key.length).toEqual(66); // 0x + 64 hex chars
 
   const keyBigInt = BigInt(key);
-  assert(keyBigInt > 0n, "Key must be > 0");
-  assert(keyBigInt < SECP256K1_N, "Key must be < secp256k1 curve order");
+  expect(keyBigInt > 0n, "Key must be > 0").toBeTruthy();
+  expect(keyBigInt < SECP256K1_N, "Key must be < secp256k1 curve order").toBeTruthy();
 });
 
-Deno.test("derived address is a valid Ethereum address", async () => {
+it("derived address is a valid Ethereum address", async () => {
   const addr = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
-  assert(/^0x[0-9a-f]{40}$/.test(addr));
+  expect(/^0x[0-9a-f]{40}$/.test(addr)).toBeTruthy();
 });
 
-Deno.test("100 different safeAddresses all produce valid keys", async () => {
+it("100 different safeAddresses all produce valid keys", async () => {
   for (let i = 0; i < 100; i++) {
     const safe = ("0x" + i.toString(16).padStart(40, "0")) as `0x${string}`;
     const key = await deriveEOAPrivateKey(TEST_SECRET, 1, ENTRY_POINT, safe);
     const keyBigInt = BigInt(key);
-    assert(keyBigInt > 0n);
-    assert(keyBigInt < SECP256K1_N);
+    expect(keyBigInt > 0n).toBeTruthy();
+    expect(keyBigInt < SECP256K1_N).toBeTruthy();
   }
 });
 
 // --- Case insensitivity ---
 
-Deno.test("address case doesn't affect derivation", async () => {
+it("address case doesn't affect derivation", async () => {
   const addrLower = await deriveEOAAddress(
     TEST_SECRET, 1, ENTRY_POINT,
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -97,12 +97,12 @@ Deno.test("address case doesn't affect derivation", async () => {
     TEST_SECRET, 1, ENTRY_POINT,
     "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as `0x${string}`,
   );
-  assertEquals(addrLower, addrUpper);
+  expect(addrLower).toEqual(addrUpper);
 });
 
 // --- LocalKeyManager ---
 
-Deno.test("LocalKeyManager - derives consistent EOA", async () => {
+it("LocalKeyManager - derives consistent EOA", async () => {
   const km = new LocalKeyManager({
     operatorSecret: TEST_SECRET,
   });
@@ -118,20 +118,20 @@ Deno.test("LocalKeyManager - derives consistent EOA", async () => {
     safeAddress: SAFE_A,
   });
 
-  assertEquals(eoa1.address, eoa2.address);
-  assert(eoa1.privateKey !== undefined);
+  expect(eoa1.address).toEqual(eoa2.address);
+  expect(eoa1.privateKey !== undefined).toBeTruthy();
 });
 
-Deno.test("LocalKeyManager - old secrets accessible", () => {
+it("LocalKeyManager - old secrets accessible", () => {
   const km = new LocalKeyManager({
     operatorSecret: TEST_SECRET,
     oldOperatorSecrets: [TEST_SECRET_2],
   });
 
-  assertEquals(km.getOldSecrets().length, 1);
+  expect(km.getOldSecrets().length).toEqual(1);
 });
 
-Deno.test("LocalKeyManager - rejects short operator secret (< 32 bytes)", () => {
+it("LocalKeyManager - rejects short operator secret (< 32 bytes)", () => {
   let threw = false;
   try {
     new LocalKeyManager({
@@ -140,10 +140,10 @@ Deno.test("LocalKeyManager - rejects short operator secret (< 32 bytes)", () => 
   } catch {
     threw = true;
   }
-  assert(threw, "Should reject secret shorter than 32 bytes");
+  expect(threw, "Should reject secret shorter than 32 bytes").toBeTruthy();
 });
 
-Deno.test("LocalKeyManager - rejects non-hex operator secret", () => {
+it("LocalKeyManager - rejects non-hex operator secret", () => {
   let threw = false;
   try {
     new LocalKeyManager({
@@ -152,17 +152,17 @@ Deno.test("LocalKeyManager - rejects non-hex operator secret", () => {
   } catch {
     threw = true;
   }
-  assert(threw, "Should reject non-hex secret");
+  expect(threw, "Should reject non-hex secret").toBeTruthy();
 });
 
-Deno.test("LocalKeyManager - accepts exactly 32-byte hex secret", () => {
+it("LocalKeyManager - accepts exactly 32-byte hex secret", () => {
   const km = new LocalKeyManager({
     operatorSecret: "0x" + "ab".repeat(32),
   });
-  assertEquals(km.getOldSecrets().length, 0);
+  expect(km.getOldSecrets().length).toEqual(0);
 });
 
-Deno.test("LocalKeyManager - validates old secrets too", () => {
+it("LocalKeyManager - validates old secrets too", () => {
   let threw = false;
   try {
     new LocalKeyManager({
@@ -172,57 +172,57 @@ Deno.test("LocalKeyManager - validates old secrets too", () => {
   } catch {
     threw = true;
   }
-  assert(threw, "Should reject invalid old secret");
+  expect(threw, "Should reject invalid old secret").toBeTruthy();
 });
 
 // --- Treasury derivation ---
 
-Deno.test("deriveTreasuryPrivateKey - deterministic", async () => {
+it("deriveTreasuryPrivateKey - deterministic", async () => {
   const key1 = await deriveTreasuryPrivateKey(TEST_SECRET);
   const key2 = await deriveTreasuryPrivateKey(TEST_SECRET);
-  assertEquals(key1, key2);
+  expect(key1).toEqual(key2);
 });
 
-Deno.test("deriveTreasuryAddress - same secret produces same address", async () => {
+it("deriveTreasuryAddress - same secret produces same address", async () => {
   const addr1 = await deriveTreasuryAddress(TEST_SECRET);
   const addr2 = await deriveTreasuryAddress(TEST_SECRET);
-  assertEquals(addr1, addr2);
-  assert(addr1.startsWith("0x"));
-  assertEquals(addr1.length, 42);
+  expect(addr1).toEqual(addr2);
+  expect(addr1.startsWith("0x")).toBeTruthy();
+  expect(addr1.length).toEqual(42);
 });
 
-Deno.test("deriveTreasuryAddress - different secret produces different address", async () => {
+it("deriveTreasuryAddress - different secret produces different address", async () => {
   const addr1 = await deriveTreasuryAddress(TEST_SECRET);
   const addr2 = await deriveTreasuryAddress(TEST_SECRET_2);
-  assertNotEquals(addr1, addr2);
+  expect(addr1).not.toEqual(addr2);
 });
 
-Deno.test("deriveTreasuryAddress - different from per-user EOA", async () => {
+it("deriveTreasuryAddress - different from per-user EOA", async () => {
   const treasury = await deriveTreasuryAddress(TEST_SECRET);
   const userEOA = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
-  assertNotEquals(treasury, userEOA);
+  expect(treasury).not.toEqual(userEOA);
 });
 
 // --- Secret validation (fail-closed on a malformed/weak OPERATOR_SECRET) ---
 
-Deno.test("validateOperatorSecret - rejects empty, non-hex, and too-short secrets", () => {
-  assertThrows(() => validateOperatorSecret(""), Error, "required");
-  assertThrows(() => validateOperatorSecret("0xnothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex__"), Error, "hex");
-  assertThrows(() => validateOperatorSecret("0x00"), Error, "at least 32 bytes");
+it("validateOperatorSecret - rejects empty, non-hex, and too-short secrets", () => {
+  expect(() => validateOperatorSecret("")).toThrow("required");
+  expect(() => validateOperatorSecret("0xnothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex_nothex__")).toThrow("hex");
+  expect(() => validateOperatorSecret("0x00")).toThrow("at least 32 bytes");
   // 31 bytes (62 hex chars) is below the floor.
-  assertThrows(() => validateOperatorSecret("0x" + "ab".repeat(31)), Error, "at least 32 bytes");
+  expect(() => validateOperatorSecret("0x" + "ab".repeat(31))).toThrow("at least 32 bytes");
   // Exactly 32 bytes is accepted (with and without 0x prefix).
   validateOperatorSecret("0x" + "ab".repeat(32));
   validateOperatorSecret("ab".repeat(32));
 });
 
-Deno.test("deriveTreasuryPrivateKey - rejects a malformed secret instead of deriving from zero bytes", async () => {
+it("deriveTreasuryPrivateKey - rejects a malformed secret instead of deriving from zero bytes", async () => {
   // Before the fix, non-hex chars were coerced to 0 bytes, silently deriving a WRONG-but-
   // non-erroring treasury key on the public /v1/treasury path. Must now fail closed.
-  await assertRejects(() => deriveTreasuryPrivateKey("0xzz" + "ab".repeat(31)), Error);
-  await assertRejects(() => deriveTreasuryPrivateKey("0x1234"), Error, "at least 32 bytes");
+  await expect(deriveTreasuryPrivateKey("0xzz" + "ab".repeat(31))).rejects.toThrow();
+  await expect(deriveTreasuryPrivateKey("0x1234")).rejects.toThrow("at least 32 bytes");
 });
 
-Deno.test("deriveEOAPrivateKey - rejects a malformed secret", async () => {
-  await assertRejects(() => deriveEOAPrivateKey("0x1234", 1, ENTRY_POINT, SAFE_A), Error, "at least 32 bytes");
+it("deriveEOAPrivateKey - rejects a malformed secret", async () => {
+  await expect(deriveEOAPrivateKey("0x1234", 1, ENTRY_POINT, SAFE_A)).rejects.toThrow("at least 32 bytes");
 });

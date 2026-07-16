@@ -2,7 +2,7 @@
  * Tests for chain registry — resolving RPC endpoints from chainId.
  */
 
-import { assertEquals, assert, assertRejects } from "@std/assert";
+import { it, expect } from "vitest";
 import {
   fetchChainInfo,
   filterPublicRpcUrls,
@@ -12,7 +12,7 @@ import {
 
 // --- filterPublicRpcUrls ---
 
-Deno.test("filterPublicRpcUrls - keeps only HTTPS, no WSS", () => {
+it("filterPublicRpcUrls - keeps only HTTPS, no WSS", () => {
   const input = [
     "https://rpc.example.com",
     "wss://ws.example.com",
@@ -20,13 +20,13 @@ Deno.test("filterPublicRpcUrls - keeps only HTTPS, no WSS", () => {
     "https://another.example.com",
   ];
   const result = filterPublicRpcUrls(input);
-  assertEquals(result, [
+  expect(result).toEqual([
     "https://rpc.example.com",
     "https://another.example.com",
   ]);
 });
 
-Deno.test("filterPublicRpcUrls - excludes template variable URLs", () => {
+it("filterPublicRpcUrls - excludes template variable URLs", () => {
   const input = [
     "https://mainnet.infura.io/v3/${INFURA_API_KEY}",
     "https://cloudflare-eth.com",
@@ -34,97 +34,93 @@ Deno.test("filterPublicRpcUrls - excludes template variable URLs", () => {
     "https://rpc.ankr.com/eth",
   ];
   const result = filterPublicRpcUrls(input);
-  assertEquals(result, [
+  expect(result).toEqual([
     "https://cloudflare-eth.com",
     "https://rpc.ankr.com/eth",
   ]);
 });
 
-Deno.test("filterPublicRpcUrls - empty input returns empty", () => {
-  assertEquals(filterPublicRpcUrls([]), []);
+it("filterPublicRpcUrls - empty input returns empty", () => {
+  expect(filterPublicRpcUrls([])).toEqual([]);
 });
 
 // --- chainSupportsEip1559 ---
 
-Deno.test("chainSupportsEip1559 - true when EIP1559 in features", () => {
-  assert(
+it("chainSupportsEip1559 - true when EIP1559 in features", () => {
+  expect(
     chainSupportsEip1559({
       features: [{ name: "EIP155" }, { name: "EIP1559" }],
     } as Parameters<typeof chainSupportsEip1559>[0]),
-  );
+  ).toBeTruthy();
 });
 
-Deno.test("chainSupportsEip1559 - false when no EIP1559 feature", () => {
-  assert(
+it("chainSupportsEip1559 - false when no EIP1559 feature", () => {
+  expect(
     !chainSupportsEip1559({
       features: [{ name: "EIP155" }],
     } as Parameters<typeof chainSupportsEip1559>[0]),
-  );
+  ).toBeTruthy();
 });
 
-Deno.test("chainSupportsEip1559 - false when no features field", () => {
-  assert(
+it("chainSupportsEip1559 - false when no features field", () => {
+  expect(
     !chainSupportsEip1559({} as Parameters<typeof chainSupportsEip1559>[0]),
-  );
+  ).toBeTruthy();
 });
 
 // --- fetchChainInfo (live network calls) ---
 
-Deno.test("fetchChainInfo - fetches Ethereum mainnet (chainId 1)", async () => {
+it("fetchChainInfo - fetches Ethereum mainnet (chainId 1)", async () => {
   const info = await fetchChainInfo(1);
-  assertEquals(info.chainId, 1);
-  assertEquals(info.name, "Ethereum Mainnet");
-  assert(info.rpc.length > 0, "Should have RPC endpoints");
-  assertEquals(info.nativeCurrency.symbol, "ETH");
+  expect(info.chainId).toEqual(1);
+  expect(info.name).toEqual("Ethereum Mainnet");
+  expect(info.rpc.length > 0, "Should have RPC endpoints").toBeTruthy();
+  expect(info.nativeCurrency.symbol).toEqual("ETH");
 });
 
-Deno.test("fetchChainInfo - fetches Polygon (chainId 137)", async () => {
+it("fetchChainInfo - fetches Polygon (chainId 137)", async () => {
   const info = await fetchChainInfo(137);
-  assertEquals(info.chainId, 137);
-  assert(info.name.includes("Polygon"));
-  assert(info.rpc.length > 0);
+  expect(info.chainId).toEqual(137);
+  expect(info.name.includes("Polygon")).toBeTruthy();
+  expect(info.rpc.length > 0).toBeTruthy();
 });
 
-Deno.test("fetchChainInfo - fetches Arbitrum One (chainId 42161)", async () => {
+it("fetchChainInfo - fetches Arbitrum One (chainId 42161)", async () => {
   const info = await fetchChainInfo(42161);
-  assertEquals(info.chainId, 42161);
-  assert(info.rpc.length > 0);
+  expect(info.chainId).toEqual(42161);
+  expect(info.rpc.length > 0).toBeTruthy();
 });
 
-Deno.test("fetchChainInfo - fetches Base (chainId 8453)", async () => {
+it("fetchChainInfo - fetches Base (chainId 8453)", async () => {
   const info = await fetchChainInfo(8453);
-  assertEquals(info.chainId, 8453);
-  assert(info.rpc.length > 0);
+  expect(info.chainId).toEqual(8453);
+  expect(info.rpc.length > 0).toBeTruthy();
 });
 
-Deno.test("fetchChainInfo - rejects unsupported chainId", async () => {
-  await assertRejects(
-    () => fetchChainInfo(99999999),
-    Error,
-    "not supported",
-  );
+it("fetchChainInfo - rejects unsupported chainId", async () => {
+  await expect(fetchChainInfo(99999999)).rejects.toThrow("not supported");
 });
 
 // --- Integration: filter real chain RPCs ---
 
-Deno.test("Ethereum mainnet has usable public RPCs after filtering", async () => {
+it("Ethereum mainnet has usable public RPCs after filtering", async () => {
   const info = await fetchChainInfo(1);
   const publicRpcs = filterPublicRpcUrls(info.rpc);
-  assert(publicRpcs.length > 0, `Expected public RPCs, got: ${publicRpcs}`);
+  expect(publicRpcs.length > 0, `Expected public RPCs, got: ${publicRpcs}`).toBeTruthy();
   // All should be HTTPS
   for (const url of publicRpcs) {
-    assert(url.startsWith("https://"), `Expected HTTPS: ${url}`);
-    assert(!url.includes("${"), `Should not contain template vars: ${url}`);
+    expect(url.startsWith("https://"), `Expected HTTPS: ${url}`).toBeTruthy();
+    expect(!url.includes("${"), `Should not contain template vars: ${url}`).toBeTruthy();
   }
 });
 
 // --- pickBestRpc ---
 
-Deno.test("pickBestRpc - returns a working RPC for Ethereum mainnet", async () => {
+it("pickBestRpc - returns a working RPC for Ethereum mainnet", async () => {
   const info = await fetchChainInfo(1);
   const publicRpcs = filterPublicRpcUrls(info.rpc);
   const best = await pickBestRpc(publicRpcs, 1);
-  assert(best.startsWith("https://"));
+  expect(best.startsWith("https://")).toBeTruthy();
 });
 
 // --- ChainRegistry.dispose() — graceful-shutdown timer release (O-4) ---
@@ -149,7 +145,7 @@ function fullConfig(): BundlerConfig {
   };
 }
 
-Deno.test("ChainRegistry.dispose - clears the health timer without leaking (idempotent)", () => {
+it("ChainRegistry.dispose - clears the health timer without leaking (idempotent)", () => {
   // The Deno test resource sanitizer fails this test if the 30s health interval leaks —
   // so a passing test proves dispose() released it. Also assert double-dispose is safe.
   const config = fullConfig();

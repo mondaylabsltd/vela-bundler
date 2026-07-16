@@ -13,9 +13,7 @@ private key is deterministically derived from the operator secret. Users prepay 
 native tokens (or a stablecoin float on Tempo) to that EOA; the bundler submits `handleOps` from it.
 
 - Entry point contract: `0x0000000071727De22E5E9d8BAf0edAc6f37da032` (EntryPoint v0.7), configurable via `ENTRY_POINT_ADDRESS`.
-- Language/runtime: **TypeScript**, run on **two targets** that share a `shared/` core:
-  - **Deno** self-hosted server (`deno/`), deployed via systemd — see [05-deployment-runbook.md](05-deployment-runbook.md).
-  - **Cloudflare Workers** (`worker/`), one **Durable Object per chain** (`BundlerDO`).
+- Language/runtime: **TypeScript**, deployed to **Cloudflare Workers** only (`worker/`), one **Durable Object per chain** (`BundlerDO`), over a shared `shared/` core — see [05-deployment-runbook.md](05-deployment-runbook.md).
 - On-chain deps: **viem 2.52.2**; a vendored Foundry contract `VelaGasSettlementSplitter` (`evm_contracts/`).
 - **No database.** All state is either derived (keys/addresses) or in-memory (mempool, reservations, EOA locks). The Worker runtime additionally persists a small amount to DO storage (chainId, pending receipts, decay timestamp).
 
@@ -50,12 +48,9 @@ native tokens (or a stablecoin float on Tempo) to that EOA; the bundler submits 
 | `utils/` | Hex helpers, viem client factory, **SSRF-validating RPC URL check**, timeouts, RPC blacklist | `rpc-client.ts`, `hex.ts`, `timeout.ts`, `rpc-blacklist.ts` |
 | `tempo.ts` | All Tempo-chain (0x76 tx) specifics: fee token, cost math, reimbursement parsing, sponsorship | `tempo.ts` |
 
-## Runtimes
+## Runtime
 
-### Deno (`deno/`)
-- `main.ts` — derives treasury, loads config, constructs `ChainRegistry` + `SponsorService`, starts the HTTP server. No SIGTERM/graceful-shutdown handler.
-- `server.ts` — `Deno.serve` handler. Routes `GET /`, `GET /health` (+`/api/health`), REST `/v1/*`, and JSON-RPC `POST /:chainId`. Rate-limits by **real TCP peer address** (`info.remoteAddr`, not spoofable headers). Streams the body with a 256 KB cap.
-- `config.ts` — env → `BundlerConfig`. Auto-bundling per chain is driven by `ChainRegistry` timers (lazy per chain, first request starts them).
+**Cloudflare Workers** (`worker/`) is the only deployment target. (The former Deno self-hosted server, `deno/`, was removed 2026-07-16 — see the migration banner in [README.md](README.md).)
 
 ### Cloudflare Workers (`worker/`)
 - `index.ts` — fetch handler; routes `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`.

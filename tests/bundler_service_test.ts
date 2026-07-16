@@ -6,7 +6,7 @@
  * public API without requiring real RPC connections.
  */
 
-import { assertEquals, assertExists } from "@std/assert";
+import { it, expect } from "vitest";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { Mempool } from "../shared/mempool/index.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
@@ -95,43 +95,43 @@ function mockAccountService(): AccountService {
 
 // --- Tests ---
 
-Deno.test("BundlerService - constructor sets manual mode", () => {
+it("BundlerService - constructor sets manual mode", () => {
   const config = mockConfig({ bundlingMode: "manual" });
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
-  assertExists(service);
+  expect(service != null).toBeTruthy();
 });
 
-Deno.test("BundlerService - tryBundle returns empty mempool error", async () => {
+it("BundlerService - tryBundle returns empty mempool error", async () => {
   const config = mockConfig();
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const result = await service.tryBundle();
-  assertEquals(result.submitted, false);
-  assertEquals(result.error, "Empty mempool");
-  assertEquals(result.userOpHashes.length, 0);
+  expect(result.submitted).toEqual(false);
+  expect(result.error).toEqual("Empty mempool");
+  expect(result.userOpHashes.length).toEqual(0);
 });
 
-Deno.test("BundlerService - getReceipt returns undefined for unknown hash", () => {
+it("BundlerService - getReceipt returns undefined for unknown hash", () => {
   const config = mockConfig();
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const receipt = service.getReceipt("0x" + "ab".repeat(32));
-  assertEquals(receipt, undefined);
+  expect(receipt).toEqual(undefined);
 });
 
-Deno.test("BundlerService - getUserOpByHash returns undefined for unknown hash", () => {
+it("BundlerService - getUserOpByHash returns undefined for unknown hash", () => {
   const config = mockConfig();
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
 
   const result = service.getUserOpByHash("0x" + "ab".repeat(32));
-  assertEquals(result, undefined);
+  expect(result).toEqual(undefined);
 });
 
-Deno.test("BundlerService - cleanExpiredReceipts is callable", () => {
+it("BundlerService - cleanExpiredReceipts is callable", () => {
   const config = mockConfig();
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
@@ -140,7 +140,7 @@ Deno.test("BundlerService - cleanExpiredReceipts is callable", () => {
   service.cleanExpiredReceipts();
 });
 
-Deno.test("BundlerService - setBundlingMode to auto then manual", () => {
+it("BundlerService - setBundlingMode to auto then manual", () => {
   const config = mockConfig({ bundlingMode: "manual" });
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
@@ -152,7 +152,7 @@ Deno.test("BundlerService - setBundlingMode to auto then manual", () => {
   // Should not throw
 });
 
-Deno.test("BundlerService - stopAutoBundling is idempotent", () => {
+it("BundlerService - stopAutoBundling is idempotent", () => {
   const config = mockConfig({ bundlingMode: "manual" });
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });
@@ -162,7 +162,7 @@ Deno.test("BundlerService - stopAutoBundling is idempotent", () => {
   service.stopAutoBundling();
 });
 
-Deno.test("BundlerService - dispose() releases timers and is idempotent (chain-eviction safety)", () => {
+it("BundlerService - dispose() releases timers and is idempotent (chain-eviction safety)", () => {
   // A chain evicted from the registry calls bundler.dispose() to release BOTH the auto-bundle
   // and the receipt-cleanup interval, so a flood of distinct chainIds can't leak timers.
   const config = mockConfig({ bundlingMode: "auto" });
@@ -175,7 +175,7 @@ Deno.test("BundlerService - dispose() releases timers and is idempotent (chain-e
   service.dispose();
 });
 
-Deno.test("BundlerService - checkPendingReceipts does nothing when empty", async () => {
+it("BundlerService - checkPendingReceipts does nothing when empty", async () => {
   const config = mockConfig();
   const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const service = new BundlerService(config, mempool, mockSimulator(), mockAccountService(), { disableTimers: true });

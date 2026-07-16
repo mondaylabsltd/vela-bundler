@@ -5,7 +5,7 @@
  * formatting without RPC dependencies.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import type { ChainRegistryLike } from "../shared/chain/index.ts";
@@ -64,84 +64,84 @@ function mockChainRegistry(): ChainRegistryLike {
 
 // --- Tests ---
 
-Deno.test("handleRestApi - returns null for non-v1 paths", async () => {
+it("handleRestApi - returns null for non-v1 paths", async () => {
   const req = new Request("http://localhost/health", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assertEquals(result, null);
+  expect(result).toEqual(null);
 });
 
-Deno.test("handleRestApi - returns null for root path", async () => {
+it("handleRestApi - returns null for root path", async () => {
   const req = new Request("http://localhost/", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assertEquals(result, null);
+  expect(result).toEqual(null);
 });
 
-Deno.test("handleRestApi - CORS preflight returns 204", async () => {
+it("handleRestApi - CORS preflight returns 204", async () => {
   const req = new Request("http://localhost/v1/treasury", { method: "OPTIONS" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 204);
-  assertEquals(result!.headers.get("Access-Control-Allow-Origin"), "*");
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(204);
+  expect(result!.headers.get("Access-Control-Allow-Origin")).toEqual("*");
 });
 
-Deno.test("handleRestApi - GET /v1/treasury returns treasury address", async () => {
+it("handleRestApi - GET /v1/treasury returns treasury address", async () => {
   const req = new Request("http://localhost/v1/treasury", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 200);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(200);
   const body = await result!.json();
-  assertEquals(body.address, TREASURY);
+  expect(body.address).toEqual(TREASURY);
 });
 
-Deno.test("handleRestApi - GET /v1/splitter returns address + derivation inputs", async () => {
+it("handleRestApi - GET /v1/splitter returns address + derivation inputs", async () => {
   const req = new Request("http://localhost/v1/splitter", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 200);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(200);
   const body = await result!.json();
-  assertEquals(body.address, "0x3979be163bFb74Dce66F8E0839577807C2197226");
-  assertEquals(body.treasury, TREASURY);
-  assertEquals(body.factory, "0x4e59b44847b379578588920cA78FbF26c0B4956C");
-  assertEquals(body.salt, "0x650cb20978a0e7efdcf6f077240c609a59f2f02401ed16fb4a222a2b51cb9720");
+  expect(body.address).toEqual("0x3979be163bFb74Dce66F8E0839577807C2197226");
+  expect(body.treasury).toEqual(TREASURY);
+  expect(body.factory).toEqual("0x4e59b44847b379578588920cA78FbF26c0B4956C");
+  expect(body.salt).toEqual("0x650cb20978a0e7efdcf6f077240c609a59f2f02401ed16fb4a222a2b51cb9720");
 });
 
-Deno.test("handleRestApi - returns 404 for unknown v1 path", async () => {
+it("handleRestApi - returns 404 for unknown v1 path", async () => {
   const req = new Request("http://localhost/v1/unknown", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 404);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(404);
   const body = await result!.json();
-  assertEquals(body.error, "Not found");
+  expect(body.error).toEqual("Not found");
 });
 
-Deno.test("handleRestApi - GET /v1/account with invalid address pattern returns 404", async () => {
+it("handleRestApi - GET /v1/account with invalid address pattern returns 404", async () => {
   // Address must be exactly 40 hex chars
   const req = new Request("http://localhost/v1/account/1/0xinvalid", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
+  expect(result !== null).toBeTruthy();
   // The regex won't match, so it falls through to 404
-  assertEquals(result!.status, 404);
+  expect(result!.status).toEqual(404);
 });
 
-Deno.test("handleRestApi - GET /v1/account with chain resolution failure returns 500", async () => {
+it("handleRestApi - GET /v1/account with chain resolution failure returns 500", async () => {
   const safeAddr = "0x" + "11".repeat(20);
   const req = new Request(`http://localhost/v1/account/1/${safeAddr}`, { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 500);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(500);
   const body = await result!.json();
-  assertEquals(body.error, "Internal error");
+  expect(body.error).toEqual("Internal error");
 });
 
-Deno.test("handleRestApi - POST /v1/sponsor without sponsorService returns 404", async () => {
+it("handleRestApi - POST /v1/sponsor without sponsorService returns 404", async () => {
   const safeAddr = "0x" + "11".repeat(20);
   const req = new Request(`http://localhost/v1/sponsor/1/${safeAddr}`, {
     method: "POST",
@@ -151,21 +151,21 @@ Deno.test("handleRestApi - POST /v1/sponsor without sponsorService returns 404",
   const url = new URL(req.url);
   // No sponsorService passed → falls through to 404
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.status, 404);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(404);
 });
 
-Deno.test("handleRestApi - CORS headers present on all v1 responses", async () => {
+it("handleRestApi - CORS headers present on all v1 responses", async () => {
   const req = new Request("http://localhost/v1/treasury", { method: "GET" });
   const url = new URL(req.url);
   const result = await handleRestApi(req, url, mockChainRegistry(), mockConfig(), mockRateLimitConfig());
-  assert(result !== null);
-  assertEquals(result!.headers.get("Access-Control-Allow-Origin"), "*");
-  assert(result!.headers.get("Access-Control-Allow-Methods")!.includes("GET"));
-  assert(result!.headers.get("Access-Control-Allow-Methods")!.includes("POST"));
+  expect(result !== null).toBeTruthy();
+  expect(result!.headers.get("Access-Control-Allow-Origin")).toEqual("*");
+  expect(result!.headers.get("Access-Control-Allow-Methods")!.includes("GET")).toBeTruthy();
+  expect(result!.headers.get("Access-Control-Allow-Methods")!.includes("POST")).toBeTruthy();
 });
 
-Deno.test("handleRestApi - POST /v1/sponsor parses dryRun + requiredWei and passes them through", async () => {
+it("handleRestApi - POST /v1/sponsor parses dryRun + requiredWei and passes them through", async () => {
   const safeAddr = "0x" + "22".repeat(20);
   const captured: { args?: unknown[] } = {};
   const stubSponsor = {
@@ -200,14 +200,14 @@ Deno.test("handleRestApi - POST /v1/sponsor parses dryRun + requiredWei and pass
     undefined,
     stubSponsor as never,
   );
-  assert(result !== null);
-  assertEquals(result!.status, 200);
+  expect(result !== null).toBeTruthy();
+  expect(result!.status).toEqual(200);
   const body = await result!.json();
-  assertEquals(body, { sponsored: false, dryRun: true, eligible: true });
+  expect(body).toEqual({ sponsored: false, dryRun: true, eligible: true });
   // sponsor(chainId, safe, relayer, trustedRpc, requiredWei, dryRun)
-  assertEquals(captured.args![0], 1);
-  assertEquals(captured.args![1], safeAddr.toLowerCase());
-  assertEquals(captured.args![3], "https://trusted.example.com");
-  assertEquals(captured.args![4], 1000n);
-  assertEquals(captured.args![5], true);
+  expect(captured.args![0]).toEqual(1);
+  expect(captured.args![1]).toEqual(safeAddr.toLowerCase());
+  expect(captured.args![3]).toEqual("https://trusted.example.com");
+  expect(captured.args![4]).toEqual(1000n);
+  expect(captured.args![5]).toEqual(true);
 });

@@ -28,7 +28,7 @@ import { RPC_TIMEOUT_MS } from "./timeout.ts";
  * that viem fails to parse and surfaces as an error — so the anti-SSRF protection
  * (a user-allowed host must not 302 us to an internal/metadata IP) is preserved.
  */
-export const RPC_REDIRECT_MODE: RequestRedirect = "manual";
+export const RPC_REDIRECT_MODE: "follow" | "error" | "manual" = "manual";
 
 const READ_TRANSPORT_OPTS = {
   timeout: RPC_TIMEOUT_MS,

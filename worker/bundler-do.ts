@@ -46,6 +46,7 @@ import {
 import {
   parseError,
   invalidRequest,
+  invalidParams,
   internalError,
 } from "../shared/rpc/errors.ts";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";

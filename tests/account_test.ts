@@ -2,7 +2,7 @@
  * Tests for account service, EOA lock manager, and binding rules.
  */
 
-import { assertEquals, assert, assertNotEquals } from "@std/assert";
+import { it, expect } from "vitest";
 import { EOALockManager } from "../shared/account/eoa-lock.ts";
 import { isTempoChain } from "../shared/tempo.ts";
 import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
@@ -11,7 +11,7 @@ const EOA_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 
 // --- EOA Lock Manager ---
 
-Deno.test("EOALockManager - acquireBundleLock and release", () => {
+it("EOALockManager - acquireBundleLock and release", () => {
   const lm = new EOALockManager();
 
   // Manually set state
@@ -25,16 +25,16 @@ Deno.test("EOALockManager - acquireBundleLock and release", () => {
     version: 0,
   });
 
-  assert(lm.isAvailable(EOA_A));
-  assert(lm.acquireBundleLock(EOA_A));
-  assert(!lm.isAvailable(EOA_A), "Should not be available while locked");
-  assert(!lm.acquireBundleLock(EOA_A), "Double lock should fail");
+  expect(lm.isAvailable(EOA_A)).toBeTruthy();
+  expect(lm.acquireBundleLock(EOA_A)).toBeTruthy();
+  expect(!lm.isAvailable(EOA_A), "Should not be available while locked").toBeTruthy();
+  expect(!lm.acquireBundleLock(EOA_A), "Double lock should fail").toBeTruthy();
 
   lm.releaseBundleLock(EOA_A);
-  assert(lm.isAvailable(EOA_A), "Should be available after release");
+  expect(lm.isAvailable(EOA_A), "Should be available after release").toBeTruthy();
 });
 
-Deno.test("EOALockManager - bundle lock sets status to LOCKED_IN_MEMORY_PENDING", () => {
+it("EOALockManager - bundle lock sets status to LOCKED_IN_MEMORY_PENDING", () => {
   const lm = new EOALockManager();
   lm["states"].set(EOA_A.toLowerCase(), {
     address: EOA_A,
@@ -47,13 +47,13 @@ Deno.test("EOALockManager - bundle lock sets status to LOCKED_IN_MEMORY_PENDING"
   });
 
   lm.acquireBundleLock(EOA_A);
-  assertEquals(lm.getState(EOA_A)?.status, "LOCKED_IN_MEMORY_PENDING");
+  expect(lm.getState(EOA_A)?.status).toEqual("LOCKED_IN_MEMORY_PENDING");
 
   lm.releaseBundleLock(EOA_A);
-  assertEquals(lm.getState(EOA_A)?.status, "ACTIVE");
+  expect(lm.getState(EOA_A)?.status).toEqual("ACTIVE");
 });
 
-Deno.test("EOALockManager - cannot acquire lock on LOCKED_PENDING_UNKNOWN", () => {
+it("EOALockManager - cannot acquire lock on LOCKED_PENDING_UNKNOWN", () => {
   const lm = new EOALockManager();
   lm["states"].set(EOA_A.toLowerCase(), {
     address: EOA_A,
@@ -65,11 +65,11 @@ Deno.test("EOALockManager - cannot acquire lock on LOCKED_PENDING_UNKNOWN", () =
     version: 0,
   });
 
-  assert(!lm.isAvailable(EOA_A));
-  assert(!lm.acquireBundleLock(EOA_A));
+  expect(!lm.isAvailable(EOA_A)).toBeTruthy();
+  expect(!lm.acquireBundleLock(EOA_A)).toBeTruthy();
 });
 
-Deno.test("EOALockManager - reservation tracking", () => {
+it("EOALockManager - reservation tracking", () => {
   const lm = new EOALockManager();
   lm["states"].set(EOA_A.toLowerCase(), {
     address: EOA_A,
@@ -81,22 +81,22 @@ Deno.test("EOALockManager - reservation tracking", () => {
     version: 0,
   });
 
-  assertEquals(lm.getReservedBalance(EOA_A), 0n);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(0n);
 
   lm.addReservation(EOA_A, 1000n);
-  assertEquals(lm.getReservedBalance(EOA_A), 1000n);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(1000n);
 
   lm.addReservation(EOA_A, 500n);
-  assertEquals(lm.getReservedBalance(EOA_A), 1500n);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(1500n);
 
   lm.releaseReservation(EOA_A, 1000n);
-  assertEquals(lm.getReservedBalance(EOA_A), 500n);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(500n);
 
   lm.releaseReservation(EOA_A, 9999n); // More than reserved
-  assertEquals(lm.getReservedBalance(EOA_A), 0n);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(0n);
 });
 
-Deno.test("EOALockManager - lockEOA forces lock", () => {
+it("EOALockManager - lockEOA forces lock", () => {
   const lm = new EOALockManager();
   lm["states"].set(EOA_A.toLowerCase(), {
     address: EOA_A,
@@ -109,11 +109,11 @@ Deno.test("EOALockManager - lockEOA forces lock", () => {
   });
 
   lm.lockEOA(EOA_A, "LOCKED_PENDING_UNKNOWN");
-  assertEquals(lm.getState(EOA_A)?.status, "LOCKED_PENDING_UNKNOWN");
-  assert(!lm.isAvailable(EOA_A));
+  expect(lm.getState(EOA_A)?.status).toEqual("LOCKED_PENDING_UNKNOWN");
+  expect(!lm.isAvailable(EOA_A)).toBeTruthy();
 });
 
-Deno.test("EOALockManager - clear resets all state", () => {
+it("EOALockManager - clear resets all state", () => {
   const lm = new EOALockManager();
   lm["states"].set(EOA_A.toLowerCase(), {
     address: EOA_A,
@@ -126,34 +126,34 @@ Deno.test("EOALockManager - clear resets all state", () => {
   });
 
   lm.clear();
-  assertEquals(lm.getState(EOA_A), undefined);
-  assertEquals(lm.getReservedBalance(EOA_A), 0n);
+  expect(lm.getState(EOA_A)).toEqual(undefined);
+  expect(lm.getReservedBalance(EOA_A)).toEqual(0n);
 });
 
 // --- spendableBalance logic ---
 
-Deno.test("spendableBalance = onchainBalance - reservedBalance", () => {
+it("spendableBalance = onchainBalance - reservedBalance", () => {
   // This is a pure logic test — no chain calls
   const onchainBalance = 10_000_000_000_000_000n; // 0.01 ETH
   const reservedBalance = 3_000_000_000_000_000n;  // 0.003 ETH
   const spendable = onchainBalance > reservedBalance
     ? onchainBalance - reservedBalance
     : 0n;
-  assertEquals(spendable, 7_000_000_000_000_000n);
+  expect(spendable).toEqual(7_000_000_000_000_000n);
 });
 
-Deno.test("spendableBalance floors at zero", () => {
+it("spendableBalance floors at zero", () => {
   const onchainBalance = 1000n;
   const reservedBalance = 5000n;
   const spendable = onchainBalance > reservedBalance
     ? onchainBalance - reservedBalance
     : 0n;
-  assertEquals(spendable, 0n);
+  expect(spendable).toEqual(0n);
 });
 
 // --- Binding rules (pure logic) ---
 
-Deno.test("Bundle only contains ops from the bound safeAddress", () => {
+it("Bundle only contains ops from the bound safeAddress", () => {
   const safeAddress = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const ops = [
     { sender: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
@@ -164,10 +164,10 @@ Deno.test("Bundle only contains ops from the bound safeAddress", () => {
   const validOps = ops.filter(
     (op) => op.sender.toLowerCase() === safeAddress.toLowerCase(),
   );
-  assertEquals(validOps.length, 2);
+  expect(validOps.length).toEqual(2);
 });
 
-Deno.test("handleOps beneficiary: splitter on native chains, EOA on Tempo", () => {
+it("handleOps beneficiary: splitter on native chains, EOA on Tempo", () => {
   const eoaAddress = "0xcccccccccccccccccccccccccccccccccccccccc" as `0x${string}`;
   const treasury = "0x1111111111111111111111111111111111111111" as `0x${string}`;
   const splitter = computeSplitterAddress(treasury);
@@ -176,36 +176,36 @@ Deno.test("handleOps beneficiary: splitter on native chains, EOA on Tempo", () =
   const beneficiaryFor = (chainId: number) => (isTempoChain(chainId) ? eoaAddress : splitter);
 
   // Native chain (mainnet=1): the EntryPoint pays the splitter, NOT the EOA.
-  assertEquals(beneficiaryFor(1), splitter);
-  assertNotEquals(beneficiaryFor(1), eoaAddress);
+  expect(beneficiaryFor(1)).toEqual(splitter);
+  expect(beneficiaryFor(1)).not.toEqual(eoaAddress);
 
   // Tempo (4217): repaid in-band to the EOA, so the beneficiary stays the EOA.
-  assertEquals(beneficiaryFor(4217), eoaAddress);
+  expect(beneficiaryFor(4217)).toEqual(eoaAddress);
 });
 
 // --- Restart recovery logic ---
 
-Deno.test("pendingNonce > latestNonce means LOCKED_PENDING_UNKNOWN", () => {
+it("pendingNonce > latestNonce means LOCKED_PENDING_UNKNOWN", () => {
   const latestNonce = 5;
   const pendingNonce = 6;
   const status = pendingNonce > latestNonce
     ? "LOCKED_PENDING_UNKNOWN"
     : "ACTIVE";
-  assertEquals(status, "LOCKED_PENDING_UNKNOWN");
+  expect(status).toEqual("LOCKED_PENDING_UNKNOWN");
 });
 
-Deno.test("pendingNonce == latestNonce means ACTIVE", () => {
+it("pendingNonce == latestNonce means ACTIVE", () => {
   const latestNonce = 5;
   const pendingNonce = 5;
   const status = pendingNonce > latestNonce
     ? "LOCKED_PENDING_UNKNOWN"
     : "ACTIVE";
-  assertEquals(status, "ACTIVE");
+  expect(status).toEqual("ACTIVE");
 });
 
 // --- Secret rotation ---
 
-Deno.test("old secrets produce different EOAs than current secret", async () => {
+it("old secrets produce different EOAs than current secret", async () => {
   const { deriveEOAAddress } = await import("../shared/keys/derive.ts");
   const secret1 = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
   const secret2 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -214,5 +214,5 @@ Deno.test("old secrets produce different EOAs than current secret", async () => 
 
   const addr1 = await deriveEOAAddress(secret1, 1, ep, safe);
   const addr2 = await deriveEOAAddress(secret2, 1, ep, safe);
-  assert(addr1 !== addr2, "Different secrets must produce different EOAs");
+  expect(addr1 !== addr2, "Different secrets must produce different EOAs").toBeTruthy();
 });
