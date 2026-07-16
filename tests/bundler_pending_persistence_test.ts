@@ -4,7 +4,7 @@
  * re-locking + re-reserving the EOA on restore so a recovered DO can't double-spend.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { Mempool } from "../shared/mempool/index.ts";
 import { EOALockManager } from "../shared/account/eoa-lock.ts";
@@ -67,7 +67,7 @@ const serialized = (txHash: string, checkCount = 0) => ({
   eoaAddress: EOA, reservedAmount: "0", rpcOverride: undefined as string | undefined, submittedAt: 1000, checkCount,
 });
 
-Deno.test("checkPendingReceipts - reentrancy-guarded AND preserves a concurrent push (no lost receipt)", async () => {
+it("checkPendingReceipts - reentrancy-guarded AND preserves a concurrent push (no lost receipt)", async () => {
   // Regression for the adversarial-review finding: two overlapping health-loop invocations plus a
   // concurrent auto-bundle push must NOT drop the pushed pending receipt.
   const svc = newService(new EOALockManager());
@@ -88,62 +88,62 @@ Deno.test("checkPendingReceipts - reentrancy-guarded AND preserves a concurrent 
   release();                                      // let run A finish (E1 still pending: null receipt)
   await runA;
 
-  assertEquals(receiptCalls, 1, "run B must have been skipped by the reentrancy guard");
+  expect(receiptCalls, "run B must have been skipped by the reentrancy guard").toEqual(1);
   // Both E1 (still pending) and the concurrently-pushed E2 must survive.
-  assertEquals(svc.pendingReceiptCount, 2);
+  expect(svc.pendingReceiptCount).toEqual(2);
   const hashes = svc.exportPendingState().map((p) => p.txHash).sort();
-  assertEquals(hashes, ["0x" + "a1".repeat(32), "0x" + "b2".repeat(32)].sort());
+  expect(hashes).toEqual(["0x" + "a1".repeat(32), "0x" + "b2".repeat(32)].sort());
 });
 
-Deno.test("pending persistence - export/import round-trips losslessly", () => {
+it("pending persistence - export/import round-trips losslessly", () => {
   const svc = newService(new EOALockManager());
   const tx = "0x" + "ab".repeat(32);
   svc.importPendingState(sampleSerialized(tx));
-  assertEquals(svc.pendingReceiptCount, 1);
+  expect(svc.pendingReceiptCount).toEqual(1);
   const exported = svc.exportPendingState();
-  assertEquals(exported.length, 1);
-  assertEquals(exported[0]!.txHash, tx);
-  assertEquals(exported[0]!.reservedAmount, "1000000000000000");
-  assertEquals(exported[0]!.entries[0]!.nonce, "5");
-  assertEquals(exported[0]!.checkCount, 2);
+  expect(exported.length).toEqual(1);
+  expect(exported[0]!.txHash).toEqual(tx);
+  expect(exported[0]!.reservedAmount).toEqual("1000000000000000");
+  expect(exported[0]!.entries[0]!.nonce).toEqual("5");
+  expect(exported[0]!.checkCount).toEqual(2);
 });
 
-Deno.test("pending persistence - import re-reserves balance and re-locks the EOA (no double-spend after recovery)", () => {
+it("pending persistence - import re-reserves balance and re-locks the EOA (no double-spend after recovery)", () => {
   // Regression test for the DO-cold-start no-op bug: a freshly-constructed EOALockManager
   // has NO state for EOA, so the old reserveBalance()/lockEOA() calls silently did nothing.
   // restorePending must CREATE the state with the reservation and the LOCKED status.
   const lockManager = new EOALockManager();
   const svc = newService(lockManager);
   svc.importPendingState(sampleSerialized("0x" + "cd".repeat(32)));
-  assertEquals(lockManager.getReservedBalance(EOA), 1_000_000_000_000_000n);
-  assertEquals(lockManager.getState(EOA)?.status, "LOCKED_PENDING_UNKNOWN");
+  expect(lockManager.getReservedBalance(EOA)).toEqual(1_000_000_000_000_000n);
+  expect(lockManager.getState(EOA)?.status).toEqual("LOCKED_PENDING_UNKNOWN");
   // The restored lock must be visible to the health loop so it can be recovered.
-  assertEquals(lockManager.getLockedEOAs().length, 1);
+  expect(lockManager.getLockedEOAs().length).toEqual(1);
 });
 
-Deno.test("pending persistence - replay is idempotent (dedups by txHash)", () => {
+it("pending persistence - replay is idempotent (dedups by txHash)", () => {
   const lockManager = new EOALockManager();
   const svc = newService(lockManager);
   const saved = sampleSerialized("0x" + "ef".repeat(32));
   svc.importPendingState(saved);
   svc.importPendingState(saved); // replay same DLQ payload — must NOT duplicate
-  assertEquals(svc.pendingReceiptCount, 1);
+  expect(svc.pendingReceiptCount).toEqual(1);
   // No double reservation on replay (restorePending takes the max, not a sum).
-  assertEquals(lockManager.getReservedBalance(EOA), 1_000_000_000_000_000n);
+  expect(lockManager.getReservedBalance(EOA)).toEqual(1_000_000_000_000_000n);
 });
 
-Deno.test("pending persistence - import tolerates empty / null without throwing", () => {
+it("pending persistence - import tolerates empty / null without throwing", () => {
   const svc = newService(new EOALockManager());
   svc.importPendingState(undefined);
   svc.importPendingState(null);
   svc.importPendingState([]);
-  assertEquals(svc.pendingReceiptCount, 0);
+  expect(svc.pendingReceiptCount).toEqual(0);
 });
 
-Deno.test("pending persistence - oldestPendingReceiptAgeMs reflects submittedAt", () => {
+it("pending persistence - oldestPendingReceiptAgeMs reflects submittedAt", () => {
   const svc = newService(new EOALockManager());
   svc.importPendingState(sampleSerialized("0x" + "12".repeat(32))); // submittedAt=1000
   const age = svc.oldestPendingReceiptAgeMs(5000);
-  assertEquals(age, 4000);
-  assert(svc.oldestPendingReceiptAgeMs(1000) === 0);
+  expect(age).toEqual(4000);
+  expect(svc.oldestPendingReceiptAgeMs(1000) === 0).toBeTruthy();
 });

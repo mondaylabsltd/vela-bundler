@@ -9,164 +9,164 @@
  * - URLs with embedded credentials
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";
 import { blacklistRpc, isRpcBlacklisted } from "../shared/utils/rpc-blacklist.ts";
 
 // --- SSRF Protection Tests ---
 
-Deno.test("validateRpcUrl - accepts valid HTTPS RPC URL", () => {
-  assertEquals(validateRpcUrl("https://mainnet.infura.io/v3/abc123"), null);
+it("validateRpcUrl - accepts valid HTTPS RPC URL", () => {
+  expect(validateRpcUrl("https://mainnet.infura.io/v3/abc123")).toEqual(null);
 });
 
-Deno.test("validateRpcUrl - accepts valid Alchemy URL", () => {
-  assertEquals(validateRpcUrl("https://eth-mainnet.g.alchemy.com/v2/key123"), null);
+it("validateRpcUrl - accepts valid Alchemy URL", () => {
+  expect(validateRpcUrl("https://eth-mainnet.g.alchemy.com/v2/key123")).toEqual(null);
 });
 
-Deno.test("validateRpcUrl - rejects HTTP (non-HTTPS)", () => {
-  assert(validateRpcUrl("http://mainnet.infura.io/v3/abc123") !== null);
+it("validateRpcUrl - rejects HTTP (non-HTTPS)", () => {
+  expect(validateRpcUrl("http://mainnet.infura.io/v3/abc123") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - rejects invalid URL format", () => {
-  assert(validateRpcUrl("not-a-url") !== null);
+it("validateRpcUrl - rejects invalid URL format", () => {
+  expect(validateRpcUrl("not-a-url") !== null).toBeTruthy();
 });
 
 // Loopback blocking
-Deno.test("validateRpcUrl - blocks localhost", () => {
-  assert(validateRpcUrl("https://localhost:8545/") !== null);
+it("validateRpcUrl - blocks localhost", () => {
+  expect(validateRpcUrl("https://localhost:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks 127.0.0.1", () => {
-  assert(validateRpcUrl("https://127.0.0.1:8545/") !== null);
+it("validateRpcUrl - blocks 127.0.0.1", () => {
+  expect(validateRpcUrl("https://127.0.0.1:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks 127.x.x.x range", () => {
-  assert(validateRpcUrl("https://127.0.0.2:8545/") !== null);
+it("validateRpcUrl - blocks 127.x.x.x range", () => {
+  expect(validateRpcUrl("https://127.0.0.2:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks ::1 IPv6 loopback", () => {
-  assert(validateRpcUrl("https://[::1]:8545/") !== null);
+it("validateRpcUrl - blocks ::1 IPv6 loopback", () => {
+  expect(validateRpcUrl("https://[::1]:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks 0.0.0.0", () => {
-  assert(validateRpcUrl("https://0.0.0.0:8545/") !== null);
+it("validateRpcUrl - blocks 0.0.0.0", () => {
+  expect(validateRpcUrl("https://0.0.0.0:8545/") !== null).toBeTruthy();
 });
 
 // Private network blocking (RFC1918)
-Deno.test("validateRpcUrl - blocks 10.x.x.x (RFC1918)", () => {
-  assert(validateRpcUrl("https://10.0.0.1:8545/") !== null);
-  assert(validateRpcUrl("https://10.255.255.255:8545/") !== null);
+it("validateRpcUrl - blocks 10.x.x.x (RFC1918)", () => {
+  expect(validateRpcUrl("https://10.0.0.1:8545/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://10.255.255.255:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks 172.16-31.x.x (RFC1918)", () => {
-  assert(validateRpcUrl("https://172.16.0.1:8545/") !== null);
-  assert(validateRpcUrl("https://172.31.255.255:8545/") !== null);
+it("validateRpcUrl - blocks 172.16-31.x.x (RFC1918)", () => {
+  expect(validateRpcUrl("https://172.16.0.1:8545/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://172.31.255.255:8545/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - allows 172.15.x.x (not RFC1918)", () => {
-  assertEquals(validateRpcUrl("https://172.15.0.1:8545/"), null);
+it("validateRpcUrl - allows 172.15.x.x (not RFC1918)", () => {
+  expect(validateRpcUrl("https://172.15.0.1:8545/")).toEqual(null);
 });
 
-Deno.test("validateRpcUrl - allows 172.32.x.x (not RFC1918)", () => {
-  assertEquals(validateRpcUrl("https://172.32.0.1:8545/"), null);
+it("validateRpcUrl - allows 172.32.x.x (not RFC1918)", () => {
+  expect(validateRpcUrl("https://172.32.0.1:8545/")).toEqual(null);
 });
 
-Deno.test("validateRpcUrl - blocks 192.168.x.x (RFC1918)", () => {
-  assert(validateRpcUrl("https://192.168.1.1:8545/") !== null);
-  assert(validateRpcUrl("https://192.168.0.1:8545/") !== null);
+it("validateRpcUrl - blocks 192.168.x.x (RFC1918)", () => {
+  expect(validateRpcUrl("https://192.168.1.1:8545/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://192.168.0.1:8545/") !== null).toBeTruthy();
 });
 
 // Link-local / metadata
-Deno.test("validateRpcUrl - blocks 169.254.x.x (link-local)", () => {
-  assert(validateRpcUrl("https://169.254.169.254/") !== null);
-  assert(validateRpcUrl("https://169.254.0.1/") !== null);
+it("validateRpcUrl - blocks 169.254.x.x (link-local)", () => {
+  expect(validateRpcUrl("https://169.254.169.254/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://169.254.0.1/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks AWS metadata endpoint", () => {
-  assert(validateRpcUrl("https://169.254.169.254/latest/meta-data/") !== null);
+it("validateRpcUrl - blocks AWS metadata endpoint", () => {
+  expect(validateRpcUrl("https://169.254.169.254/latest/meta-data/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks GCP metadata endpoint", () => {
-  assert(validateRpcUrl("https://metadata.google.internal/") !== null);
+it("validateRpcUrl - blocks GCP metadata endpoint", () => {
+  expect(validateRpcUrl("https://metadata.google.internal/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks Azure IMDS", () => {
-  assert(validateRpcUrl("https://168.63.129.16/") !== null);
+it("validateRpcUrl - blocks Azure IMDS", () => {
+  expect(validateRpcUrl("https://168.63.129.16/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks .internal domains", () => {
-  assert(validateRpcUrl("https://something.internal/") !== null);
+it("validateRpcUrl - blocks .internal domains", () => {
+  expect(validateRpcUrl("https://something.internal/") !== null).toBeTruthy();
 });
 
 // Credential blocking
-Deno.test("validateRpcUrl - blocks URLs with credentials", () => {
-  assert(validateRpcUrl("https://user:pass@evil.com/rpc") !== null);
+it("validateRpcUrl - blocks URLs with credentials", () => {
+  expect(validateRpcUrl("https://user:pass@evil.com/rpc") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks URLs with username only", () => {
-  assert(validateRpcUrl("https://admin@evil.com/rpc") !== null);
+it("validateRpcUrl - blocks URLs with username only", () => {
+  expect(validateRpcUrl("https://admin@evil.com/rpc") !== null).toBeTruthy();
 });
 
 // --- Blacklist Tests ---
 
-Deno.test("blacklistRpc - blacklisted URL is detected", () => {
+it("blacklistRpc - blacklisted URL is detected", () => {
   blacklistRpc("https://test-blacklist-detect.example.com");
-  assert(isRpcBlacklisted("https://test-blacklist-detect.example.com"));
+  expect(isRpcBlacklisted("https://test-blacklist-detect.example.com")).toBeTruthy();
 });
 
-Deno.test("isRpcBlacklisted - returns false for unknown URL", () => {
-  assertEquals(isRpcBlacklisted("https://never-blacklisted.example.com"), false);
+it("isRpcBlacklisted - returns false for unknown URL", () => {
+  expect(isRpcBlacklisted("https://never-blacklisted.example.com")).toEqual(false);
 });
 
 // --- SSRF bypass regression tests (these MUST stay blocked) ---
 
-Deno.test("validateRpcUrl - blocks IPv4-mapped IPv6 loopback [::ffff:127.0.0.1]", () => {
-  assert(validateRpcUrl("https://[::ffff:127.0.0.1]/") !== null);
+it("validateRpcUrl - blocks IPv4-mapped IPv6 loopback [::ffff:127.0.0.1]", () => {
+  expect(validateRpcUrl("https://[::ffff:127.0.0.1]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks IPv4-mapped IPv6 cloud metadata [::ffff:169.254.169.254]", () => {
+it("validateRpcUrl - blocks IPv4-mapped IPv6 cloud metadata [::ffff:169.254.169.254]", () => {
   // The headline SSRF: AWS/GCP IMDS via IPv4-mapped IPv6 must be blocked.
-  assert(validateRpcUrl("https://[::ffff:169.254.169.254]/latest/meta-data/") !== null);
+  expect(validateRpcUrl("https://[::ffff:169.254.169.254]/latest/meta-data/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks fully-expanded mapped metadata [0:0:0:0:0:ffff:a9fe:a9fe]", () => {
-  assert(validateRpcUrl("https://[0:0:0:0:0:ffff:a9fe:a9fe]/") !== null);
+it("validateRpcUrl - blocks fully-expanded mapped metadata [0:0:0:0:0:ffff:a9fe:a9fe]", () => {
+  expect(validateRpcUrl("https://[0:0:0:0:0:ffff:a9fe:a9fe]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks expanded IPv6 loopback [0:0:0:0:0:0:0:1]", () => {
-  assert(validateRpcUrl("https://[0:0:0:0:0:0:0:1]/") !== null);
+it("validateRpcUrl - blocks expanded IPv6 loopback [0:0:0:0:0:0:0:1]", () => {
+  expect(validateRpcUrl("https://[0:0:0:0:0:0:0:1]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks IPv6 unspecified [::]", () => {
-  assert(validateRpcUrl("https://[::]/") !== null);
+it("validateRpcUrl - blocks IPv6 unspecified [::]", () => {
+  expect(validateRpcUrl("https://[::]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks IPv6 ULA fc00::/7 (fc/fd)", () => {
-  assert(validateRpcUrl("https://[fd00::1]/") !== null);
-  assert(validateRpcUrl("https://[fc00::1]/") !== null);
+it("validateRpcUrl - blocks IPv6 ULA fc00::/7 (fc/fd)", () => {
+  expect(validateRpcUrl("https://[fd00::1]/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://[fc00::1]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks IPv6 link-local fe80::/10", () => {
-  assert(validateRpcUrl("https://[fe80::1]/") !== null);
+it("validateRpcUrl - blocks IPv6 link-local fe80::/10", () => {
+  expect(validateRpcUrl("https://[fe80::1]/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks trailing-dot FQDN metadata.google.internal.", () => {
-  assert(validateRpcUrl("https://metadata.google.internal./") !== null);
+it("validateRpcUrl - blocks trailing-dot FQDN metadata.google.internal.", () => {
+  expect(validateRpcUrl("https://metadata.google.internal./") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - blocks 0.0.0.0/8 and Azure IMDS", () => {
-  assert(validateRpcUrl("https://0.1.2.3/") !== null);
-  assert(validateRpcUrl("https://168.63.129.16/") !== null);
+it("validateRpcUrl - blocks 0.0.0.0/8 and Azure IMDS", () => {
+  expect(validateRpcUrl("https://0.1.2.3/") !== null).toBeTruthy();
+  expect(validateRpcUrl("https://168.63.129.16/") !== null).toBeTruthy();
 });
 
-Deno.test("validateRpcUrl - still allows legit global-unicast IPv6 RPC", () => {
-  assertEquals(validateRpcUrl("https://[2001:4860:4860::8888]/"), null);
+it("validateRpcUrl - still allows legit global-unicast IPv6 RPC", () => {
+  expect(validateRpcUrl("https://[2001:4860:4860::8888]/")).toEqual(null);
 });
 
 // --- redactUrl secret-masking regression (INFO-2) ---
 import { redactUrl } from "../shared/reliability/log.ts";
 
-Deno.test("redactUrl - masks query-string keys (any length) and short path keys, keeps host", () => {
+it("redactUrl - masks query-string keys (any length) and short path keys, keeps host", () => {
   const cases = [
     "https://eth.llamarpc.com/rpc?apikey=sk_live_0123456789abcdef",
     "https://nd-1.p2pify.com/abcd1234",                 // 8-char path key
@@ -175,11 +175,11 @@ Deno.test("redactUrl - masks query-string keys (any length) and short path keys,
   ];
   for (const u of cases) {
     const r = redactUrl(u);
-    assert(!r.includes("sk_live_0123456789abcdef"), `leak: ${r}`);
-    assert(!r.includes("abcd1234"), `leak: ${r}`);
-    assert(!r.includes("SECRETKEY1234567890"), `leak: ${r}`);
-    assert(!r.includes("ab.cd.ef"), `leak: ${r}`);
+    expect(!r.includes("sk_live_0123456789abcdef"), `leak: ${r}`).toBeTruthy();
+    expect(!r.includes("abcd1234"), `leak: ${r}`).toBeTruthy();
+    expect(!r.includes("SECRETKEY1234567890"), `leak: ${r}`).toBeTruthy();
+    expect(!r.includes("ab.cd.ef"), `leak: ${r}`).toBeTruthy();
   }
   // Host must remain for debuggability.
-  assert(redactUrl("https://eth.llamarpc.com/rpc?apikey=secret").includes("llamarpc.com"));
+  expect(redactUrl("https://eth.llamarpc.com/rpc?apikey=secret").includes("llamarpc.com")).toBeTruthy();
 });

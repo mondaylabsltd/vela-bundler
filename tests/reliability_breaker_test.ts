@@ -3,7 +3,7 @@
  * transitions with an injected clock (no real time).
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
+import { it, expect } from "vitest";
 import { CircuitBreaker } from "../shared/reliability/breaker.ts";
 import { CircuitOpenError } from "../shared/reliability/errors.ts";
 
@@ -14,73 +14,72 @@ function fakeClock() {
 
 const KEY = "https://rpc.example";
 
-Deno.test("breaker - opens after N consecutive failures, then fast-fails", () => {
+it("breaker - opens after N consecutive failures, then fast-fails", () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 3, cooldownMs: 1000, now: clk.now });
-  assertEquals(b.state(KEY), "closed");
+  expect(b.state(KEY)).toEqual("closed");
   b.onFailure(KEY); b.onFailure(KEY);
-  assertEquals(b.state(KEY), "closed"); // 2 < 3
+  expect(b.state(KEY)).toEqual("closed"); // 2 < 3
   b.onFailure(KEY);
-  assertEquals(b.state(KEY), "open");
-  assertEquals(b.allow(KEY), false); // fast-fail while open
+  expect(b.state(KEY)).toEqual("open");
+  expect(b.allow(KEY)).toEqual(false); // fast-fail while open
 });
 
-Deno.test("breaker - a success resets the consecutive failure count", () => {
+it("breaker - a success resets the consecutive failure count", () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 3, cooldownMs: 1000, now: clk.now });
   b.onFailure(KEY); b.onFailure(KEY);
   b.onSuccess(KEY);
   b.onFailure(KEY); b.onFailure(KEY);
-  assertEquals(b.state(KEY), "closed"); // never reached 3 in a row
+  expect(b.state(KEY)).toEqual("closed"); // never reached 3 in a row
 });
 
-Deno.test("breaker - transitions open → half-open after cooldown, success closes", () => {
+it("breaker - transitions open → half-open after cooldown, success closes", () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 2, cooldownMs: 1000, now: clk.now });
   b.onFailure(KEY); b.onFailure(KEY);
-  assertEquals(b.state(KEY), "open");
-  assertEquals(b.allow(KEY), false);
+  expect(b.state(KEY)).toEqual("open");
+  expect(b.allow(KEY)).toEqual(false);
   clk.advance(1000);
-  assertEquals(b.state(KEY), "half-open");
-  assertEquals(b.allow(KEY), true);   // admits a probe
-  assertEquals(b.allow(KEY), false);  // only one probe at a time (halfOpenMaxProbes=1)
+  expect(b.state(KEY)).toEqual("half-open");
+  expect(b.allow(KEY)).toEqual(true);   // admits a probe
+  expect(b.allow(KEY)).toEqual(false);  // only one probe at a time (halfOpenMaxProbes=1)
   b.onSuccess(KEY);
-  assertEquals(b.state(KEY), "closed");
+  expect(b.state(KEY)).toEqual("closed");
 });
 
-Deno.test("breaker - a half-open probe failure re-opens immediately", () => {
+it("breaker - a half-open probe failure re-opens immediately", () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 2, cooldownMs: 1000, now: clk.now });
   b.onFailure(KEY); b.onFailure(KEY);
   clk.advance(1000);
-  assertEquals(b.state(KEY), "half-open");
+  expect(b.state(KEY)).toEqual("half-open");
   b.allow(KEY);
   b.onFailure(KEY);
-  assertEquals(b.state(KEY), "open");
-  assertEquals(b.allow(KEY), false);
+  expect(b.state(KEY)).toEqual("open");
+  expect(b.allow(KEY)).toEqual(false);
 });
 
-Deno.test("breaker - guard() throws CircuitOpenError without invoking fn when open", async () => {
+it("breaker - guard() throws CircuitOpenError without invoking fn when open", async () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: clk.now });
   // First call fails → opens.
-  await assertRejects(() => b.guard(KEY, () => Promise.reject(new Error("boom"))));
-  assertEquals(b.state(KEY), "open");
+  await expect(b.guard(KEY, () => Promise.reject(new Error("boom")))).rejects.toThrow();
+  expect(b.state(KEY)).toEqual("open");
   let invoked = false;
-  await assertRejects(
-    () => b.guard(KEY, () => { invoked = true; return Promise.resolve("x"); }),
-    CircuitOpenError,
-  );
-  assertEquals(invoked, false); // fn never ran — fast fail
+  await expect(
+    b.guard(KEY, () => { invoked = true; return Promise.resolve("x"); }),
+  ).rejects.toThrow(CircuitOpenError);
+  expect(invoked).toEqual(false); // fn never ran — fast fail
 });
 
-Deno.test("breaker - degradedCount + snapshot reflect non-closed endpoints", () => {
+it("breaker - degradedCount + snapshot reflect non-closed endpoints", () => {
   const clk = fakeClock();
   const b = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: clk.now });
   b.onFailure("https://a.example");
   b.onFailure("https://b.example");
-  assertEquals(b.degradedCount(), 2);
+  expect(b.degradedCount()).toEqual(2);
   const snap = b.snapshot();
-  assertEquals(snap.length, 2);
-  assertEquals(snap.every((s) => s.state === "open"), true);
+  expect(snap.length).toEqual(2);
+  expect(snap.every((s) => s.state === "open")).toEqual(true);
 });

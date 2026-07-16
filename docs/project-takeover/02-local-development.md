@@ -5,16 +5,15 @@
 
 ## Prerequisites
 
-- **Deno** (for the primary runtime + all tests). `deno.json` pins viem 2.52.2 via `npm:` specifiers.
-- **Node.js + npm** (only for the Cloudflare Worker toolchain: wrangler + vitest).
+- **Node.js + npm** — the entire runtime toolchain: `wrangler` (`npm run dev` / `npm run deploy`) and `vitest` (all tests). `package.json` pins viem `^2.52.2`.
 - **Foundry** (`forge`) — only if you need to rebuild the splitter contract bytecode. Not required to run the bundler.
 - No database, no Redis, no external infra to run locally.
 
 ## Environment variables
 
-Only **`OPERATOR_SECRET`** is strictly required. The treasury address is **derived** from it (the
-`TREASURY_ADDRESS` line in `.env.example` is not read by the Deno loader — treasury is always derived;
-see [deno/config.ts](../../deno/config.ts) and [deno/main.ts:24-27](../../deno/main.ts#L24)).
+Only **`OPERATOR_SECRET`** is strictly required. The treasury address is **derived** from it — it is
+never read from the environment (treasury is always derived; `GET /v1/treasury` returns it). See
+[worker/config.ts](../../worker/config.ts) and [shared/keys/derive.ts](../../shared/keys/derive.ts).
 
 | Variable | Required | Default | Notes |
 |----------|----------|---------|-------|
@@ -22,7 +21,7 @@ see [deno/config.ts](../../deno/config.ts) and [deno/main.ts:24-27](../../deno/m
 | `ALCHEMY_API_KEY` | no | — | Enables preferred Alchemy RPCs. |
 | `OLD_OPERATOR_SECRETS` | no | — | Comma-separated; old secrets kept derivable for draining rotated EOAs. |
 | `ENTRY_POINT_ADDRESS` | no | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7. |
-| `PORT` / `HOST` | no | `3300` / `0.0.0.0` | Deno server only. |
+| `PORT` / `HOST` | no | `3300` / `0.0.0.0` | Deno server only — N-A on Workers (no listen port). |
 | `BUNDLING_MODE` | no | `auto` | `auto` or `manual`. |
 | `MAX_BUNDLE_SIZE` / `MAX_BUNDLE_GAS` | no | `10` / `5000000` | |
 | `AUTO_BUNDLE_INTERVAL_MS` | no | `10000` | |
@@ -41,32 +40,30 @@ see [deno/config.ts](../../deno/config.ts) and [deno/main.ts:24-27](../../deno/m
 (commits `53020de`/`62b91d4`) contained the documented `0xdeadbeef…` placeholder, **not a real secret**
 (verified by hashing the historical value against `.env.example`).
 
-## Run — Deno (primary)
-
-```bash
-export OPERATOR_SECRET=0x$(openssl rand -hex 32)   # dev only
-deno task dev     # watch mode
-deno task start   # production mode (--no-lock)
-```
-
-Server listens on `0.0.0.0:3300`. Smoke check:
-
-```bash
-curl -s localhost:3300/health | jq
-curl -s localhost:3300/v1/treasury | jq
-# JSON-RPC (chainId in path):
-curl -s -X POST localhost:3300/1 -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
-```
-
 ## Run — Cloudflare Workers
+
+Cloudflare Workers (Durable Objects) is the only runtime. `npm run dev` boots `wrangler dev`, which
+serves on `localhost:8787`; `npm run deploy` runs `npx wrangler deploy`. Secrets are set with
+`npx wrangler secret put …`.
 
 ```bash
 npm install
 npx wrangler secret put OPERATOR_SECRET
-npx wrangler secret put ALCHEMY_API_KEY   # optional
-npm run dev        # wrangler dev (miniflare)
-npm run deploy     # wrangler deploy
+npx wrangler secret put ALCHEMY_API_KEY      # optional
+npx wrangler secret put TELEGRAM_BOT_TOKEN   # optional — enables treasury/ops alerting
+npx wrangler secret put TELEGRAM_CHAT_ID     # optional
+npm run dev        # wrangler dev — serves on localhost:8787
+npm run deploy     # npx wrangler deploy
+```
+
+Smoke check (against `npm run dev` on `:8787`):
+
+```bash
+curl -s localhost:8787/health | jq
+curl -s localhost:8787/v1/treasury | jq
+# JSON-RPC (chainId in path):
+curl -s -X POST localhost:8787/1 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
 ```
 
 ## Commands & their ACTUAL status (commit `4beaaef`)
@@ -96,7 +93,10 @@ npm run deploy     # wrangler deploy
 
 ## Test layout
 
-All tests live in `tests/*.ts` and run under **Deno** (not vitest, despite `vitest.config.ts` existing).
-Coverage is broad on the shared core (account, bundler, gas, fee model, mempool, rate limit, rpc
-security/resolution, simulation, tempo, userop, reliability, splitter, CORS, body cap). The **Worker
-adapter layer is untested**. See [07-maintenance-guide.md](07-maintenance-guide.md) for the testing strategy.
+Tests run under **vitest** in two projects (see [`vitest.workspace.ts`](../../vitest.workspace.ts)).
+The **node** project covers the shared core in `tests/*.ts` (account, bundler, gas, fee model,
+mempool, rate limit, rpc security/resolution, simulation, tempo, userop, reliability, splitter,
+CORS, body cap); the **workers** project runs the Worker / Durable-Object adapter tests in
+`worker/tests/**` under the real `workerd` pool (miniflare). `npm test` runs both projects;
+`npm run test:node` / `npm run test:worker` run one. See
+[07-maintenance-guide.md](07-maintenance-guide.md) for the testing strategy.

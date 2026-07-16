@@ -1,17 +1,15 @@
 # Minimal CI gate — mirrors the local checks documented in
 # docs/project-takeover/02-local-development.md.
 #
-# No deployment coupling: both runtimes deploy manually (`deno task deploy`
-# over SSH for the Deno server, `npx wrangler deploy` for the Worker — see
-# docs/project-takeover/05-deployment-runbook.md). CI green ≠ deployed; these
-# jobs are the merge gate only.
+# No deployment coupling: the Worker deploys manually (`npx wrangler deploy` — see
+# docs/project-takeover/05-deployment-runbook.md). CI green ≠ deployed; these jobs are
+# the merge gate only.
 #
 # Deliberately NOT included:
-#   - `deno task e2e`: boots a live server and runs load/perf dimensions, and
-#     fires a real Telegram alert when creds are present; run locally per the
-#     runbook. Promote to CI once it has a proven-stable record on a runner.
-#   - tests/integration_test.ts: self-skips ("ignored") when no bundler is
-#     listening on localhost — it never runs here, only against a live stack.
+#   - tests/integration_test.ts: self-skips (it.skipIf) when no bundler is listening on
+#     localhost — it never runs here, only against a live stack.
+#   - scripts/run-spec-tests.sh: boots a live `wrangler dev` + Anvil; run locally per the
+#     runbook.
 name: CI
 
 on:
@@ -20,21 +18,7 @@ on:
   pull_request:
 
 jobs:
-  deno:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-      - name: Lint + typecheck
-        run: deno task lint
-      - name: Tests
-        run: deno task test
-      - name: Homepage build
-        run: deno task build
-
-  worker:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,8 +27,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Worker tests (vitest, workerd pool)
-        run: npm run test:worker
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests (vitest — node + workers projects)
+        run: npm test
 
   contracts:
     runs-on: ubuntu-latest

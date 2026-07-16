@@ -1,54 +1,25 @@
 # 05 — Deployment Runbook
 
-> Two deployment targets. Pick one per environment. Commands verified against the repo at
+> Cloudflare Workers only (Durable Objects). Commands verified against the repo at
 > commit `4beaaef` + this pass's changes.
 
-## Pre-deploy checklist (both targets)
+## Pre-deploy checklist
 
-1. `deno task lint` → exit 0.
-2. `deno test -A` → 0 failed (409 passed / 5 ignored at this pass).
-3. `npm run test:worker` → 0 failed (9 passed) — required if deploying the Worker target.
-4. `OPERATOR_SECRET` is a ≥32-byte CSPRNG hex value, stored only in the target's secret store. **Never** commit it. Startup now fails closed on a short/malformed secret.
-5. Decide `MIN_PROFIT_MARGIN_BPS` for native chains — see the splitter-haircut open issue in [08](08-open-issues.md). The shipped default (1000 = 10%) under-provisions the never-a-loss invariant when the beneficiary is the splitter.
-6. **The `VelaGasSettlementSplitter` must be deployed** on each native chain you serve (CREATE2, same address everywhere) before native settlement routes to it, or gas refunds are trapped. Confirm with `GET /v1/splitter` (returns the deterministic address) and an on-chain `eth_getCode` at that address. The wallet normally deploys it in its first batch.
+1. `npm run typecheck` → exit 0. (Was `deno task lint`; typecheck is now the gate — there is no separate style-linter.)
+2. `npm test` → 0 failed — runs both vitest projects: `node` (shared/ logic) and `workers` (worker/ runtime). (Was `deno test -A` + `npm run test:worker`.)
+3. `OPERATOR_SECRET` is a ≥32-byte CSPRNG hex value, stored only in the target's secret store. **Never** commit it. Startup now fails closed on a short/malformed secret.
+4. Decide `MIN_PROFIT_MARGIN_BPS` for native chains — see the splitter-haircut open issue in [08](08-open-issues.md). The shipped default (1000 = 10%) under-provisions the never-a-loss invariant when the beneficiary is the splitter.
+5. **The `VelaGasSettlementSplitter` must be deployed** on each native chain you serve (CREATE2, same address everywhere) before native settlement routes to it, or gas refunds are trapped. Confirm with `GET /v1/splitter` (returns the deterministic address) and an on-chain `eth_getCode` at that address. The wallet normally deploys it in its first batch.
 
-## Target A — Deno (self-hosted, systemd)
+## Deploy (Cloudflare Workers)
 
-The interactive deployer handles remote provisioning end-to-end over SSH.
-
-```bash
-deno task deploy            # interactive: pick/add target, upload release, activate
-deno task deploy status     # systemctl status + current release + recent releases + health
-deno task deploy rollback   # swap the `current` symlink to the previous release
-```
-
-What `deno task deploy` does ([scripts/deploy.ts](../../scripts/deploy.ts)):
-1. Prompts for/persists an SSH target; primes the connection.
-2. Installs Deno on the remote if missing; ensures the `vela` service user + directories.
-3. Ensures `/opt/vela-bundler/data/vela.env` — **validates `OPERATOR_SECRET` is `0x…` and ≥66 chars** at this step (`scripts/deploy.ts:163`).
-4. Installs a sudoers entry, uploads the release tar to `/opt/vela-bundler/releases/<tag>`.
-5. Installs the systemd unit ([deploy/systemd/vela-bundler.service](../../deploy/systemd/vela-bundler.service)), `daemon-reload`, `enable`.
-6. Swaps the `current` symlink → new release, `systemctl restart`.
-7. **Health-gates**: polls `http://127.0.0.1:3300/health` up to 15×2s, looking for `"ok"`.
-
-Service facts:
-- Runs `deno task start` as user `vela`, `WorkingDirectory=/opt/vela-bundler/current`, `EnvironmentFile=/opt/vela-bundler/data/vela.env`.
-- Hardened: `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryMax=1G`/`MemoryHigh=800M`, `Restart=on-failure` (`StartLimitBurst=5`/`60s`).
-- Logs to journald (`journalctl -u vela-bundler`).
-
-### Rollback (Deno)
-```bash
-deno task deploy rollback     # atomic symlink swap to previous release + restart
-```
-No database → no data migration to reverse. In-memory state (mempool, reservations) is lost across the restart; this is safe (see the "conservative restart" invariant in [03](03-core-flows.md)) but in-flight receipts for the instant of restart are not persisted (Deno) — clients re-poll/resubmit.
-
-## Target B — Cloudflare Workers
+Cloudflare Workers is the only deployment target — no self-hosted server, systemd, or SSH deploy.
 
 ```bash
 npm install
 npx wrangler secret put OPERATOR_SECRET     # required
 npx wrangler secret put ALCHEMY_API_KEY      # optional
-npm run deploy                                # wrangler deploy
+npm run deploy                                # npx wrangler deploy
 ```
 
 Facts ([wrangler.jsonc](../../wrangler.jsonc)):
@@ -66,7 +37,7 @@ DO storage (persisted `chainId`, `pendingReceipts`, `lastDecayAt`) survives a co
 ## Post-deploy smoke test (run against the live base URL)
 
 ```bash
-BASE=https://<your-host>            # Deno: http://host:3300 ; Workers: your workers.dev/route
+BASE=https://<your-host>            # your workers.dev subdomain or custom route
 curl -s $BASE/health | jq          # {"status":"ok", ...}
 curl -s $BASE/v1/treasury | jq     # derived treasury address
 curl -s $BASE/v1/splitter | jq     # splitter address + derivation inputs

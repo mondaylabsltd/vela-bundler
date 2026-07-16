@@ -1,5 +1,5 @@
 /**
- * CF Worker config builder — reads from env bindings instead of Deno.env.
+ * CF Worker config builder — reads config from Cloudflare env bindings.
  */
 
 import type { Env } from "./types.ts";

@@ -2,7 +2,7 @@
  * Unit tests for UserOperation packing, hashing, validation, and normalization.
  */
 
-import { assertEquals, assert, assertThrows } from "@std/assert";
+import { it, expect } from "vitest";
 import { packUserOp, unpackUserOp } from "../shared/userop/pack.ts";
 import { getUserOpHash } from "../shared/userop/hash.ts";
 import {
@@ -40,22 +40,22 @@ function makeUserOp(overrides: Partial<UserOperation> = {}): UserOperation {
 
 // --- Pack / Unpack ---
 
-Deno.test("packUserOp and unpackUserOp are inverse operations", () => {
+it("packUserOp and unpackUserOp are inverse operations", () => {
   const userOp = makeUserOp();
   const packed = packUserOp(userOp);
   const unpacked = unpackUserOp(packed);
 
-  assertEquals(unpacked.sender, userOp.sender);
-  assertEquals(unpacked.nonce, userOp.nonce);
-  assertEquals(unpacked.callGasLimit, userOp.callGasLimit);
-  assertEquals(unpacked.verificationGasLimit, userOp.verificationGasLimit);
-  assertEquals(unpacked.maxFeePerGas, userOp.maxFeePerGas);
-  assertEquals(unpacked.maxPriorityFeePerGas, userOp.maxPriorityFeePerGas);
-  assertEquals(unpacked.factory, userOp.factory);
-  assertEquals(unpacked.paymaster, userOp.paymaster);
+  expect(unpacked.sender).toEqual(userOp.sender);
+  expect(unpacked.nonce).toEqual(userOp.nonce);
+  expect(unpacked.callGasLimit).toEqual(userOp.callGasLimit);
+  expect(unpacked.verificationGasLimit).toEqual(userOp.verificationGasLimit);
+  expect(unpacked.maxFeePerGas).toEqual(userOp.maxFeePerGas);
+  expect(unpacked.maxPriorityFeePerGas).toEqual(userOp.maxPriorityFeePerGas);
+  expect(unpacked.factory).toEqual(userOp.factory);
+  expect(unpacked.paymaster).toEqual(userOp.paymaster);
 });
 
-Deno.test("packUserOp - packs factory into initCode", () => {
+it("packUserOp - packs factory into initCode", () => {
   const userOp = makeUserOp({
     factory: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     factoryData: "0x1234",
@@ -63,11 +63,11 @@ Deno.test("packUserOp - packs factory into initCode", () => {
   const packed = packUserOp(userOp);
 
   // initCode = factory (20 bytes) + factoryData
-  assert(packed.initCode.startsWith("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-  assert(packed.initCode.endsWith("1234"));
+  expect(packed.initCode.startsWith("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).toBeTruthy();
+  expect(packed.initCode.endsWith("1234")).toBeTruthy();
 });
 
-Deno.test("packUserOp - packs paymaster into paymasterAndData", () => {
+it("packUserOp - packs paymaster into paymasterAndData", () => {
   const userOp = makeUserOp({
     paymaster: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     paymasterVerificationGasLimit: 50_000n,
@@ -76,15 +76,15 @@ Deno.test("packUserOp - packs paymaster into paymasterAndData", () => {
   });
   const packed = packUserOp(userOp);
 
-  assert(packed.paymasterAndData.length > 2);
-  assert(
+  expect(packed.paymasterAndData.length > 2).toBeTruthy();
+  expect(
     packed.paymasterAndData.startsWith(
       "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ),
-  );
+  ).toBeTruthy();
 });
 
-Deno.test("packUserOp / unpackUserOp roundtrip with paymaster", () => {
+it("packUserOp / unpackUserOp roundtrip with paymaster", () => {
   const userOp = makeUserOp({
     paymaster: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     paymasterVerificationGasLimit: 50_000n,
@@ -94,78 +94,81 @@ Deno.test("packUserOp / unpackUserOp roundtrip with paymaster", () => {
   const packed = packUserOp(userOp);
   const unpacked = unpackUserOp(packed);
 
-  assertEquals(unpacked.paymaster, userOp.paymaster);
-  assertEquals(unpacked.paymasterVerificationGasLimit, userOp.paymasterVerificationGasLimit);
-  assertEquals(unpacked.paymasterPostOpGasLimit, userOp.paymasterPostOpGasLimit);
-  assertEquals(unpacked.paymasterData, userOp.paymasterData);
+  expect(unpacked.paymaster).toEqual(userOp.paymaster);
+  expect(unpacked.paymasterVerificationGasLimit).toEqual(userOp.paymasterVerificationGasLimit);
+  expect(unpacked.paymasterPostOpGasLimit).toEqual(userOp.paymasterPostOpGasLimit);
+  expect(unpacked.paymasterData).toEqual(userOp.paymasterData);
 });
 
 // --- Hash ---
 
-Deno.test("getUserOpHash - returns a 32-byte hex string", () => {
+it("getUserOpHash - returns a 32-byte hex string", () => {
   const userOp = makeUserOp();
   const packed = packUserOp(userOp);
   const hash = getUserOpHash(packed, ENTRY_POINT, 1);
 
-  assert(hash.startsWith("0x"));
-  assertEquals(hash.length, 66); // 0x + 64 hex chars
+  expect(hash.startsWith("0x")).toBeTruthy();
+  expect(hash.length).toEqual(66); // 0x + 64 hex chars
 });
 
-Deno.test("getUserOpHash - different nonces produce different hashes", () => {
+it("getUserOpHash - different nonces produce different hashes", () => {
   const op1 = makeUserOp({ nonce: 0n });
   const op2 = makeUserOp({ nonce: 1n });
 
   const hash1 = getUserOpHash(packUserOp(op1), ENTRY_POINT, 1);
   const hash2 = getUserOpHash(packUserOp(op2), ENTRY_POINT, 1);
 
-  assert(hash1 !== hash2);
+  expect(hash1 !== hash2).toBeTruthy();
 });
 
-Deno.test("getUserOpHash - different chains produce different hashes", () => {
+it("getUserOpHash - different chains produce different hashes", () => {
   const userOp = makeUserOp();
   const packed = packUserOp(userOp);
 
   const hash1 = getUserOpHash(packed, ENTRY_POINT, 1);
   const hash137 = getUserOpHash(packed, ENTRY_POINT, 137);
 
-  assert(hash1 !== hash137);
+  expect(hash1 !== hash137).toBeTruthy();
 });
 
 // --- Validation ---
 
-Deno.test("validateUserOpFields - accepts valid UserOp", () => {
+it("validateUserOpFields - accepts valid UserOp", () => {
   const userOp = makeUserOp();
   validateUserOpFields(userOp); // should not throw
 });
 
-Deno.test("validateUserOpFields - rejects invalid sender", () => {
-  assertThrows(
+it("validateUserOpFields - rejects invalid sender", () => {
+  expect(
     () => validateUserOpFields(makeUserOp({ sender: "0xinvalid" as `0x${string}` })),
-    UserOpValidationError,
-    "invalid sender",
-  );
+  ).toThrow("invalid sender");
+  expect(
+    () => validateUserOpFields(makeUserOp({ sender: "0xinvalid" as `0x${string}` })),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("validateUserOpFields - rejects zero callGasLimit", () => {
-  assertThrows(
+it("validateUserOpFields - rejects zero callGasLimit", () => {
+  expect(
     () => validateUserOpFields(makeUserOp({ callGasLimit: 0n })),
-    UserOpValidationError,
-    "callGasLimit must be > 0",
-  );
+  ).toThrow("callGasLimit must be > 0");
+  expect(
+    () => validateUserOpFields(makeUserOp({ callGasLimit: 0n })),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("validateUserOpFields - rejects verificationGasLimit over MAX", () => {
+it("validateUserOpFields - rejects verificationGasLimit over MAX", () => {
   // MAX_VERIFICATION_GAS is 5_000_000n (non-Tempo). Use a value strictly above it so the
   // test tracks the constant instead of a hardcoded number that silently goes stale when
   // the cap is raised.
-  assertThrows(
+  expect(
     () => validateUserOpFields(makeUserOp({ verificationGasLimit: 5_000_001n })),
-    UserOpValidationError,
-    "verificationGasLimit exceeds max",
-  );
+  ).toThrow("verificationGasLimit exceeds max");
+  expect(
+    () => validateUserOpFields(makeUserOp({ verificationGasLimit: 5_000_001n })),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("validateUserOpFields - accepts verificationGasLimit at MAX", () => {
+it("validateUserOpFields - accepts verificationGasLimit at MAX", () => {
   // The boundary value must be accepted (regression guard against an off-by-one in the cap).
   validateUserOpFields(makeUserOp({ verificationGasLimit: 5_000_000n }));
 });
@@ -173,32 +176,35 @@ Deno.test("validateUserOpFields - accepts verificationGasLimit at MAX", () => {
 // uint128 packing bounds — a field ≥ 2^128 would throw inside packUint128; validation must
 // reject it cleanly (regression for O-20).
 const OVER_UINT128 = 1n << 128n;
-Deno.test("validateUserOpFields - rejects callGasLimit ≥ 2^128", () => {
-  assertThrows(() => validateUserOpFields(makeUserOp({ callGasLimit: OVER_UINT128 })), UserOpValidationError, "callGasLimit exceeds uint128");
+it("validateUserOpFields - rejects callGasLimit ≥ 2^128", () => {
+  expect(() => validateUserOpFields(makeUserOp({ callGasLimit: OVER_UINT128 }))).toThrow("callGasLimit exceeds uint128");
+  expect(() => validateUserOpFields(makeUserOp({ callGasLimit: OVER_UINT128 }))).toThrow(UserOpValidationError);
 });
-Deno.test("validateUserOpFields - rejects maxFeePerGas ≥ 2^128", () => {
-  assertThrows(
+it("validateUserOpFields - rejects maxFeePerGas ≥ 2^128", () => {
+  expect(
     () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128, maxPriorityFeePerGas: 0n })),
-    UserOpValidationError,
-    "maxFeePerGas exceeds uint128",
-  );
+  ).toThrow("maxFeePerGas exceeds uint128");
+  expect(
+    () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128, maxPriorityFeePerGas: 0n })),
+  ).toThrow(UserOpValidationError);
 });
-Deno.test("validateUserOpFields - rejects maxPriorityFeePerGas ≥ 2^128", () => {
+it("validateUserOpFields - rejects maxPriorityFeePerGas ≥ 2^128", () => {
   // Keep priority ≤ maxFee so we reach the uint128 check rather than the ordering check;
   // set both above the cap.
-  assertThrows(
+  expect(
     () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128 + 1n, maxPriorityFeePerGas: OVER_UINT128 })),
-    UserOpValidationError,
-    "exceeds uint128",
-  );
+  ).toThrow("exceeds uint128");
+  expect(
+    () => validateUserOpFields(makeUserOp({ maxFeePerGas: OVER_UINT128 + 1n, maxPriorityFeePerGas: OVER_UINT128 })),
+  ).toThrow(UserOpValidationError);
 });
-Deno.test("validateUserOpFields - accepts fields at uint128 max boundary", () => {
+it("validateUserOpFields - accepts fields at uint128 max boundary", () => {
   const MAX = (1n << 128n) - 1n;
   validateUserOpFields(makeUserOp({ callGasLimit: MAX, maxFeePerGas: MAX, maxPriorityFeePerGas: MAX }));
 });
 
-Deno.test("validateUserOpFields - rejects priority > maxFee", () => {
-  assertThrows(
+it("validateUserOpFields - rejects priority > maxFee", () => {
+  expect(
     () =>
       validateUserOpFields(
         makeUserOp({
@@ -206,74 +212,84 @@ Deno.test("validateUserOpFields - rejects priority > maxFee", () => {
           maxPriorityFeePerGas: 20n,
         }),
       ),
-    UserOpValidationError,
-    "must not exceed",
-  );
+  ).toThrow("must not exceed");
+  expect(
+    () =>
+      validateUserOpFields(
+        makeUserOp({
+          maxFeePerGas: 10n,
+          maxPriorityFeePerGas: 20n,
+        }),
+      ),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("validateUserOpFields - rejects empty signature", () => {
-  assertThrows(
+it("validateUserOpFields - rejects empty signature", () => {
+  expect(
     () => validateUserOpFields(makeUserOp({ signature: "0x" })),
-    UserOpValidationError,
-    "signature is required",
-  );
+  ).toThrow("signature is required");
+  expect(
+    () => validateUserOpFields(makeUserOp({ signature: "0x" })),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("validateUserOpFields - rejects factoryData without factory", () => {
-  assertThrows(
+it("validateUserOpFields - rejects factoryData without factory", () => {
+  expect(
     () =>
       validateUserOpFields(makeUserOp({ factory: null, factoryData: "0x1234" })),
-    UserOpValidationError,
-    "factoryData without factory",
-  );
+  ).toThrow("factoryData without factory");
+  expect(
+    () =>
+      validateUserOpFields(makeUserOp({ factory: null, factoryData: "0x1234" })),
+  ).toThrow(UserOpValidationError);
 });
 
 // --- parseValidationData ---
 
-Deno.test("parseValidationData - zero means valid forever from zero aggregator", () => {
+it("parseValidationData - zero means valid forever from zero aggregator", () => {
   const result = parseValidationData(0n);
-  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000000");
-  assertEquals(result.validAfter, 0);
-  assertEquals(result.validUntil, 0xffffffffffff); // 0 means no expiry
+  expect(result.aggregator).toEqual("0x0000000000000000000000000000000000000000");
+  expect(result.validAfter).toEqual(0);
+  expect(result.validUntil).toEqual(0xffffffffffff); // 0 means no expiry
 });
 
-Deno.test("parseValidationData - sig failure aggregator == 1", () => {
+it("parseValidationData - sig failure aggregator == 1", () => {
   // Canonical ERC-4337 v0.7: aggregator is the LOW 160 bits; SIG_VALIDATION_FAILED == 1.
   const data = 1n;
   const result = parseValidationData(data);
-  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000001");
+  expect(result.aggregator).toEqual("0x0000000000000000000000000000000000000001");
 });
 
-Deno.test("parseValidationData - time-bounded op has zero aggregator (accepted, not mis-read)", () => {
+it("parseValidationData - time-bounded op has zero aggregator (accepted, not mis-read)", () => {
   // Regression guard for the inverted-layout bug: a valid op with only validUntil set must
   // parse aggregator == 0 (success), NOT a bogus nonzero value that would be rejected as
   // "Aggregated signatures not supported".
   const validUntil = 1893456000n; // 2030-01-01
   const data = validUntil << 160n;
   const result = parseValidationData(data);
-  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000000");
-  assertEquals(result.validUntil, 1893456000);
-  assertEquals(result.validAfter, 0);
+  expect(result.aggregator).toEqual("0x0000000000000000000000000000000000000000");
+  expect(result.validUntil).toEqual(1893456000);
+  expect(result.validAfter).toEqual(0);
 });
 
-Deno.test("isValidTimeRange - current time within range", () => {
+it("isValidTimeRange - current time within range", () => {
   const now = Math.floor(Date.now() / 1000);
-  assert(isValidTimeRange(now - 100, now + 100, 0));
+  expect(isValidTimeRange(now - 100, now + 100, 0)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - expired returns false", () => {
+it("isValidTimeRange - expired returns false", () => {
   const now = Math.floor(Date.now() / 1000);
-  assert(!isValidTimeRange(0, now - 10, 0));
+  expect(!isValidTimeRange(0, now - 10, 0)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - not yet valid returns false", () => {
+it("isValidTimeRange - not yet valid returns false", () => {
   const now = Math.floor(Date.now() / 1000);
-  assert(!isValidTimeRange(now + 1000, now + 2000, 0));
+  expect(!isValidTimeRange(now + 1000, now + 2000, 0)).toBeTruthy();
 });
 
 // --- Normalization ---
 
-Deno.test("normalizeUserOp - converts hex strings to bigints", () => {
+it("normalizeUserOp - converts hex strings to bigints", () => {
   const raw = {
     sender: "0x1234567890abcdef1234567890abcdef12345678",
     nonce: "0x1",
@@ -287,14 +303,13 @@ Deno.test("normalizeUserOp - converts hex strings to bigints", () => {
   };
 
   const userOp = normalizeUserOp(raw);
-  assertEquals(userOp.nonce, 1n);
-  assertEquals(userOp.callGasLimit, 100_000n);
-  assertEquals(userOp.verificationGasLimit, 200_000n);
+  expect(userOp.nonce).toEqual(1n);
+  expect(userOp.callGasLimit).toEqual(100_000n);
+  expect(userOp.verificationGasLimit).toEqual(200_000n);
 });
 
-Deno.test("normalizeUserOp - rejects missing sender", () => {
-  assertThrows(
+it("normalizeUserOp - rejects missing sender", () => {
+  expect(
     () => normalizeUserOp({ nonce: "0x0" }),
-    UserOpValidationError,
-  );
+  ).toThrow(UserOpValidationError);
 });

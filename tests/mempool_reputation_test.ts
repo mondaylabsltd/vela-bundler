@@ -4,7 +4,7 @@
  * block. (Factory/paymaster — shared entities — remain bannable; covered elsewhere.)
  */
 
-import { assertEquals, assertThrows } from "@std/assert";
+import { it, expect } from "vitest";
 import { Mempool } from "../shared/mempool/index.ts";
 import { UserOpValidationError } from "../shared/userop/validate.ts";
 import type { UserOperation } from "../shared/userop/types.ts";
@@ -27,34 +27,31 @@ function newMempool(): Mempool {
   return new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
 }
 
-Deno.test("mempool - a BANNED sender is NOT rejected (custodial: reputation is a rate limit, not a block)", () => {
+it("mempool - a BANNED sender is NOT rejected (custodial: reputation is a rate limit, not a block)", () => {
   const mp = newMempool();
   // Force the sender into a banned reputation status.
   mp.reputation.setReputation(SENDER, "sender", 1000, 0, "banned");
-  assertEquals(mp.reputation.isBanned(SENDER, "sender"), true);
+  expect(mp.reputation.isBanned(SENDER, "sender")).toEqual(true);
   // The op must still be accepted — the user can move their money.
   const hash = mp.add(makeOp());
-  assertEquals(typeof hash, "string");
-  assertEquals(mp.size, 1);
+  expect(typeof hash).toEqual("string");
+  expect(mp.size).toEqual(1);
 });
 
-Deno.test("mempool - a penalized sender is rate-limited to 1 pending op (not blocked)", () => {
+it("mempool - a penalized sender is rate-limited to 1 pending op (not blocked)", () => {
   const mp = newMempool();
   mp.reputation.setReputation(SENDER, "sender", 1000, 0, "banned");
   mp.add(makeOp({ nonce: 0n })); // first op accepted
   // A SECOND concurrent op while one is pending is rate-limited (throttle), not a permanent block.
-  assertThrows(
-    () => mp.add(makeOp({ nonce: 1n })),
-    UserOpValidationError,
-    "rate-limited",
-  );
+  expect(() => mp.add(makeOp({ nonce: 1n }))).toThrow("rate-limited");
+  expect(() => mp.add(makeOp({ nonce: 1n }))).toThrow(UserOpValidationError);
   // Once the first clears, the sender can submit again.
   mp.remove(mp.dump()[0]!.userOpHash);
   const hash = mp.add(makeOp({ nonce: 1n }));
-  assertEquals(typeof hash, "string");
+  expect(typeof hash).toEqual("string");
 });
 
-Deno.test("mempool - a TTL-evicted op fires the eviction hook (feeds a terminal failed receipt)", () => {
+it("mempool - a TTL-evicted op fires the eviction hook (feeds a terminal failed receipt)", () => {
   const mp = newMempool();
   const evicted: string[] = [];
   mp.setTtlEvictionHook((e) => evicted.push(e.userOpHash));
@@ -65,16 +62,16 @@ Deno.test("mempool - a TTL-evicted op fires the eviction hook (feeds a terminal 
   (entry as { addedAt: number }).addedAt = Date.now() - 10 * 60 * 1000;
   (entry as { firstSeenAt: number }).firstSeenAt = Date.now() - 10 * 60 * 1000;
   mp.getAll(); // triggers TTL eviction + hook
-  assertEquals(mp.size, 0);
-  assertEquals(evicted, [hash]);
+  expect(mp.size).toEqual(0);
+  expect(evicted).toEqual([hash]);
 });
 
-Deno.test("reputation.countPenalized - counts banned/throttled senders for the alert", () => {
+it("reputation.countPenalized - counts banned/throttled senders for the alert", () => {
   const mp = newMempool();
   mp.reputation.setReputation("0x" + "a1".repeat(20) as `0x${string}`, "sender", 1000, 0, "banned");
   mp.reputation.setReputation("0x" + "b2".repeat(20) as `0x${string}`, "sender", 30, 0, "throttled");
   mp.reputation.setReputation("0x" + "c3".repeat(20) as `0x${string}`, "sender", 1, 0, "ok");
   const c = mp.reputation.countPenalized("sender");
-  assertEquals(c.banned, 1);
-  assertEquals(c.throttled, 1);
+  expect(c.banned).toEqual(1);
+  expect(c.throttled).toEqual(1);
 });

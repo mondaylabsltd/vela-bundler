@@ -2,7 +2,7 @@
  * Tests for worker/config.ts — buildConfig from CF Worker env bindings.
  */
 
-import { assertEquals } from "@std/assert";
+import { it, expect } from "vitest";
 
 // worker/config.ts cannot be imported here: worker/types.ts references the Cloudflare
 // ambient type `DurableObjectNamespace`, which `deno check` cannot resolve. The AUTHORITATIVE
@@ -12,7 +12,7 @@ import { assertEquals } from "@std/assert";
 
 import type { BundlerConfig } from "../shared/config/types.ts";
 
-Deno.test("BundlerConfig defaults — all optional fields have sensible defaults", () => {
+it("BundlerConfig defaults — all optional fields have sensible defaults", () => {
   // Simulate what buildConfig does with minimal env
   const config: BundlerConfig = {
     chainId: 0,
@@ -47,40 +47,40 @@ Deno.test("BundlerConfig defaults — all optional fields have sensible defaults
     treasuryAlertThresholdPathUsd: 0n,
   };
 
-  assertEquals(config.bundlingMode, "auto");
-  assertEquals(config.maxBundleSize, 10);
-  assertEquals(config.minProfitMarginBps, 1000);
-  assertEquals(config.walletGasMarkup, 1.5);
-  assertEquals(config.useEip1559, true);
+  expect(config.bundlingMode).toEqual("auto");
+  expect(config.maxBundleSize).toEqual(10);
+  expect(config.minProfitMarginBps).toEqual(1000);
+  expect(config.walletGasMarkup).toEqual(1.5);
+  expect(config.useEip1559).toEqual(true);
 });
 
-Deno.test("BundlerConfig — walletGasMarkup calculation matches formula", () => {
+it("BundlerConfig — walletGasMarkup calculation matches formula", () => {
   // Formula: 1 + parseInt(WALLET_GAS_MARGIN_PERCENT) / 100
   const percent50 = 1 + 50 / 100;
-  assertEquals(percent50, 1.5);
+  expect(percent50).toEqual(1.5);
 
   const percent30 = 1 + 30 / 100;
-  assertEquals(percent30, 1.3);
+  expect(percent30).toEqual(1.3);
 
   const percent0 = 1 + 0 / 100;
-  assertEquals(percent0, 1);
+  expect(percent0).toEqual(1);
 });
 
-Deno.test("BundlerConfig — useEip1559 env parsing", () => {
+it("BundlerConfig — useEip1559 env parsing", () => {
   // Mirrors worker/config.ts:37 `(env.USE_EIP1559 ?? "true") === "true"` — via a typed
   // helper so it tests the real expression rather than a compile-time-constant literal.
   const parseEip1559 = (v: string | undefined): boolean => (v ?? "true") === "true";
-  assertEquals(parseEip1559("true"), true);
-  assertEquals(parseEip1559("false"), false);
-  assertEquals(parseEip1559(undefined), true);
-  assertEquals(parseEip1559("anything-else"), false);
+  expect(parseEip1559("true")).toEqual(true);
+  expect(parseEip1559("false")).toEqual(false);
+  expect(parseEip1559(undefined)).toEqual(true);
+  expect(parseEip1559("anything-else")).toEqual(false);
 });
 
-Deno.test("BundlerConfig — oldOperatorSecrets CSV parsing", () => {
+it("BundlerConfig — oldOperatorSecrets CSV parsing", () => {
   // Mirrors worker/config.ts:44 / deno/config.ts:30 CSV parse.
   const parseCsv = (v: string | undefined): string[] =>
     (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  assertEquals(parseCsv("0xaa,0xbb, 0xcc ,"), ["0xaa", "0xbb", "0xcc"]);
-  assertEquals(parseCsv(""), []);
-  assertEquals(parseCsv(undefined), []);
+  expect(parseCsv("0xaa,0xbb, 0xcc ,")).toEqual(["0xaa", "0xbb", "0xcc"]);
+  expect(parseCsv("")).toEqual([]);
+  expect(parseCsv(undefined)).toEqual([]);
 });
