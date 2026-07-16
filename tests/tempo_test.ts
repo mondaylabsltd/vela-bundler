@@ -152,6 +152,38 @@ Deno.test("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no
   assertEquals(parseTempoReimbursement(mixed, eoa, PATHUSD), 1234n);
 });
 
+Deno.test("parseTempoReimbursement SECURITY: rejects a phantom batch not delegatecalling MultiSend (drain fix)", () => {
+  const eoa = getAddress("0x1111111111111111111111111111111111111111");
+  const msData = encodeFunctionData({
+    abi: multiSend,
+    functionName: "multiSend",
+    args: [packTx(PATHUSD, transfer(eoa, 9_999_999n))],
+  });
+  // executeUserOp(to = code-less addr, operation = 0 CALL): the on-chain CALL succeeds moving
+  // NOTHING (the bytes are never run as a MultiSend batch), so it must NOT be credited — else a
+  // zero-balance UserOp drains the bundler's gas float.
+  const phantomCall = encodeFunctionData({
+    abi: execUserOp,
+    functionName: "executeUserOp",
+    args: ["0x000000000000000000000000000000000000dEaD", 0n, msData, 0],
+  });
+  assertEquals(parseTempoReimbursement(phantomCall, eoa, PATHUSD), 0n);
+
+  // DELEGATECALL (operation = 1) to a NON-MultiSend target → also rejected.
+  const wrongTarget = encodeFunctionData({
+    abi: execUserOp,
+    functionName: "executeUserOp",
+    args: ["0x000000000000000000000000000000000000dEaD", 0n, msData, 1],
+  });
+  assertEquals(parseTempoReimbursement(wrongTarget, eoa, PATHUSD), 0n);
+
+  // The legit encoding (delegatecall to the real MultiSend) still credits the reimbursement.
+  assertEquals(
+    parseTempoReimbursement(buildBatch([{ to: PATHUSD, data: transfer(eoa, 1234n) }]), eoa, PATHUSD),
+    1234n,
+  );
+});
+
 // --- tempoHandleOpsGasLimit: the outer-0x76 gas must cover declared op limits ---
 
 function packGasLimits(vGL: bigint, cGL: bigint): `0x${string}` {
