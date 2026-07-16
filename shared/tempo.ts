@@ -146,6 +146,14 @@ export async function sponsorTempoPathUsd(params: {
  * risk (same token in, same token out). Trust-minimised: reads the signed calldata, not a
  * wallet-supplied amount.
  */
+/**
+ * The ONLY target a reimbursement is credited from. A reimbursing UserOp must be
+ * `executeUserOp(TRUSTED_MULTISEND, _, batch, operation=DELEGATECALL)` — only a delegatecall to
+ * this exact canonical Safe MultiSend runs the decoded legs against the Safe and actually pays the
+ * bundler EOA. Same deterministic address on every chain.
+ */
+export const TRUSTED_MULTISEND = getAddress("0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526");
+
 export function parseTempoReimbursement(
   callData: Hex,
   recipient: `0x${string}`,
@@ -163,6 +171,19 @@ export function parseTempoReimbursement(
   }
   try {
     const exec = decodeFunctionData({ abi: EXECUTE_USER_OP_ABI, data: callData });
+    // SECURITY (critical): bind the decoded batch to what ACTUALLY executes on-chain. The UserOp
+    // must DELEGATECALL (operation=1) the canonical MultiSend — only then do the inner legs run
+    // against the Safe and truly transfer the feeToken to the bundler. A CALL (operation=0) to a
+    // code-less address, or a call to any non-MultiSend target, executes NOTHING interpretable as
+    // this batch, yet the bytes still decode as transfers below — so a zero-balance UserOp could
+    // be credited a PHANTOM reimbursement, pass the gate, and drain the bundler's gas float for
+    // free. Reject anything that is not a delegatecall to the trusted MultiSend.
+    if (Number(exec.args[3]) !== 1) return 0n;
+    try {
+      if (getAddress(exec.args[0] as string) !== TRUSTED_MULTISEND) return 0n;
+    } catch {
+      return 0n;
+    }
     const innerData = exec.args[2] as Hex; // bytes -> the multiSend(bytes) call
     const ms = decodeFunctionData({ abi: MULTISEND_ABI, data: innerData });
     const txs = ms.args[0] as Hex; // packed: op(1) to(20) value(32) len(32) data(len)
