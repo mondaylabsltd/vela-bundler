@@ -15,7 +15,10 @@ import {
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
 import { validateUserOpFields, UserOpValidationError } from "../userop/validate.ts";
-import { isTempoChain } from "../tempo.ts";
+import { isTempoChain, chainSupportsInBand, IN_BAND_MARKUP_X } from "../tempo.ts";
+import { quoteNativeToStable, stableDecimals, requiredStableCharge } from "../gas/stable-rate.ts";
+import { getAddress } from "viem";
+import { getPublicClient } from "../utils/rpc-client.ts";
 import { calcPreVerificationGas } from "../gas/preVerificationGas.ts";
 import {
   calcUserOpGasPrice,
@@ -74,6 +77,8 @@ export async function handleRpcMethod(
       return "0x" + reqCtx.chainId.toString(16);
     case "pimlico_getUserOperationGasPrice":
       return await handleGetUserOperationGasPrice(config, chainRegistry, reqCtx);
+    case "vela_getInBandGasQuote":
+      return await handleGetInBandGasQuote(params, config, chainRegistry, reqCtx);
     default:
       throw methodNotFound(method);
   }
@@ -138,8 +143,13 @@ async function handleSendUserOperation(
   }
 
   try {
-    // Tempo requires maxFeePerGas = 0 (no native coin; gas paid in a stablecoin 0x76).
-    validateUserOpFields(userOp, isTempoChain(reqCtx.chainId));
+    // In-band chains allow maxFeePerGas = 0 (bundler repaid in-band); the raised verification-gas
+    // ceiling is the Tempo ENVELOPE only. See docs/inband-gas-settlement.md.
+    validateUserOpFields(
+      userOp,
+      chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false),
+      isTempoChain(reqCtx.chainId),
+    );
   } catch (err) {
     if (err instanceof UserOpValidationError) {
       throw bundlerError(err.code, err.message);
@@ -173,10 +183,11 @@ async function handleSendUserOperation(
     );
   }
 
-  // Tempo settles gas in a stablecoin via the bundler's 0x76 (see shared/tempo.ts), so
-  // the native balance / priority-fee floor / gas-price-margin checks below don't apply
-  // (maxFeePerGas = 0 there is required, not a misconfiguration).
+  // In-band chains settle gas by an in-band reimbursement (the bundler EOA is an OPERATOR float,
+  // not a user deposit), so the native-balance / priority-fee-floor / gas-price-margin checks below
+  // do not apply (maxFeePerGas = 0 is expected there, not a misconfiguration). See docs/.
   const tempo = isTempoChain(reqCtx.chainId);
+  const inBand = chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false);
 
   // Check balance — use chain-aware gas pricing
   let gasPrices;
@@ -210,6 +221,10 @@ async function handleSendUserOperation(
   // guaranteed 5-min TTL miss instead of a synchronous "deposit to X" error.
   const estimatedCost = maxGas * outerGas.maxFeePerGas;
 
+  // In-band: the EOA is an operator float (repaid in-band), not a user deposit — skip the
+  // user-facing "deposit to {eoa}" balance gate entirely. A low float is handled at submit time
+  // (defer + operator alert + top-up), never surfaced to the user as a bad UserOp.
+  if (!inBand) {
   console.log(`[RPC] Balance check: eoa=${eoa.address} maxGas=${maxGas} effectiveGasPrice=${outerGas.effectiveGasPrice} estimatedCost=${estimatedCost} rpcOverride=${rpcOverride ?? 'none'}`);
   let balanceCheck;
   try {
@@ -244,6 +259,7 @@ async function handleSendUserOperation(
       `Deposit to: ${eoa.address}`,
     );
   }
+  } // end if (!inBand) balance gate
 
   // --- Standard ERC-4337 checks ---
   const minPvg = calcPreVerificationGas(userOp, {
@@ -256,7 +272,7 @@ async function handleSendUserOperation(
     );
   }
 
-  if (!tempo && userOp.maxPriorityFeePerGas < config.minPriorityFeePerGas) {
+  if (!inBand && userOp.maxPriorityFeePerGas < config.minPriorityFeePerGas) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `maxPriorityFeePerGas too low: ${userOp.maxPriorityFeePerGas} < minimum ${config.minPriorityFeePerGas}`,
@@ -276,7 +292,7 @@ async function handleSendUserOperation(
   // Sanity check: derived outer price must not be absurdly below chain rate.
   // Use 5x tolerance — on cheap-gas chains (Gnosis, ~0.001 Gwei) the gas price
   // fluctuates by 2-3x between blocks, making a 50% threshold too strict.
-  if (!tempo && derivedOuterPrice * 5n < outerGas.effectiveGasPrice) {
+  if (!inBand && derivedOuterPrice * 5n < outerGas.effectiveGasPrice) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
       `Gas price too low: derived outer price ${derivedOuterPrice} < ` +
@@ -390,6 +406,82 @@ async function handleEstimateUserOperationGas(
   }
 
   return result;
+}
+
+/**
+ * vela_getInBandGasQuote — advisory sizing help for the in-band gas reimbursement the wallet batches
+ * into its UserOp. The bundle GATE re-verifies at submit (so this only helps the wallet transfer
+ * enough; it trusts the caller's `nativeCost` estimate). Params: [{ safeAddress, nativeCost (wei,
+ * hex or decimal), feeToken? }]. Returns the recipient EOA + the amount to transfer — in native
+ * (feeToken omitted) or a whitelisted stablecoin (priced by the chain's DEX, $0.01-floored).
+ */
+async function handleGetInBandGasQuote(
+  params: unknown[],
+  config: BundlerConfig,
+  chainRegistry: ChainRegistryLike,
+  reqCtx: RequestContext,
+): Promise<Record<string, unknown>> {
+  if (!chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false)) {
+    throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "in-band gas settlement is not enabled on this chain");
+  }
+  const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
+  const arg = (params?.[0] ?? {}) as { safeAddress?: string; nativeCost?: string; feeToken?: string | null };
+  if (!arg.safeAddress || !/^0x[0-9a-fA-F]{40}$/.test(arg.safeAddress)) {
+    throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "safeAddress is required");
+  }
+  let nativeCost: bigint;
+  try {
+    nativeCost = BigInt(arg.nativeCost ?? "0");
+  } catch {
+    throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "nativeCost must be a number (hex or decimal wei)");
+  }
+  if (nativeCost <= 0n) throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "nativeCost must be > 0");
+
+  const eoa = await chain.accountService.deriveEOA(getAddress(arg.safeAddress));
+  const requiredNative = nativeCost * IN_BAND_MARKUP_X;
+
+  if (!arg.feeToken) {
+    return {
+      recipient: eoa.address,
+      asset: "native",
+      feeToken: null,
+      requiredAmount: "0x" + requiredNative.toString(16),
+      markupX: Number(IN_BAND_MARKUP_X),
+    };
+  }
+
+  // Stablecoin: must be whitelisted; priced by the chain's DEX; charge floored at $0.01.
+  const stable = getAddress(arg.feeToken);
+  const stables = (config.chainInfo?.stables ?? []).map((s) => {
+    try {
+      return getAddress(s.contract);
+    } catch {
+      return null;
+    }
+  });
+  if (!stables.includes(stable)) {
+    throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, `feeToken ${stable} is not a whitelisted stablecoin on this chain`);
+  }
+  const quoter = config.chainInfo?.dex?.contracts?.quoterV2;
+  const wnative = config.chainInfo?.wrappedNativeToken;
+  if (!quoter || !wnative) {
+    throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "stablecoin gas is unsupported on this chain (no DEX quoter / wrappedNative)");
+  }
+  const client = getPublicClient(config.rpcUrl);
+  const costStable = await quoteNativeToStable(client, { quoterV2: quoter, wrappedNative: wnative, stable }, nativeCost, reqCtx.chainId);
+  if (costStable === null || costStable <= 0n) {
+    throw degradedFromError(new Error("no DEX quote for stablecoin"), "stablecoin rate");
+  }
+  const decimals = await stableDecimals(client, stable);
+  const required = requiredStableCharge(costStable, decimals, IN_BAND_MARKUP_X);
+  return {
+    recipient: eoa.address,
+    asset: "erc20",
+    feeToken: stable,
+    requiredAmount: "0x" + required.toString(16),
+    decimals,
+    markupX: Number(IN_BAND_MARKUP_X),
+  };
 }
 
 /**

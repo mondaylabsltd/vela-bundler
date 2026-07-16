@@ -55,6 +55,11 @@ export interface BundlerConfig {
    *  Derived (CREATE2) from treasuryAddress; identical on every chain. See
    *  shared/contracts/splitter.ts. */
   readonly splitterAddress: `0x${string}`;
+  /** Opt a non-Tempo chain into the in-band settlement model (bundler eats gas, UserOp repays
+   *  in-band; EntryPoint fee=0). Off by default; flipped per-chain as chains migrate off the
+   *  legacy native-self-pay/splitter route. Tempo chains are always in-band regardless.
+   *  See docs/inband-gas-settlement.md. */
+  readonly inBandEnabled?: boolean;
   readonly apiRateLimitPerMinute: number;
   /** Client IPs exempt from rate limiting (comma-separated env RATE_LIMIT_ALLOWLIST) —
    *  the operator's own bot must never self-throttle its trading ops. */

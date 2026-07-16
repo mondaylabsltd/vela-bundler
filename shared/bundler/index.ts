@@ -36,17 +36,23 @@ import type {
 import { encodeHandleOps } from "../userop/encode.ts";
 import {
   calcUserOpGasPrice,
+  calcOuterTxGasPrice,
   checkBundleProfitability,
 } from "../gas/profitability.ts";
+import { quoteNativeToStable, stableDecimals, stableFloorUnits } from "../gas/stable-rate.ts";
 import { computeOuterGas, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 import {
   isTempoChain,
+  chainSupportsInBand,
   resolveFeeToken,
   tempoCostInFeeToken,
   parseTempoReimbursement,
+  parseInBandReimbursement,
   submitTempoBundle,
   TEMPO_COST_BUFFER_GAS,
+  EIP1559_COST_BUFFER_GAS,
+  IN_BAND_MARKUP_X,
 } from "../tempo.ts";
 
 export interface BundleResult {
@@ -628,7 +634,7 @@ export class BundlerService {
     const userOpEffective = revenueCap; // revenue basis used by the profitability gate below
     const intendedGasPrice = reverseMarkup(revenueCap, markupBps);
     const chainTip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
-    const outerGas = computeOuterGas({
+    let outerGas = computeOuterGas({
       revenueCapPerGas: revenueCap,
       baseFee,
       intendedGasPrice,
@@ -716,12 +722,28 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "All ops failed re-validation" };
     }
 
-    // Beneficiary: on native chains the EntryPoint pays the VelaGasSettlementSplitter, whose
-    // receive() splits the gas settlement 50/50 between the bundler EOA (tx.origin) and the
-    // treasury. On Tempo the EntryPoint refund is 0 (maxFee=0) and the bundler is repaid by an
-    // in-band feeToken transfer to the EOA, so the beneficiary MUST stay the EOA there.
-    const tempo = isTempoChain(this.config.chainId);
-    const beneficiary = tempo ? eoa.address : this.config.splitterAddress;
+    // Two orthogonal axes (see docs/inband-gas-settlement.md):
+    //  - inBand = SETTLEMENT model: beneficiary=EOA, in-band reimbursement gate, no reservation.
+    //    On native (route-A) chains the EntryPoint instead pays the VelaGasSettlementSplitter,
+    //    which splits 50/50 EOA/treasury. inBand is always on for Tempo, opt-in elsewhere.
+    //  - tempoEnvelope = tx ENVELOPE only (0x76 fee-token tx vs native EIP-1559) + trusted RPC.
+    //  Until a chain sets inBandEnabled, inBand === tempoEnvelope === isTempoChain (no change).
+    const tempoEnvelope = isTempoChain(this.config.chainId);
+    const inBand = chainSupportsInBand(this.config.chainId, this.config.inBandEnabled ?? false);
+    const beneficiary = inBand ? eoa.address : this.config.splitterAddress;
+
+    // Generic in-band ops sign maxFeePerGas=0, so the revenueCap-based outerGas above is 0 and would
+    // make the outer tx unminable. The bundler is repaid in-band (not via EntryPoint), so there is
+    // no revenue cap — reprice the outer tx straight from the network. (Route-A keeps the clamp;
+    // Tempo prices its own 0x76 fee in submitTempoBundle and does not use outerGas.)
+    if (inBand && !tempoEnvelope) {
+      outerGas = calcOuterTxGasPrice({
+        currentBaseFee: baseFee,
+        baseFeeMultiplier: this.config.baseFeeMultiplier,
+        bundlerTipGwei: this.config.bundlerTipGwei,
+        chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
+      });
+    }
 
     // Full bundle simulation. The outer handleOps tx is sent BY the EOA (eoa.address is
     // tx.origin), so simulation's `from` stays the EOA even when the encoded beneficiary is
@@ -753,8 +775,18 @@ export class BundlerService {
     // Gating on the node's own rule keeps the op IN the mempool instead, where the
     // stuck-mempool alert observes it. On Tempo it's meaningless (no native coin) and unused.
     const expectedCost = bundleSim.estimatedGas! * outerGas.maxFeePerGas;
+    // In-band ops reserve nothing (the EOA is an operator float, repaid in-band, not a user
+    // custody balance). Persist 0 as the reserved amount so the receipt's later release / fee-bump
+    // re-reserve are no-ops. releaseReservation clamps at 0, so the immediate release paths that
+    // still pass expectedCost are harmless for in-band.
+    const reservedAmount = inBand ? 0n : expectedCost;
+    // Fee-bump ceiling basis. Route-A uses the signed revenueCap. Generic in-band signs maxFee=0 so
+    // revenueCap is 0, which would collapse the fee-bump ceiling and strand a stuck tx forever;
+    // use the network outer price instead — the reimbursement is IN_BAND_MARKUP_X× that, so bumping
+    // up to the ceiling (a small multiple of this) stays comfortably profitable.
+    const revenueCapForReceipt = inBand && !tempoEnvelope ? outerGas.maxFeePerGas : revenueCap;
 
-    if (tempo) {
+    if (inBand && tempoEnvelope) {
       // Tempo: the bundler is repaid by a stablecoin transfer batched into the UserOp,
       // not by EntryPoint (maxFee=0 → refund 0). Native profitability/balance checks
       // don't apply — instead we (1) verify execution succeeds (else the in-band transfer
@@ -802,6 +834,82 @@ export class BundlerService {
           submitted: false,
           userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
           error: `Tempo reimbursement too low: ${reimbursed} < cost ${costInFeeToken} in ${feeToken}`,
+        };
+      }
+    } else if (inBand) {
+      // Generic in-band (native EIP-1559 envelope): the bundler EOA fronts native L1 gas and is
+      // repaid by a native transfer to it batched into the UserOp. Same fail-closed shape as Tempo
+      // but priced in native wei: (1) prove execution succeeds (else the in-band transfer rolls
+      // back leaving us unpaid), (2) cost = realGas × network outer price, (3) require the in-band
+      // native reimbursement to cover IN_BAND_MARKUP_X × cost. Stablecoin reimbursement + the $0.01
+      // floor land in step 8 (empty token allowlist here → native-only). See docs/.
+      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
+      if (!execCheck.success) {
+        if (execCheck.failedOpIndex !== undefined) {
+          const failed = checkedEntries[execCheck.failedOpIndex];
+          if (failed) {
+            this.dropWithReceipt(failed.entry, `in-band execution would revert: ${execCheck.errorMessage}`);
+            this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
+          }
+        }
+        console.warn(`[Bundler][InBand] REJECT — execution would revert: ${execCheck.errorMessage}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `In-band execution would revert (bundler not reimbursed): ${execCheck.errorMessage}`,
+        };
+      }
+      // outerGas was repriced from the network for generic in-band above (a maxFee=0 op makes
+      // revenueCap 0), so it is the price the submit path will actually pay — cost basis uses it.
+      const realGas = (execCheck.gasUsed ?? bundleSim.estimatedGas!) + EIP1559_COST_BUFFER_GAS;
+      const costNative = realGas * outerGas.maxFeePerGas;
+      let requiredNative = costNative * IN_BAND_MARKUP_X; // 3× the real on-chain gas
+
+      // Accumulate the in-band reimbursement across ops: native value + allowlisted-stablecoin
+      // transfers to the EOA. Allowlist = the chain's registry `stables` (anti fake-token drain).
+      const stableAllow = (this.config.chainInfo?.stables ?? []).map((s) => s.contract);
+      let native = 0n;
+      const byToken: Record<string, bigint> = {};
+      for (const e of checkedEntries) {
+        const r = parseInBandReimbursement(e.entry.userOp.callData, beneficiary, stableAllow);
+        native += r.native;
+        for (const [k, v] of Object.entries(r.byToken)) byToken[k] = (byToken[k] ?? 0n) + v;
+      }
+
+      // Value everything in native-equiv. Stablecoin legs are priced by the chain's DEX quote
+      // (WETH→stable of the native cost, rescaled), and each stablecoin used raises the required
+      // charge to the $0.01 floor. Fail closed if a stablecoin can't be priced.
+      let reimbursedNativeEquiv = native;
+      const quoter = this.config.chainInfo?.dex?.contracts?.quoterV2;
+      const wnative = this.config.chainInfo?.wrappedNativeToken;
+      for (const [stableLower, amount] of Object.entries(byToken)) {
+        if (amount <= 0n) continue;
+        if (!quoter || !wnative) {
+          return { submitted: false, userOpHashes: checkedEntries.map((e) => e.entry.userOpHash), error: "stablecoin gas unsupported on this chain (no DEX quoter / wrappedNative)" };
+        }
+        const stable = stableLower as `0x${string}`;
+        const client = this.publicClient as PublicClient<Transport, Chain>;
+        const costStable = await quoteNativeToStable(client, { quoterV2: quoter, wrappedNative: wnative, stable }, costNative, this.config.chainId);
+        if (costStable === null || costStable <= 0n) {
+          return { submitted: false, userOpHashes: checkedEntries.map((e) => e.entry.userOpHash), error: `cannot price stablecoin ${stable} for in-band gas (no DEX quote)` };
+        }
+        // native-equiv of this stable leg = amount × costNative / costStable (reuses the quote ratio).
+        reimbursedNativeEquiv += (amount * costNative) / costStable;
+        // $0.01-per-stablecoin floor, expressed in native-equiv; raise the requirement if higher.
+        const dec = await stableDecimals(client, stable);
+        const floorNative = (stableFloorUnits(dec) * costNative) / costStable;
+        if (floorNative > requiredNative) requiredNative = floorNative;
+      }
+
+      console.log(
+        `[Bundler][InBand] reimbursedNativeEquiv=${reimbursedNativeEquiv} required=${requiredNative} (${IN_BAND_MARKUP_X}× of ${costNative}; native=${native}, stables=${Object.keys(byToken).length}) simGas=${execCheck.gasUsed ?? "n/a"} (${checkedEntries.length} ops)`,
+      );
+      if (reimbursedNativeEquiv < requiredNative) {
+        console.warn(`[Bundler][InBand] REJECT — reimbursement ${reimbursedNativeEquiv} < required ${requiredNative}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `In-band reimbursement too low: ${reimbursedNativeEquiv} < required ${requiredNative}`,
         };
       }
     } else {
@@ -894,8 +1002,8 @@ export class BundlerService {
       }
     }
 
-    // Reserve balance atomically (native only — Tempo settles in stablecoin in-band).
-    if (!tempo) this.accountService.reserveBalance(eoa.address, expectedCost);
+    // Reserve balance atomically (route-A native only — in-band settles by reimbursement).
+    if (!inBand) this.accountService.reserveBalance(eoa.address, expectedCost);
 
     // SECURITY: sign & broadcast ONLY via the bundler's own trusted RPC, never the
     // user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC leaks it and lets
@@ -914,14 +1022,14 @@ export class BundlerService {
     const userOpHashes = checkedEntries.map((e) => e.entry.userOpHash);
 
     console.log(
-      `[Bundler] Submitting bundle for ${safeAddress} via ${tempo ? "Tempo 0x76" : "EIP-1559"} (eoa=${eoa.address}, rpc=${submitRpcUrl})`,
+      `[Bundler] Submitting bundle for ${safeAddress} via ${tempoEnvelope ? "Tempo 0x76" : "EIP-1559"} (eoa=${eoa.address}, rpc=${submitRpcUrl})`,
     );
 
     // ------------------------------------------------------------------
     // Tempo: submit handleOps inside a native 0x76 tx paying gas in the stablecoin.
     // sendTransactionSync waits for the receipt, so success here means MINED.
     // ------------------------------------------------------------------
-    if (tempo) {
+    if (tempoEnvelope) {
       // Pin the outer nonce for Tempo too (best-effort): the sync submit signs its own tx,
       // but the value read here right before it feeds (a) proof-based EOA recovery on the
       // ambiguous path and (b) the proof-based dropped verdict for the pending receipt —
@@ -1062,14 +1170,14 @@ export class BundlerService {
           checkedEntries,
           eoaAddress: eoa.address,
           safeAddress,
-          reservedAmount: expectedCost,
+          reservedAmount,
           txNonce,
           txTo: this.config.entryPointAddress,
           txData: calldata,
           txGas,
           maxFeePerGas: outerGas.maxFeePerGas,
           maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
-          revenueCapPerGas: revenueCap,
+          revenueCapPerGas: revenueCapForReceipt,
           ambiguous: true,
         });
       }
@@ -1092,14 +1200,14 @@ export class BundlerService {
       checkedEntries,
       eoaAddress: eoa.address,
       safeAddress,
-      reservedAmount: expectedCost,
+      reservedAmount,
       txNonce,
       txTo: this.config.entryPointAddress,
       txData: calldata,
       txGas,
       maxFeePerGas: outerGas.maxFeePerGas,
       maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
-      revenueCapPerGas: revenueCap,
+      revenueCapPerGas: revenueCapForReceipt,
     });
   }
 

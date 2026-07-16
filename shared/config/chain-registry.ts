@@ -41,6 +41,20 @@ export interface ChainInfo {
     url: string;
     standard?: string;
   }[];
+  // --- In-band stablecoin gas settlement (see docs/inband-gas-settlement.md). Present in the
+  //     awesometools registry JSON; fetchChainInfo passes them through. All optional — a chain
+  //     without a `dex`/`stables` simply can't offer stablecoin gas (native in-band still works). ---
+  /** Whitelisted stablecoins a user may pay gas in (the anti-drain allowlist). */
+  stables?: { symbol: string; type?: string; contract: `0x${string}` }[];
+  /** Wrapped native token (e.g. WETH) — the DEX quote leg for the native↔stable rate. */
+  wrappedNativeToken?: `0x${string}`;
+  /** On-chain DEX used to price native↔stable (Uniswap-v3 QuoterV2). */
+  dex?: {
+    dex?: string;
+    protocol?: string;
+    contracts?: { factory?: `0x${string}`; quoterV2?: `0x${string}` };
+    url?: string;
+  };
 }
 
 /**

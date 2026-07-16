@@ -10,6 +10,8 @@ import {
 import {
   isTempoChain,
   parseTempoReimbursement,
+  parseInBandReimbursement,
+  TRUSTED_MULTISEND,
   resolveFeeToken,
   tempoCostInFeeToken,
   tempoHandleOpsGasLimit,
@@ -135,6 +137,117 @@ it("parseTempoReimbursement matches a LOWERCASE recipient (bundler passes eoa.ad
 it("parseTempoReimbursement returns 0 for non-batch callData (no crash)", () => {
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
   expect(parseTempoReimbursement("0xdeadbeef", eoa, PATHUSD)).toEqual(0n);
+});
+
+// ---------------------------------------------------------------------------
+// parseInBandReimbursement — the generalized (native + allowlisted-stablecoin) decoder.
+// ---------------------------------------------------------------------------
+
+/** Pack a MultiSend leg with explicit value + operation (the base helpers force value=0/op=0). */
+function packTxFull(to: Hex, value: bigint, data: Hex, operation: number): Hex {
+  const len = BigInt((data.length - 2) / 2);
+  return encodePacked(["uint8", "address", "uint256", "uint256", "bytes"], [operation, to, value, len, data]);
+}
+function buildBatchFull(calls: { to: Hex; value?: bigint; data?: Hex; operation?: number }[]): Hex {
+  const packed = concat(calls.map((c) => packTxFull(c.to, c.value ?? 0n, c.data ?? "0x", c.operation ?? 0)));
+  const msData = encodeFunctionData({ abi: multiSend, functionName: "multiSend", args: [packed] });
+  return encodeFunctionData({ abi: execUserOp, functionName: "executeUserOp", args: [MULTI_SEND, 0n, msData, 1] });
+}
+
+const EOA = getAddress("0x1111111111111111111111111111111111111111");
+const USDC = getAddress("0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48");
+const USDT = getAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+
+it("parseInBandReimbursement counts native value sent to the EOA", () => {
+  const r = parseInBandReimbursement(buildBatchFull([{ to: EOA, value: 5000n }]), EOA, [USDC]);
+  expect(r.native).toEqual(5000n);
+  expect(r.byToken).toEqual({});
+});
+
+it("parseInBandReimbursement counts an allowlisted stablecoin transfer to the EOA", () => {
+  const r = parseInBandReimbursement(buildBatchFull([{ to: USDC, data: transfer(EOA, 12345n) }]), EOA, [USDC, USDT]);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(12345n);
+  expect(r.native).toEqual(0n);
+});
+
+it("parseInBandReimbursement SECURITY: ignores a NON-allowlisted token (anti fake-token drain)", () => {
+  const fake = getAddress("0x000000000000000000000000000000000000dEaD");
+  const r = parseInBandReimbursement(buildBatchFull([{ to: fake, data: transfer(EOA, 9_999_999n) }]), EOA, [USDC]);
+  expect(r).toEqual({ native: 0n, byToken: {} });
+});
+
+it("parseInBandReimbursement SECURITY: ignores DELEGATECALL legs (move nothing to the EOA)", () => {
+  const r = parseInBandReimbursement(
+    buildBatchFull([
+      { to: USDC, data: transfer(EOA, 5000n), operation: 1 },
+      { to: EOA, value: 5000n, operation: 1 },
+    ]),
+    EOA,
+    [USDC],
+  );
+  expect(r).toEqual({ native: 0n, byToken: {} });
+});
+
+it("parseInBandReimbursement splits native + stablecoin and ignores the user's own send", () => {
+  const other = getAddress("0x2222222222222222222222222222222222222222");
+  const r = parseInBandReimbursement(
+    buildBatchFull([
+      { to: USDC, data: transfer(other, 50_000n) }, // user's actual send — not to the EOA
+      { to: USDC, data: transfer(EOA, 700n) }, // stablecoin gas reimbursement
+      { to: EOA, value: 300n }, // native gas reimbursement
+    ]),
+    EOA,
+    [USDC],
+  );
+  expect(r.native).toEqual(300n);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(700n);
+});
+
+// Build executeUserOp with an EXPLICIT outer target + operation (to test the phantom-batch guard).
+function buildExecCustom(
+  outerTo: Hex,
+  outerOp: number,
+  legs: { to: Hex; value?: bigint; data?: Hex; operation?: number }[],
+): Hex {
+  const packed = concat(legs.map((c) => packTxFull(c.to, c.value ?? 0n, c.data ?? "0x", c.operation ?? 0)));
+  const msData = encodeFunctionData({ abi: multiSend, functionName: "multiSend", args: [packed] });
+  return encodeFunctionData({ abi: execUserOp, functionName: "executeUserOp", args: [outerTo, 0n, msData, outerOp] });
+}
+const CODELESS = "0x000000000000000000000000000000000000dEaD" as Hex;
+
+it("SECURITY: rejects a phantom CALL batch — not delegatecalling MultiSend (the drain fix)", () => {
+  // executeUserOp(to=code-less, op=CALL): on-chain this moves NOTHING, so a batch-shaped `data`
+  // must NOT be credited as a reimbursement (would let a zero-balance op drain the bundler).
+  const cd = buildExecCustom(CODELESS, 0, [{ to: EOA, value: 5000n }, { to: USDC, data: transfer(EOA, 9000n) }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+  // Same guard protects the live Tempo path.
+  const cdTempo = buildExecCustom(CODELESS, 0, [{ to: PATHUSD, data: transfer(EOA, 9999n) }]);
+  expect(parseTempoReimbursement(cdTempo, EOA, PATHUSD)).toEqual(0n);
+});
+
+it("SECURITY: rejects delegatecall to a NON-MultiSend target", () => {
+  const cd = buildExecCustom(CODELESS, 1, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+});
+
+it("SECURITY: rejects a CALL (op=0) even to the real MultiSend", () => {
+  const cd = buildExecCustom(TRUSTED_MULTISEND, 0, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+});
+
+it("credits a proper DELEGATECALL to the trusted MultiSend", () => {
+  const cd = buildExecCustom(TRUSTED_MULTISEND, 1, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC]).native).toEqual(5000n);
+});
+
+it("parseInBandReimbursement matches a LOWERCASE recipient", () => {
+  const r = parseInBandReimbursement(
+    buildBatchFull([{ to: EOA, value: 42n }, { to: USDC, data: transfer(EOA, 8n) }]),
+    EOA.toLowerCase() as `0x${string}`,
+    [USDC],
+  );
+  expect(r.native).toEqual(42n);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(8n);
 });
 
 it("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no-op-reimbursement drain)", () => {
