@@ -4,7 +4,7 @@
  * happens) BEFORE the bundler spends 0x76 gas. handleOps hides the inner revert, so the
  * guard reads UserOperationEvent.success from an eth_simulateV1 run.
  */
-import { assertEquals } from "@std/assert";
+import { it, expect } from "vitest";
 import { encodeAbiParameters, pad } from "viem";
 import { createSimulator } from "../shared/simulation/index.ts";
 import type { PackedUserOperation } from "../shared/userop/types.ts";
@@ -62,65 +62,65 @@ async function withMock(body: unknown, fn: () => Promise<void>) {
   }
 }
 
-Deno.test("simulateExecutionSuccess: all ops succeed → success", async () => {
+it("simulateExecutionSuccess: all ops succeed → success", async () => {
   await withMock({ result: [{ calls: [{ status: "0x1", logs: [uoeLog(true, 0)] }] }] }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, true);
+    expect(r.success).toEqual(true);
   });
 });
 
-Deno.test("simulateExecutionSuccess: returns the REAL gasUsed (drives the cost basis)", async () => {
+it("simulateExecutionSuccess: returns the REAL gasUsed (drives the cost basis)", async () => {
   await withMock({ result: [{ calls: [{ status: "0x1", gasUsed: "0x668a5", logs: [uoeLog(true, 0)] }] }] }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, true);
-    assertEquals(r.gasUsed, 420_005n); // 0x668a5
+    expect(r.success).toEqual(true);
+    expect(r.gasUsed).toEqual(420_005n); // 0x668a5
   });
 });
 
-Deno.test("simulateExecutionSuccess: a reverting op (success=false) is REJECTED with its index", async () => {
+it("simulateExecutionSuccess: a reverting op (success=false) is REJECTED with its index", async () => {
   await withMock({ result: [{ calls: [{ status: "0x1", logs: [uoeLog(false, 0)] }] }] }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, false);
-    assertEquals(r.failedOpIndex, 0);
+    expect(r.success).toEqual(false);
+    expect(r.failedOpIndex).toEqual(0);
   });
 });
 
-Deno.test("simulateExecutionSuccess: rejects the right op in a multi-op bundle", async () => {
+it("simulateExecutionSuccess: rejects the right op in a multi-op bundle", async () => {
   await withMock(
     { result: [{ calls: [{ status: "0x1", logs: [uoeLog(true, 0), uoeLog(false, 1)] }] }] },
     async () => {
       const r = await createSimulator(config).simulateExecutionSuccess([op(), op()], BENE);
-      assertEquals(r.success, false);
-      assertEquals(r.failedOpIndex, 1);
+      expect(r.success).toEqual(false);
+      expect(r.failedOpIndex).toEqual(1);
     },
   );
 });
 
-Deno.test("simulateExecutionSuccess: missing UserOperationEvent (op never executed) → reject", async () => {
+it("simulateExecutionSuccess: missing UserOperationEvent (op never executed) → reject", async () => {
   // 1 op submitted but 0 events emitted — op reverted before producing an event.
   await withMock({ result: [{ calls: [{ status: "0x1", logs: [] }] }] }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, false);
+    expect(r.success).toEqual(false);
   });
 });
 
-Deno.test("simulateExecutionSuccess: handleOps reverted (status 0x0) → reject", async () => {
+it("simulateExecutionSuccess: handleOps reverted (status 0x0) → reject", async () => {
   await withMock({ result: [{ calls: [{ status: "0x0", error: { message: "FailedOp" }, logs: [] }] }] }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, false);
+    expect(r.success).toEqual(false);
   });
 });
 
-Deno.test("simulateExecutionSuccess: FAILS CLOSED on RPC error (no submit without proof)", async () => {
+it("simulateExecutionSuccess: FAILS CLOSED on RPC error (no submit without proof)", async () => {
   await withMock({ error: { message: "rate limited" } }, async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, false);
+    expect(r.success).toEqual(false);
   });
 });
 
-Deno.test("simulateExecutionSuccess: FAILS CLOSED when fetch throws", async () => {
+it("simulateExecutionSuccess: FAILS CLOSED when fetch throws", async () => {
   await withMock("throw", async () => {
     const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
-    assertEquals(r.success, false);
+    expect(r.success).toEqual(false);
   });
 });

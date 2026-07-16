@@ -6,7 +6,7 @@
  * the full CF Worker runtime.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 
 // ---------------------------------------------------------------------------
 // redactRpcUrl logic
@@ -22,88 +22,88 @@ function redactRpcUrl(url: string): string {
   }
 }
 
-Deno.test("redactRpcUrl — redacts Alchemy API key from URL", () => {
+it("redactRpcUrl — redacts Alchemy API key from URL", () => {
   const url = "https://eth-mainnet.g.alchemy.com/v2/abcdefghijklmnopqrstuvwxyz1234";
   const redacted = redactRpcUrl(url);
-  assert(!redacted.includes("abcdefghijklmnopqrstuvwxyz1234"));
-  assert(redacted.includes("/***"));
+  expect(!redacted.includes("abcdefghijklmnopqrstuvwxyz1234")).toBeTruthy();
+  expect(redacted.includes("/***")).toBeTruthy();
 });
 
-Deno.test("redactRpcUrl — preserves short path segments", () => {
+it("redactRpcUrl — preserves short path segments", () => {
   const url = "https://rpc.ankr.com/eth";
   const redacted = redactRpcUrl(url);
-  assertEquals(redacted, "https://rpc.ankr.com/eth");
+  expect(redacted).toEqual("https://rpc.ankr.com/eth");
 });
 
-Deno.test("redactRpcUrl — handles invalid URL gracefully", () => {
+it("redactRpcUrl — handles invalid URL gracefully", () => {
   const url = "not-a-url-with-longapikey1234567890abcdef";
   const redacted = redactRpcUrl(url);
-  assert(!redacted.includes("longapikey1234567890abcdef"));
+  expect(!redacted.includes("longapikey1234567890abcdef")).toBeTruthy();
 });
 
-Deno.test("redactRpcUrl — preserves base URL structure", () => {
+it("redactRpcUrl — preserves base URL structure", () => {
   const url = "https://arb-mainnet.g.alchemy.com/v2/AAAABBBBCCCCDDDDEEEEFFFFGGGG";
   const redacted = redactRpcUrl(url);
-  assert(redacted.startsWith("https://arb-mainnet.g.alchemy.com/"));
+  expect(redacted.startsWith("https://arb-mainnet.g.alchemy.com/")).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
 // chainId extraction from URL path
 // ---------------------------------------------------------------------------
 
-Deno.test("chainId extraction — valid single-digit chain", () => {
+it("chainId extraction — valid single-digit chain", () => {
   const match = "/1".match(/^\/(\d+)$/);
-  assert(match !== null);
-  assertEquals(parseInt(match![1]!), 1);
+  expect(match !== null).toBeTruthy();
+  expect(parseInt(match![1]!)).toEqual(1);
 });
 
-Deno.test("chainId extraction — valid multi-digit chain", () => {
+it("chainId extraction — valid multi-digit chain", () => {
   const match = "/42161".match(/^\/(\d+)$/);
-  assert(match !== null);
-  assertEquals(parseInt(match![1]!), 42161);
+  expect(match !== null).toBeTruthy();
+  expect(parseInt(match![1]!)).toEqual(42161);
 });
 
-Deno.test("chainId extraction — rejects non-numeric", () => {
+it("chainId extraction — rejects non-numeric", () => {
   const match = "/abc".match(/^\/(\d+)$/);
-  assertEquals(match, null);
+  expect(match).toEqual(null);
 });
 
-Deno.test("chainId extraction — rejects nested path", () => {
+it("chainId extraction — rejects nested path", () => {
   const match = "/1/extra".match(/^\/(\d+)$/);
-  assertEquals(match, null);
+  expect(match).toEqual(null);
 });
 
-Deno.test("chainId extraction — rejects empty", () => {
+it("chainId extraction — rejects empty", () => {
   const match = "/".match(/^\/(\d+)$/);
-  assertEquals(match, null);
+  expect(match).toEqual(null);
 });
 
 // ---------------------------------------------------------------------------
 // REST API path matching
 // ---------------------------------------------------------------------------
 
-Deno.test("REST path — matches /v1/account/:chainId/:address", () => {
+it("REST path — matches /v1/account/:chainId/:address", () => {
   const match = "/v1/account/137/0xabc".match(/^\/v1\/(?:account|sponsor)\/(\d+)\//);
-  assert(match !== null);
-  assertEquals(parseInt(match![1]!), 137);
+  expect(match !== null).toBeTruthy();
+  expect(parseInt(match![1]!)).toEqual(137);
 });
 
-Deno.test("REST path — matches /v1/sponsor/:chainId/:address", () => {
+it("REST path — matches /v1/sponsor/:chainId/:address", () => {
   const match = "/v1/sponsor/1/0xdef".match(/^\/v1\/(?:account|sponsor)\/(\d+)\//);
-  assert(match !== null);
-  assertEquals(parseInt(match![1]!), 1);
+  expect(match !== null).toBeTruthy();
+  expect(parseInt(match![1]!)).toEqual(1);
 });
 
-Deno.test("REST path — rejects /v1/unknown/:chainId/:address", () => {
+it("REST path — rejects /v1/unknown/:chainId/:address", () => {
   const match = "/v1/unknown/1/0xabc".match(/^\/v1\/(?:account|sponsor)\/(\d+)\//);
-  assertEquals(match, null);
+  expect(match).toEqual(null);
 });
 
 // ---------------------------------------------------------------------------
 // Batch size limit
 // ---------------------------------------------------------------------------
 
-Deno.test("batch size — rejects oversized batch", () => {
+it("batch size — rejects oversized batch", () => {
   const MAX_BATCH_SIZE = 20;
   const batch = Array.from({ length: 25 }, (_, i) => ({
     jsonrpc: "2.0",
@@ -111,10 +111,10 @@ Deno.test("batch size — rejects oversized batch", () => {
     method: "eth_chainId",
     params: [],
   }));
-  assert(batch.length > MAX_BATCH_SIZE);
+  expect(batch.length > MAX_BATCH_SIZE).toBeTruthy();
 });
 
-Deno.test("batch size — allows batch within limit", () => {
+it("batch size — allows batch within limit", () => {
   const MAX_BATCH_SIZE = 20;
   const batch = Array.from({ length: 20 }, (_, i) => ({
     jsonrpc: "2.0",
@@ -122,39 +122,39 @@ Deno.test("batch size — allows batch within limit", () => {
     method: "eth_chainId",
     params: [],
   }));
-  assert(batch.length <= MAX_BATCH_SIZE);
+  expect(batch.length <= MAX_BATCH_SIZE).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
 // Body size limit
 // ---------------------------------------------------------------------------
 
-Deno.test("body size — detects oversized body", () => {
+it("body size — detects oversized body", () => {
   const MAX_BODY_SIZE = 256 * 1024;
   const bigBody = "x".repeat(MAX_BODY_SIZE + 1);
-  assert(bigBody.length > MAX_BODY_SIZE);
+  expect(bigBody.length > MAX_BODY_SIZE).toBeTruthy();
 });
 
-Deno.test("body size — allows body within limit", () => {
+it("body size — allows body within limit", () => {
   const MAX_BODY_SIZE = 256 * 1024;
   const normalBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] });
-  assert(normalBody.length < MAX_BODY_SIZE);
+  expect(normalBody.length < MAX_BODY_SIZE).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
 // rpcUsed redaction in REST API response
 // ---------------------------------------------------------------------------
 
-Deno.test("rpcUsed redaction — strips API key from Alchemy URL", () => {
+it("rpcUsed redaction — strips API key from Alchemy URL", () => {
   const url = "https://eth-mainnet.g.alchemy.com/v2/abcdefghijklmnopqrstuvwxyz1234";
   const redacted = url.replace(/\/[a-zA-Z0-9_-]{20,}(\/|$)/, "/***$1");
-  assert(!redacted.includes("abcdefghijklmnopqrstuvwxyz1234"));
-  assert(redacted.includes("/***"));
-  assert(redacted.startsWith("https://eth-mainnet.g.alchemy.com/"));
+  expect(!redacted.includes("abcdefghijklmnopqrstuvwxyz1234")).toBeTruthy();
+  expect(redacted.includes("/***")).toBeTruthy();
+  expect(redacted.startsWith("https://eth-mainnet.g.alchemy.com/")).toBeTruthy();
 });
 
-Deno.test("rpcUsed redaction — preserves public RPC URL", () => {
+it("rpcUsed redaction — preserves public RPC URL", () => {
   const url = "https://rpc.ankr.com/eth";
   const redacted = url.replace(/\/[a-zA-Z0-9_-]{20,}(\/|$)/, "/***$1");
-  assertEquals(redacted, url);
+  expect(redacted).toEqual(url);
 });

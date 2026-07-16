@@ -2,6 +2,25 @@
 
 Evidence-based takeover audit. Baseline commit `4beaaef`; audit + fixes dated **2026-07-09**.
 
+> **⚠ 2026-07-16 — Deno runtime removed. Vela Bundler now targets Cloudflare Workers only.**
+> The Deno self-hosted server (`deno/`), its systemd/SSH deployment (`deploy/`, `scripts/deploy*`),
+> the e2e + homepage-build scripts, and `deno.json`/`deno.lock` were deleted. The former Deno test
+> suite (`tests/*_test.ts`) was ported to **vitest** (a Node project for `shared/` logic + a workerd
+> pool for `worker/`). Current toolchain:
+>
+> | Was (Deno) | Now (Node / Workers) |
+> |------------|----------------------|
+> | `deno task start` / `deno task dev` | `npm run dev` (`wrangler dev`) |
+> | `deno task deploy` (SSH + systemd)  | `npm run deploy` (`wrangler deploy`) |
+> | `deno task test` / `deno test -A`   | `npm test` (vitest: `node` + `workers` projects) |
+> | `deno task lint` (`deno lint && deno check`) | `npm run typecheck` (`tsc --noEmit`) |
+> | `deno task e2e` / `deno task build` | removed |
+>
+> **The audit content below predates this migration** and describes the former dual-runtime
+> (Deno + Workers) system. Dated verification snapshots (e.g. "`deno test -A` 444 passed") are
+> preserved as historical record — they reflect the pre-migration toolchain, not today's. Where a
+> doc gives instructions to run *now*, follow the Workers-only commands above.
+
 | Doc | Contents |
 |-----|----------|
 | [01-system-overview.md](01-system-overview.md) | What it is, architecture, module map, runtimes, API, the money path |

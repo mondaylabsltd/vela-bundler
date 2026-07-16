@@ -14,7 +14,7 @@
  *  - process.ts: unmarked {code,message} objects are NOT forwarded to clients
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   BundlerService,
@@ -119,7 +119,7 @@ function nonceClient(script: { latest?: number | Error; pending?: number | Error
 // Broadcast error classification
 // ---------------------------------------------------------------------------
 
-Deno.test("classifyBroadcastError - ambiguous outcomes (tx may be in flight)", () => {
+it("classifyBroadcastError - ambiguous outcomes (tx may be in flight)", () => {
   for (const msg of [
     "already known",
     "known transaction: 0xabc",
@@ -131,36 +131,36 @@ Deno.test("classifyBroadcastError - ambiguous outcomes (tx may be in flight)", (
     "HTTP request failed: 502 Bad Gateway",
     "503 Service Unavailable",
   ]) {
-    assertEquals(classifyBroadcastError(new Error(msg)), "ambiguous", msg);
+    expect(classifyBroadcastError(new Error(msg)), msg).toEqual("ambiguous");
   }
 });
 
-Deno.test("classifyBroadcastError - definitive rejections (node provably refused)", () => {
+it("classifyBroadcastError - definitive rejections (node provably refused)", () => {
   for (const msg of [
     "insufficient funds for gas * price + value",
     "transaction underpriced", // initial send, not replacement
     "invalid transaction: malformed RLP",
     "execution reverted",
   ]) {
-    assertEquals(classifyBroadcastError(new Error(msg)), "definitive", msg);
+    expect(classifyBroadcastError(new Error(msg)), msg).toEqual("definitive");
   }
 });
 
-Deno.test("isInsufficientFundsError - native + Tempo shapes", () => {
-  assert(isInsufficientFundsError(new Error("insufficient funds for gas * price + value")));
-  assert(isInsufficientFundsError(new Error("total cost exceeds balance")));
-  assert(!isInsufficientFundsError(new Error("nonce too low")));
+it("isInsufficientFundsError - native + Tempo shapes", () => {
+  expect(isInsufficientFundsError(new Error("insufficient funds for gas * price + value"))).toBeTruthy();
+  expect(isInsufficientFundsError(new Error("total cost exceeds balance"))).toBeTruthy();
+  expect(!isInsufficientFundsError(new Error("nonce too low"))).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
 // EOA lock: version guard + proof-based recovery
 // ---------------------------------------------------------------------------
 
-Deno.test("initEOA - stale reads must not clobber a lock taken during the await (#11)", async () => {
+it("initEOA - stale reads must not clobber a lock taken during the await (#11)", async () => {
   const lm = new EOALockManager();
   // Seed an ACTIVE state (the ingress path refreshes existing EOAs).
   await lm.initEOA(TEST_EOA, nonceClient({ latest: 5, pending: 5 }));
-  assertEquals(lm.getState(TEST_EOA)?.status, "ACTIVE");
+  expect(lm.getState(TEST_EOA)?.status).toEqual("ACTIVE");
 
   // Start a refresh that blocks inside the nonce read…
   let releaseLatest: (n: number) => void = () => {};
@@ -179,12 +179,12 @@ Deno.test("initEOA - stale reads must not clobber a lock taken during the await 
   releaseLatest(5); // the refresh completes with reads from BEFORE the lock
   const result = await refresh;
 
-  assertEquals(result.status, "LOCKED_PENDING_UNKNOWN", "stale refresh must return the current state");
-  assertEquals(lm.getState(TEST_EOA)?.status, "LOCKED_PENDING_UNKNOWN", "the lock must survive");
-  assertEquals(lm.getState(TEST_EOA)?.inFlightNonce, 5);
+  expect(result.status, "stale refresh must return the current state").toEqual("LOCKED_PENDING_UNKNOWN");
+  expect(lm.getState(TEST_EOA)?.status, "the lock must survive").toEqual("LOCKED_PENDING_UNKNOWN");
+  expect(lm.getState(TEST_EOA)?.inFlightNonce).toEqual(5);
 });
 
-Deno.test("initEOA - a locked EOA with a known inFlightNonce needs PROOF to unlock (#9)", async () => {
+it("initEOA - a locked EOA with a known inFlightNonce needs PROOF to unlock (#9)", async () => {
   const lm = new EOALockManager();
   await lm.initEOA(TEST_EOA, nonceClient({ latest: 5, pending: 5 }));
   lm.lockEOA(TEST_EOA, "LOCKED_PENDING_UNKNOWN", 5); // our tx uses nonce 5
@@ -192,44 +192,44 @@ Deno.test("initEOA - a locked EOA with a known inFlightNonce needs PROOF to unlo
   // pending==latest==5 on an RPC without reliable "pending" support: the OLD heuristic
   // unlocked here (false ACTIVE while our tx is in flight). Now: nonce 5 not consumed → LOCKED.
   const still = await lm.initEOA(TEST_EOA, nonceClient({ latest: 5, pending: 5 }));
-  assertEquals(still.status, "LOCKED_PENDING_UNKNOWN");
+  expect(still.status).toEqual("LOCKED_PENDING_UNKNOWN");
 
   // latest advanced PAST our nonce → the chain consumed it → recovery is safe.
   const recovered = await lm.initEOA(TEST_EOA, nonceClient({ latest: 6, pending: 6 }));
-  assertEquals(recovered.status, "ACTIVE");
-  assertEquals(recovered.inFlightNonce, undefined, "proof consumed — the pin is cleared");
+  expect(recovered.status).toEqual("ACTIVE");
+  expect(recovered.inFlightNonce, "proof consumed — the pin is cleared").toEqual(undefined);
 });
 
-Deno.test("initEOA - failed nonce reads never unlock a locked EOA", async () => {
+it("initEOA - failed nonce reads never unlock a locked EOA", async () => {
   const lm = new EOALockManager();
   await lm.initEOA(TEST_EOA, nonceClient({ latest: 5, pending: 5 }));
   lm.lockEOA(TEST_EOA, "LOCKED_PENDING_UNKNOWN", 5);
 
   // Both reads fail — the old code aliased pending=latest(cached) and unlocked blind.
   const state = await lm.initEOA(TEST_EOA, nonceClient({ latest: new Error("down"), pending: new Error("down") }));
-  assertEquals(state.status, "LOCKED_PENDING_UNKNOWN");
+  expect(state.status).toEqual("LOCKED_PENDING_UNKNOWN");
 });
 
-Deno.test("initEOA - unknown in-flight nonce still recovers via the heuristic (restart path)", async () => {
+it("initEOA - unknown in-flight nonce still recovers via the heuristic (restart path)", async () => {
   const lm = new EOALockManager();
   // A restart-restored lock has no nonce proof (pre-upgrade persisted state).
   lm.restorePending(TEST_EOA, 0n);
-  assertEquals(lm.getState(TEST_EOA)?.status, "LOCKED_PENDING_UNKNOWN");
+  expect(lm.getState(TEST_EOA)?.status).toEqual("LOCKED_PENDING_UNKNOWN");
   // Successful reads with pending == latest → heuristic recovery (the ONLY path after restart).
   const state = await lm.initEOA(TEST_EOA, nonceClient({ latest: 7, pending: 7 }));
-  assertEquals(state.status, "ACTIVE");
+  expect(state.status).toEqual("ACTIVE");
 });
 
-Deno.test("restorePending - carries the persisted nonce pin and lock clock", () => {
+it("restorePending - carries the persisted nonce pin and lock clock", () => {
   const lm = new EOALockManager();
   lm.restorePending(TEST_EOA, 100n, { inFlightNonce: 9, lockedSince: 12345 });
   const s = lm.getState(TEST_EOA)!;
-  assertEquals(s.inFlightNonce, 9);
-  assertEquals(s.lockedSince, 12345);
-  assertEquals(lm.oldestLockedAgeMs(20000), 20000 - 12345);
+  expect(s.inFlightNonce).toEqual(9);
+  expect(s.lockedSince).toEqual(12345);
+  expect(lm.oldestLockedAgeMs(20000)).toEqual(20000 - 12345);
 });
 
-Deno.test("initEOA - proof unlock needs ONLY a live latest read (pending-tag failure must not brick the EOA)", async () => {
+it("initEOA - proof unlock needs ONLY a live latest read (pending-tag failure must not brick the EOA)", async () => {
   // Regression for the review finding: an RPC that errors on blockTag "pending" (common)
   // must still unlock a locked EOA once `latest` proves the nonce was consumed.
   const lm = new EOALockManager();
@@ -237,7 +237,7 @@ Deno.test("initEOA - proof unlock needs ONLY a live latest read (pending-tag fai
   lm.lockEOA(TEST_EOA, "LOCKED_PENDING_UNKNOWN", 5);
 
   const state = await lm.initEOA(TEST_EOA, nonceClient({ latest: 6, pending: new Error("pending unsupported") }));
-  assertEquals(state.status, "ACTIVE", "latest=6 > inFlightNonce=5 is proof — pending read is irrelevant");
+  expect(state.status, "latest=6 > inFlightNonce=5 is proof — pending read is irrelevant").toEqual("ACTIVE");
 });
 
 // ---------------------------------------------------------------------------
@@ -260,7 +260,7 @@ function pinnedPending(txHash: string, txNonce: number, extra: Partial<Serialize
   } as SerializedPending];
 }
 
-Deno.test("checkPendingReceipts - NEVER declares dropped while latestNonce <= txNonce (#9)", async () => {
+it("checkPendingReceipts - NEVER declares dropped while latestNonce <= txNonce (#9)", async () => {
   const svc = newService(new EOALockManager());
   (svc as unknown as { publicClient: unknown }).publicClient = {
     getTransactionReceipt: () => Promise.reject(new Error("not found")),
@@ -271,11 +271,11 @@ Deno.test("checkPendingReceipts - NEVER declares dropped while latestNonce <= tx
   // Many cycles: the old heuristic (pending<=latest) would have declared dropped on cycle 3.
   for (let i = 0; i < 12; i++) await svc.checkPendingReceipts();
 
-  assertEquals(svc.pendingReceiptCount, 1, "still pending — no dropped verdict without proof");
-  assertEquals(svc.getReceipt("0x" + "11".repeat(32)), undefined, "no fabricated failed receipt");
+  expect(svc.pendingReceiptCount, "still pending — no dropped verdict without proof").toEqual(1);
+  expect(svc.getReceipt("0x" + "11".repeat(32)), "no fabricated failed receipt").toEqual(undefined);
 });
 
-Deno.test("checkPendingReceipts - dropped only after consecutive nonce-consumed confirmations", async () => {
+it("checkPendingReceipts - dropped only after consecutive nonce-consumed confirmations", async () => {
   const lm = new EOALockManager();
   const svc = newService(lm);
   (svc as unknown as { publicClient: unknown }).publicClient = {
@@ -287,15 +287,15 @@ Deno.test("checkPendingReceipts - dropped only after consecutive nonce-consumed 
   // Nonce probes run every 3rd check; 3 consecutive consumed-observations are required.
   // Cycles 3, 6 → observations 1, 2 (still pending); cycle 9 → observation 3 → dropped.
   for (let i = 0; i < 8; i++) await svc.checkPendingReceipts();
-  assertEquals(svc.pendingReceiptCount, 1, "not yet — needs the third confirmation");
+  expect(svc.pendingReceiptCount, "not yet — needs the third confirmation").toEqual(1);
   await svc.checkPendingReceipts();
-  assertEquals(svc.pendingReceiptCount, 0, "proven dropped after 3 consecutive probes");
+  expect(svc.pendingReceiptCount, "proven dropped after 3 consecutive probes").toEqual(0);
   const receipt = svc.getReceipt("0x" + "11".repeat(32));
-  assert(receipt && receipt.success === false, "honest failed receipt stored");
-  assertEquals(lm.getReservedBalance(TEST_EOA), 0n, "reservation released");
+  expect(receipt && receipt.success === false, "honest failed receipt stored").toBeTruthy();
+  expect(lm.getReservedBalance(TEST_EOA), "reservation released").toEqual(0n);
 });
 
-Deno.test("checkPendingReceipts - a receipt on a PRIOR (pre-bump) hash reconciles the bundle", async () => {
+it("checkPendingReceipts - a receipt on a PRIOR (pre-bump) hash reconciles the bundle", async () => {
   const lm = new EOALockManager();
   const svc = newService(lm);
   const oldHash = ("0x" + "c3".repeat(32)) as `0x${string}`;
@@ -320,10 +320,10 @@ Deno.test("checkPendingReceipts - a receipt on a PRIOR (pre-bump) hash reconcile
   svc.importPendingState(pinnedPending("0x" + "d4".repeat(32), 7, { priorTxHashes: [oldHash] } as Partial<SerializedPending>));
 
   await svc.checkPendingReceipts();
-  assertEquals(svc.pendingReceiptCount, 0, "reconciled via the prior hash");
+  expect(svc.pendingReceiptCount, "reconciled via the prior hash").toEqual(0);
 });
 
-Deno.test("checkPendingReceipts - a REVERTED outer tx still yields terminal failed receipts", async () => {
+it("checkPendingReceipts - a REVERTED outer tx still yields terminal failed receipts", async () => {
   // Regression for the review finding: a landed-but-reverted tx carries no
   // UserOperationEvent logs — the ops must not end with receipt=null forever.
   const lm = new EOALockManager();
@@ -349,13 +349,13 @@ Deno.test("checkPendingReceipts - a REVERTED outer tx still yields terminal fail
   svc.importPendingState(pinnedPending(txHash, 7));
 
   await svc.checkPendingReceipts();
-  assertEquals(svc.pendingReceiptCount, 0, "settled");
+  expect(svc.pendingReceiptCount, "settled").toEqual(0);
   const receipt = svc.getReceipt("0x" + "11".repeat(32));
-  assert(receipt && receipt.success === false, "terminal failed receipt for the reverted bundle");
-  assertEquals(receipt.receipt.transactionHash, txHash, "tied to the landed tx");
+  expect(receipt && receipt.success === false, "terminal failed receipt for the reverted bundle").toBeTruthy();
+  expect(receipt.receipt.transactionHash, "tied to the landed tx").toEqual(txHash);
 });
 
-Deno.test("checkPendingReceipts - legacy (unpinned) dropped verdict is debounced too", async () => {
+it("checkPendingReceipts - legacy (unpinned) dropped verdict is debounced too", async () => {
   // Regression: a MINED sync-submitted (Tempo) tx has pending==latest as its NORMAL state;
   // a transient receipt-read failure must not fabricate a failed receipt on one observation.
   const svc = newService(new EOALockManager());
@@ -366,9 +366,9 @@ Deno.test("checkPendingReceipts - legacy (unpinned) dropped verdict is debounced
   svc.importPendingState(pinnedPending("0x" + "ad".repeat(32), undefined as unknown as number));
 
   for (let i = 0; i < 8; i++) await svc.checkPendingReceipts();
-  assertEquals(svc.pendingReceiptCount, 1, "cycle 3 and 6 observations are not enough");
+  expect(svc.pendingReceiptCount, "cycle 3 and 6 observations are not enough").toEqual(1);
   await svc.checkPendingReceipts(); // cycle 9 → third consecutive observation
-  assertEquals(svc.pendingReceiptCount, 0, "dropped after the debounce");
+  expect(svc.pendingReceiptCount, "dropped after the debounce").toEqual(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -391,7 +391,7 @@ function feeBumpFetchStub(sentRaw: string[]) {
   };
 }
 
-Deno.test("tryFeeBump - replaces the stuck tx at ≥12.5% higher fees and re-bases the reservation", async () => {
+it("tryFeeBump - replaces the stuck tx at ≥12.5% higher fees and re-bases the reservation", async () => {
   const lm = new EOALockManager();
   const svc = newService(lm, {
     getGasPrices: () => Promise.resolve({ baseFee: 3_000_000_000n, suggestedMaxPriorityFeePerGas: 1_000_000_000n, chainGasPrice: 0n }),
@@ -420,17 +420,17 @@ Deno.test("tryFeeBump - replaces the stuck tx at ≥12.5% higher fees and re-bas
     globalThis.fetch = originalFetch;
   }
 
-  assertEquals(sentRaw.length, 1, "one raw replacement broadcast");
-  assertEquals(pending.bumpCount, 1);
-  assertEquals((pending.priorTxHashes as string[]).length, 1, "old hash still polled");
+  expect(sentRaw.length, "one raw replacement broadcast").toEqual(1);
+  expect(pending.bumpCount).toEqual(1);
+  expect((pending.priorTxHashes as string[]).length, "old hash still polled").toEqual(1);
   const newMax = pending.maxFeePerGas as bigint;
-  assert(newMax >= (2_000_000_000n * 1125n) / 1000n, "≥12.5% replacement minimum");
-  assert(newMax >= (3_000_000_000n * 125n) / 100n, "targets current base fee headroom");
+  expect(newMax >= (2_000_000_000n * 1125n) / 1000n, "≥12.5% replacement minimum").toBeTruthy();
+  expect(newMax >= (3_000_000_000n * 125n) / 100n, "targets current base fee headroom").toBeTruthy();
   // Reservation re-based on the new worst-case prefund.
-  assertEquals(lm.getReservedBalance(TEST_EOA), 100_000n * newMax);
+  expect(lm.getReservedBalance(TEST_EOA)).toEqual(100_000n * newMax);
 });
 
-Deno.test("tryFeeBump - refuses to bump past the bounded-loss ceiling", async () => {
+it("tryFeeBump - refuses to bump past the bounded-loss ceiling", async () => {
   const svc = newService(new EOALockManager(), {
     getGasPrices: () => Promise.resolve({ baseFee: 100_000_000_000n, suggestedMaxPriorityFeePerGas: 1_000_000_000n, chainGasPrice: 0n }),
   });
@@ -444,15 +444,15 @@ Deno.test("tryFeeBump - refuses to bump past the bounded-loss ceiling", async ()
 
   await (svc as unknown as { tryFeeBump: (p: unknown) => Promise<void> }).tryFeeBump(pending);
 
-  assertEquals(pending.bumpCount, 0, "no bump — the loss would exceed the cap");
-  assertEquals(pending.txHash, "0x" + "f6".repeat(32), "original tx untouched");
+  expect(pending.bumpCount, "no bump — the loss would exceed the cap").toEqual(0);
+  expect(pending.txHash, "original tx untouched").toEqual("0x" + "f6".repeat(32));
 });
 
 // ---------------------------------------------------------------------------
 // Mempool: firstSeenAt, serialization, restore
 // ---------------------------------------------------------------------------
 
-Deno.test("mempool - replacement preserves firstSeenAt (stuck-age can't be masked, #3)", () => {
+it("mempool - replacement preserves firstSeenAt (stuck-age can't be masked, #3)", () => {
   const mp = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   mp.add(makeUserOp());
   const first = mp.dump()[0]!;
@@ -461,53 +461,53 @@ Deno.test("mempool - replacement preserves firstSeenAt (stuck-age can't be maske
   // Fee-bumped replacement (same sender+nonce, +10% fees, equal deltas).
   mp.add(makeUserOp({ maxFeePerGas: 2_400_000_000n, maxPriorityFeePerGas: 1_400_000_000n }));
 
-  assertEquals(mp.size, 1);
+  expect(mp.size).toEqual(1);
   const age = mp.oldestEntryAgeMs();
-  assert(age >= 100_000, `age must survive the replacement (got ${age})`);
+  expect(age >= 100_000, `age must survive the replacement (got ${age})`).toBeTruthy();
 });
 
-Deno.test("mempool - serialize/deserialize round-trips (feeToken included)", () => {
+it("mempool - serialize/deserialize round-trips (feeToken included)", () => {
   const mp = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const feeToken = ("0x" + "fe".repeat(20)) as `0x${string}`;
   const hash = mp.add(makeUserOp({ feeToken }), 123n, "https://user-rpc.example.com");
   const entry = mp.get(hash)!;
 
   const restored = deserializeMempoolEntry(serializeMempoolEntry(entry), ENTRY_POINT, 1);
-  assertEquals(restored.userOpHash, hash, "hash re-derivation must match");
-  assertEquals(restored.userOp.feeToken?.toLowerCase(), feeToken.toLowerCase());
-  assertEquals(restored.prefund, 123n);
-  assertEquals(restored.rpcUrlOverride, "https://user-rpc.example.com");
-  assertEquals(restored.firstSeenAt, entry.firstSeenAt);
+  expect(restored.userOpHash, "hash re-derivation must match").toEqual(hash);
+  expect(restored.userOp.feeToken?.toLowerCase()).toEqual(feeToken.toLowerCase());
+  expect(restored.prefund).toEqual(123n);
+  expect(restored.rpcUrlOverride).toEqual("https://user-rpc.example.com");
+  expect(restored.firstSeenAt).toEqual(entry.firstSeenAt);
 });
 
-Deno.test("mempool - restoreEntry dedups against a fresher same-(sender,nonce) entry", () => {
+it("mempool - restoreEntry dedups against a fresher same-(sender,nonce) entry", () => {
   const mp = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const hash = mp.add(makeUserOp());
   const stale = deserializeMempoolEntry(serializeMempoolEntry(mp.get(hash)!), ENTRY_POINT, 1);
-  assertEquals(mp.restoreEntry(stale), false, "duplicate must be rejected");
-  assertEquals(mp.size, 1);
+  expect(mp.restoreEntry(stale), "duplicate must be rejected").toEqual(false);
+  expect(mp.size).toEqual(1);
 
   mp.remove(hash);
-  assertEquals(mp.restoreEntry(stale), true, "restores cleanly when absent");
-  assertEquals(mp.size, 1);
+  expect(mp.restoreEntry(stale), "restores cleanly when absent").toEqual(true);
+  expect(mp.size).toEqual(1);
 });
 
-Deno.test("mempool - paymaster reservation key is deleted at zero (no unbounded growth)", () => {
+it("mempool - paymaster reservation key is deleted at zero (no unbounded growth)", () => {
   const mp = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 100, stakedSenderMaxOps: 4 });
   const paymaster = ("0x" + "9a".repeat(20)) as `0x${string}`;
   const hash = mp.add(makeUserOp({ paymaster, paymasterVerificationGasLimit: 50_000n, paymasterPostOpGasLimit: 50_000n, paymasterData: "0x" as `0x${string}` }));
-  assert(mp.getPaymasterReserved(paymaster) > 0n);
+  expect(mp.getPaymasterReserved(paymaster) > 0n).toBeTruthy();
   mp.remove(hash);
-  assertEquals(mp.getPaymasterReserved(paymaster), 0n);
+  expect(mp.getPaymasterReserved(paymaster)).toEqual(0n);
   const reservations = (mp as unknown as { paymasterReservations: Map<string, bigint> }).paymasterReservations;
-  assertEquals(reservations.size, 0, "zeroed key must be deleted, not kept");
+  expect(reservations.size, "zeroed key must be deleted, not kept").toEqual(0);
 });
 
 // ---------------------------------------------------------------------------
 // Receipt serialization round-trip
 // ---------------------------------------------------------------------------
 
-Deno.test("receipt serialize/deserialize - lossless bigint round-trip", () => {
+it("receipt serialize/deserialize - lossless bigint round-trip", () => {
   const receipt: UserOperationReceipt = {
     userOpHash: ("0x" + "11".repeat(32)) as `0x${string}`,
     entryPoint: ENTRY_POINT,
@@ -531,57 +531,57 @@ Deno.test("receipt serialize/deserialize - lossless bigint round-trip", () => {
     },
   };
   const roundTripped = deserializeReceipt(JSON.parse(JSON.stringify(serializeReceipt(receipt))));
-  assertEquals(roundTripped, receipt);
+  expect(roundTripped).toEqual(receipt);
 });
 
 // ---------------------------------------------------------------------------
 // Escalator + heartbeat + alerter escalation
 // ---------------------------------------------------------------------------
 
-Deno.test("RepeatedErrorEscalator - pages at 3 consecutive failures, resets on success", async () => {
+it("RepeatedErrorEscalator - pages at 3 consecutive failures, resets on success", async () => {
   const alerter = new RecordingAlerter();
   const esc = new RepeatedErrorEscalator(alerter);
   await esc.note("reconcile", 1, new Error("boom"));
   await esc.note("reconcile", 1, new Error("boom"));
-  assertEquals(alerter.sent.length, 0, "transient noise must not page");
+  expect(alerter.sent.length, "transient noise must not page").toEqual(0);
   await esc.note("reconcile", 1, new Error("boom"));
-  assertEquals(alerter.sent.length, 1);
-  assertEquals(alerter.sent[0]!.id, "code-error-reconcile-1");
-  assert(alerter.sent[0]!.message.includes("boom"));
+  expect(alerter.sent.length).toEqual(1);
+  expect(alerter.sent[0]!.id).toEqual("code-error-reconcile-1");
+  expect(alerter.sent[0]!.message.includes("boom")).toBeTruthy();
 
   esc.ok("reconcile", 1);
   await esc.note("reconcile", 1, new Error("boom"));
   await esc.note("reconcile", 1, new Error("boom"));
-  assertEquals(alerter.sent.length, 1, "streak reset — two failures after an ok stay quiet");
+  expect(alerter.sent.length, "streak reset — two failures after an ok stay quiet").toEqual(1);
 });
 
-Deno.test("maybeSendAliveHeartbeat - fires only past the interval, returns the new stamp", async () => {
+it("maybeSendAliveHeartbeat - fires only past the interval, returns the new stamp", async () => {
   const alerter = new RecordingAlerter();
   const t0 = 1_000_000;
   const unchanged = await maybeSendAliveHeartbeat({
     alerter, lastSentAt: t0, stats: "s", runtime: "deno", intervalMs: 1000, now: t0 + 999,
   });
-  assertEquals(unchanged, t0);
-  assertEquals(alerter.sent.length, 0);
+  expect(unchanged).toEqual(t0);
+  expect(alerter.sent.length).toEqual(0);
 
   const bumped = await maybeSendAliveHeartbeat({
     alerter, lastSentAt: t0, stats: "2 chain(s)", runtime: "deno", intervalMs: 1000, now: t0 + 1001,
   });
-  assertEquals(bumped, t0 + 1001);
-  assertEquals(alerter.sent.length, 1);
-  assert(alerter.sent[0]!.message.includes("alive"));
+  expect(bumped).toEqual(t0 + 1001);
+  expect(alerter.sent.length).toEqual(1);
+  expect(alerter.sent[0]!.message.includes("alive")).toBeTruthy();
 });
 
-Deno.test("maybeSendAliveHeartbeat - a FAILED delivery does not advance the stamp (no silent gap)", async () => {
+it("maybeSendAliveHeartbeat - a FAILED delivery does not advance the stamp (no silent gap)", async () => {
   const failing: Alerter = { enabled: true, send: () => Promise.resolve(false) };
   const t0 = 1_000_000;
   const stamp = await maybeSendAliveHeartbeat({
     alerter: failing, lastSentAt: t0, stats: "s", runtime: "deno", intervalMs: 1000, now: t0 + 1001,
   });
-  assertEquals(stamp, t0, "retry next cycle instead of opening a 2x-interval silence gap");
+  expect(stamp, "retry next cycle instead of opening a 2x-interval silence gap").toEqual(t0);
 });
 
-Deno.test("TelegramAlerter - per-call cooldown override + persistent-incident escalation", async () => {
+it("TelegramAlerter - per-call cooldown override + persistent-incident escalation", async () => {
   const sent: { text: string }[] = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => {
@@ -594,14 +594,14 @@ Deno.test("TelegramAlerter - per-call cooldown override + persistent-incident es
     await alerter.send("stuck-eoa-1", "money stuck", { cooldownMs: 10 * 60 * 1000 });
     now = 11 * 60 * 1000; // past the 10-min override, inside the default 30-min window
     await alerter.send("stuck-eoa-1", "money stuck", { cooldownMs: 10 * 60 * 1000 });
-    assertEquals(sent.length, 2, "the shorter per-call cooldown must win");
-    assert(sent[1]!.text.includes("reminder #2"), "a persisting condition escalates its wording");
+    expect(sent.length, "the shorter per-call cooldown must win").toEqual(2);
+    expect(sent[1]!.text.includes("reminder #2"), "a persisting condition escalates its wording").toBeTruthy();
 
     // Routine periodic messages (heartbeats) opt OUT of the incident prefix.
     await alerter.send("heartbeat-x", "alive", { cooldownMs: 0, noEscalation: true });
     now += 1;
     await alerter.send("heartbeat-x", "alive", { cooldownMs: 0, noEscalation: true });
-    assert(!sent[3]!.text.includes("STILL FIRING"), "heartbeats repeat by design — never an incident");
+    expect(!sent[3]!.text.includes("STILL FIRING"), "heartbeats repeat by design — never an incident").toBeTruthy();
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -611,7 +611,7 @@ Deno.test("TelegramAlerter - per-call cooldown override + persistent-incident es
 // process.ts: unmarked errors are internal (no upstream leak-through)
 // ---------------------------------------------------------------------------
 
-Deno.test("processRequest - an unmarked {code,message} object is NOT forwarded to the client", async () => {
+it("processRequest - an unmarked {code,message} object is NOT forwarded to the client", async () => {
   const leaky = { code: -32000, message: "upstream says: https://eth-mainnet.g.alchemy.com/v2/SECRETKEY123 failed" };
   const registry = {
     getChain: () => Promise.reject(leaky),
@@ -622,16 +622,16 @@ Deno.test("processRequest - an unmarked {code,message} object is NOT forwarded t
     { jsonrpc: "2.0", id: 1, method: "eth_getUserOperationReceipt", params: ["0x" + "11".repeat(32)] },
     mockConfig(), registry, { chainId: 1 },
   );
-  assertEquals(res.error?.code, -32603, "generic internal error");
-  assertEquals(res.error?.message, "Internal error");
-  assert(!JSON.stringify(res).includes("SECRETKEY123"), "the upstream secret must not leak");
+  expect(res.error?.code, "generic internal error").toEqual(-32603);
+  expect(res.error?.message).toEqual("Internal error");
+  expect(!JSON.stringify(res).includes("SECRETKEY123"), "the upstream secret must not leak").toBeTruthy();
 });
 
-Deno.test("processRequest - deliberate factory errors ARE forwarded", async () => {
+it("processRequest - deliberate factory errors ARE forwarded", async () => {
   const registry = { getChain: () => Promise.reject(methodNotFound("x")), getAll: () => [] } as unknown as ChainRegistryLike;
   const res = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_bogusMethod", params: [] },
     mockConfig(), registry, { chainId: 1 },
   );
-  assertEquals(res.error?.code, -32601, "methodNotFound passes the marker gate");
+  expect(res.error?.code, "methodNotFound passes the marker gate").toEqual(-32601);
 });

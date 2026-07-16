@@ -2,7 +2,7 @@
  * Unit tests for Alchemy RPC support.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import {
   isAlchemySupported,
   buildAlchemyRpcUrl,
@@ -11,108 +11,105 @@ import {
 
 // ---- isAlchemySupported ----
 
-Deno.test("isAlchemySupported - Ethereum mainnet", () => {
-  assert(isAlchemySupported(1));
+it("isAlchemySupported - Ethereum mainnet", () => {
+  expect(isAlchemySupported(1)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - BSC mainnet", () => {
-  assert(isAlchemySupported(56));
+it("isAlchemySupported - BSC mainnet", () => {
+  expect(isAlchemySupported(56)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - Polygon mainnet", () => {
-  assert(isAlchemySupported(137));
+it("isAlchemySupported - Polygon mainnet", () => {
+  expect(isAlchemySupported(137)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - Arbitrum mainnet", () => {
-  assert(isAlchemySupported(42161));
+it("isAlchemySupported - Arbitrum mainnet", () => {
+  expect(isAlchemySupported(42161)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - Base mainnet", () => {
-  assert(isAlchemySupported(8453));
+it("isAlchemySupported - Base mainnet", () => {
+  expect(isAlchemySupported(8453)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - Optimism mainnet", () => {
-  assert(isAlchemySupported(10));
+it("isAlchemySupported - Optimism mainnet", () => {
+  expect(isAlchemySupported(10)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - unsupported local/dev chain", () => {
-  assert(!isAlchemySupported(1337));
-  assert(!isAlchemySupported(31337));
+it("isAlchemySupported - unsupported local/dev chain", () => {
+  expect(!isAlchemySupported(1337)).toBeTruthy();
+  expect(!isAlchemySupported(31337)).toBeTruthy();
 });
 
-Deno.test("isAlchemySupported - unsupported random chainId", () => {
-  assert(!isAlchemySupported(99999999));
+it("isAlchemySupported - unsupported random chainId", () => {
+  expect(!isAlchemySupported(99999999)).toBeTruthy();
 });
 
 // ---- buildAlchemyRpcUrl ----
 
-Deno.test("buildAlchemyRpcUrl - Ethereum mainnet URL format", () => {
+it("buildAlchemyRpcUrl - Ethereum mainnet URL format", () => {
   const url = buildAlchemyRpcUrl(1, "test-key-123");
-  assertEquals(url, "https://eth-mainnet.g.alchemy.com/v2/test-key-123");
+  expect(url).toEqual("https://eth-mainnet.g.alchemy.com/v2/test-key-123");
 });
 
-Deno.test("buildAlchemyRpcUrl - BSC mainnet URL format", () => {
+it("buildAlchemyRpcUrl - BSC mainnet URL format", () => {
   const url = buildAlchemyRpcUrl(56, "my-api-key");
-  assertEquals(url, "https://bnb-mainnet.g.alchemy.com/v2/my-api-key");
+  expect(url).toEqual("https://bnb-mainnet.g.alchemy.com/v2/my-api-key");
 });
 
-Deno.test("buildAlchemyRpcUrl - Polygon mainnet URL format", () => {
+it("buildAlchemyRpcUrl - Polygon mainnet URL format", () => {
   const url = buildAlchemyRpcUrl(137, "key");
-  assertEquals(url, "https://polygon-mainnet.g.alchemy.com/v2/key");
+  expect(url).toEqual("https://polygon-mainnet.g.alchemy.com/v2/key");
 });
 
-Deno.test("buildAlchemyRpcUrl - Base Sepolia URL format", () => {
+it("buildAlchemyRpcUrl - Base Sepolia URL format", () => {
   const url = buildAlchemyRpcUrl(84532, "key");
-  assertEquals(url, "https://base-sepolia.g.alchemy.com/v2/key");
+  expect(url).toEqual("https://base-sepolia.g.alchemy.com/v2/key");
 });
 
-Deno.test("buildAlchemyRpcUrl - returns null for unsupported chain", () => {
+it("buildAlchemyRpcUrl - returns null for unsupported chain", () => {
   const url = buildAlchemyRpcUrl(1337, "key");
-  assertEquals(url, null);
+  expect(url).toEqual(null);
 });
 
-Deno.test("buildAlchemyRpcUrl - all testnets have correct slug", () => {
+it("buildAlchemyRpcUrl - all testnets have correct slug", () => {
   // Verify a few testnet URLs
-  assertEquals(
+  expect(
     buildAlchemyRpcUrl(11155111, "k"),
-    "https://eth-sepolia.g.alchemy.com/v2/k",
-  );
-  assertEquals(
+  ).toEqual("https://eth-sepolia.g.alchemy.com/v2/k");
+  expect(
     buildAlchemyRpcUrl(421614, "k"),
-    "https://arb-sepolia.g.alchemy.com/v2/k",
-  );
-  assertEquals(
+  ).toEqual("https://arb-sepolia.g.alchemy.com/v2/k");
+  expect(
     buildAlchemyRpcUrl(97, "k"),
-    "https://bnb-testnet.g.alchemy.com/v2/k",
-  );
+  ).toEqual("https://bnb-testnet.g.alchemy.com/v2/k");
 });
 
 // ---- getAlchemySupportedChainIds ----
 
-Deno.test("getAlchemySupportedChainIds - returns non-empty array", () => {
+it("getAlchemySupportedChainIds - returns non-empty array", () => {
   const ids = getAlchemySupportedChainIds();
-  assert(ids.length > 80, `Expected >80 supported chains, got ${ids.length}`);
+  expect(ids.length > 80, `Expected >80 supported chains, got ${ids.length}`).toBeTruthy();
 });
 
-Deno.test("getAlchemySupportedChainIds - all IDs are positive numbers", () => {
+it("getAlchemySupportedChainIds - all IDs are positive numbers", () => {
   const ids = getAlchemySupportedChainIds();
   for (const id of ids) {
-    assert(id > 0, `Invalid chainId: ${id}`);
-    assert(Number.isInteger(id), `Non-integer chainId: ${id}`);
+    expect(id > 0, `Invalid chainId: ${id}`).toBeTruthy();
+    expect(Number.isInteger(id), `Non-integer chainId: ${id}`).toBeTruthy();
   }
 });
 
-Deno.test("getAlchemySupportedChainIds - major chains included", () => {
+it("getAlchemySupportedChainIds - major chains included", () => {
   const ids = getAlchemySupportedChainIds();
   const major = [1, 10, 56, 137, 8453, 42161, 43114, 324, 534352, 59144];
   for (const chainId of major) {
-    assert(ids.includes(chainId), `Major chain ${chainId} missing from Alchemy support`);
+    expect(ids.includes(chainId), `Major chain ${chainId} missing from Alchemy support`).toBeTruthy();
   }
 });
 
 // ---- Coverage of all chains from Alchemy docs ----
 
-Deno.test("Alchemy chains - covers all major L2s", () => {
+it("Alchemy chains - covers all major L2s", () => {
   // L2s that should be supported
   const l2s: Record<string, number> = {
     "Optimism": 10,
@@ -130,11 +127,11 @@ Deno.test("Alchemy chains - covers all major L2s", () => {
     "Unichain": 130,
   };
   for (const [name, chainId] of Object.entries(l2s)) {
-    assert(isAlchemySupported(chainId), `L2 ${name} (${chainId}) not in Alchemy support`);
+    expect(isAlchemySupported(chainId), `L2 ${name} (${chainId}) not in Alchemy support`).toBeTruthy();
   }
 });
 
-Deno.test("Alchemy chains - covers newly added chains from 2026 docs", () => {
+it("Alchemy chains - covers newly added chains from 2026 docs", () => {
   const newChains: Record<string, number> = {
     "BOB": 60808,
     "MegaETH": 4326,
@@ -156,19 +153,19 @@ Deno.test("Alchemy chains - covers newly added chains from 2026 docs", () => {
     "Frax Hoodi": 2523,
   };
   for (const [name, chainId] of Object.entries(newChains)) {
-    assert(isAlchemySupported(chainId), `${name} (${chainId}) not in Alchemy support`);
+    expect(isAlchemySupported(chainId), `${name} (${chainId}) not in Alchemy support`).toBeTruthy();
     const url = buildAlchemyRpcUrl(chainId, "test");
-    assert(url !== null, `${name} (${chainId}) returned null URL`);
+    expect(url !== null, `${name} (${chainId}) returned null URL`).toBeTruthy();
   }
 });
 
-Deno.test("Alchemy chains - each chainId maps to a unique slug", () => {
+it("Alchemy chains - each chainId maps to a unique slug", () => {
   const ids = getAlchemySupportedChainIds();
   const urls = new Set<string>();
   for (const id of ids) {
     const url = buildAlchemyRpcUrl(id, "test");
-    assert(url !== null);
-    assert(!urls.has(url!), `Duplicate URL for chainId ${id}: ${url}`);
+    expect(url !== null).toBeTruthy();
+    expect(!urls.has(url!), `Duplicate URL for chainId ${id}: ${url}`).toBeTruthy();
     urls.add(url!);
   }
 });

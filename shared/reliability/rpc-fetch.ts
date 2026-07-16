@@ -125,7 +125,11 @@ export async function reliableTextFetch(
       // must not be able to 302 us to an internal/metadata IP (SSRF). A redirecting RPC is
       // rejected (not retried — it's not a transient condition).
       const res = await doFetch(url, { ...init, signal: controller.signal, redirect: "manual" });
-      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+      // Cast res.type to string: @cloudflare/workers-types narrows Response.type to
+      // "default" | "error" (workerd never surfaces "opaqueredirect"), but this guard also
+      // runs under Node/undici where "opaqueredirect" IS a possible value. The status-range
+      // check below is the belt-and-suspenders that catches redirects on either runtime.
+      if ((res.type as string) === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
         const e = new Error(`refusing to follow redirect from ${redactUrl(url)}`);
         (e as { classified?: ClassifiedError }).classified = { category: "permanent", retryable: false, reason: "redirect_blocked" };
         throw e;

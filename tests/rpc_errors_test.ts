@@ -2,7 +2,7 @@
  * Tests for shared/rpc/errors.ts — JSON-RPC error constructors.
  */
 
-import { assertEquals } from "@std/assert";
+import { it, expect } from "vitest";
 import {
   parseError,
   invalidRequest,
@@ -12,38 +12,38 @@ import {
   bundlerError,
 } from "../shared/rpc/errors.ts";
 
-Deno.test("parseError — returns -32700", () => {
+it("parseError — returns -32700", () => {
   const err = parseError();
-  assertEquals(err.code, -32700);
-  assertEquals(err.message, "Parse error");
+  expect(err.code).toEqual(-32700);
+  expect(err.message).toEqual("Parse error");
 });
 
-Deno.test("invalidRequest — returns -32600 with custom message", () => {
+it("invalidRequest — returns -32600 with custom message", () => {
   const err = invalidRequest("bad request");
-  assertEquals(err.code, -32600);
-  assertEquals(err.message, "bad request");
+  expect(err.code).toEqual(-32600);
+  expect(err.message).toEqual("bad request");
 });
 
-Deno.test("invalidParams — returns -32602", () => {
+it("invalidParams — returns -32602", () => {
   const err = invalidParams("missing sender");
-  assertEquals(err.code, -32602);
-  assertEquals(err.message, "missing sender");
+  expect(err.code).toEqual(-32602);
+  expect(err.message).toEqual("missing sender");
 });
 
-Deno.test("methodNotFound — returns -32601 with method name", () => {
+it("methodNotFound — returns -32601 with method name", () => {
   const err = methodNotFound("eth_foo");
-  assertEquals(err.code, -32601);
-  assertEquals(err.message, "Method not found: eth_foo");
+  expect(err.code).toEqual(-32601);
+  expect(err.message).toEqual("Method not found: eth_foo");
 });
 
-Deno.test("internalError — returns -32603", () => {
+it("internalError — returns -32603", () => {
   const err = internalError("oops");
-  assertEquals(err.code, -32603);
-  assertEquals(err.message, "oops");
+  expect(err.code).toEqual(-32603);
+  expect(err.message).toEqual("oops");
 });
 
-Deno.test("bundlerError — returns custom code", () => {
+it("bundlerError — returns custom code", () => {
   const err = bundlerError(-32500, "simulation failed");
-  assertEquals(err.code, -32500);
-  assertEquals(err.message, "simulation failed");
+  expect(err.code).toEqual(-32500);
+  expect(err.message).toEqual("simulation failed");
 });
