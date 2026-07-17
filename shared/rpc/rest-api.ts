@@ -8,6 +8,9 @@
 
 import type { ChainRegistryLike } from "../chain/index.ts";
 import type { BundlerConfig } from "../config/types.ts";
+import { vaultActiveForChain, isTempoChain, tempoPathUsdBalance, TEMPO_TREASURY_FLOOR } from "../tempo.ts";
+import { TREASURY_FLOOR } from "../account/sponsor.ts";
+import { getPublicClient } from "../utils/rpc-client.ts";
 import { SPLITTER_CREATION_CODE_HASH, SPLITTER_FACTORY, SPLITTER_SALT } from "../contracts/splitter.ts";
 import { rateLimitGuard, type RateLimitConfig } from "../auth/index.ts";
 import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blacklist.ts";
@@ -59,6 +62,23 @@ export async function handleRestApi(
     return jsonResponse({ address: config.treasuryAddress }, 200, corsHeaders);
   }
 
+  // GET /v1/treasury/:chainId — treasury balance on ONE chain + whether it needs a
+  // bootstrap contribution. Lets the wallet route a "relayer unavailable on this
+  // network" dead-end to a fund-the-treasury sheet (non-refundable operator float —
+  // NOT gas credit; it bootstraps the chain's relayer, e.g. a local devnet the
+  // operator holds no coins on). The float EOAs then refill themselves from the
+  // treasury via the top-up loops.
+  const treasuryMatch = url.pathname.match(/^\/v1\/treasury\/(\d+)$/);
+  if (treasuryMatch && req.method === "GET") {
+    return await handleGetTreasuryStatus(
+      parseInt(treasuryMatch[1]!),
+      chainRegistry,
+      config,
+      corsHeaders,
+      requestRpcUrl,
+    );
+  }
+
   // GET /v1/splitter — VelaGasSettlementSplitter address + derivation inputs (same on all chains).
   // Lets the wallet compute the identical address locally and cross-check its embedded constants.
   if (url.pathname === "/v1/splitter" && req.method === "GET") {
@@ -106,11 +126,48 @@ export async function handleRestApi(
   );
 }
 
+async function handleGetTreasuryStatus(
+  chainId: number,
+  chainRegistry: ChainRegistryLike,
+  config: BundlerConfig,
+  corsHeaders: Record<string, string>,
+  requestRpcUrl?: string,
+): Promise<Response> {
+  try {
+    const chain = await chainRegistry.getChain(chainId, requestRpcUrl);
+    const client = getPublicClient(chain.rpcUrl || config.rpcUrl);
+    if (isTempoChain(chainId)) {
+      // Tempo's operating float is pathUSD, not native.
+      const balance = await tempoPathUsdBalance(client as Parameters<typeof tempoPathUsdBalance>[0], config.treasuryAddress);
+      return jsonResponse({
+        chainId,
+        address: config.treasuryAddress,
+        asset: "pathUSD",
+        balance: "0x" + balance.toString(16),
+        floor: "0x" + TEMPO_TREASURY_FLOOR.toString(16),
+        bootstrapNeeded: balance < TEMPO_TREASURY_FLOOR,
+      }, 200, corsHeaders);
+    }
+    const balance = await client.getBalance({ address: config.treasuryAddress });
+    return jsonResponse({
+      chainId,
+      address: config.treasuryAddress,
+      asset: "native",
+      balance: "0x" + balance.toString(16),
+      floor: "0x" + TREASURY_FLOOR.toString(16),
+      bootstrapNeeded: balance < TREASURY_FLOOR,
+    }, 200, corsHeaders);
+  } catch (err) {
+    console.error(`[REST] Treasury status error for chain ${chainId}:`, err);
+    return jsonResponse({ error: "Internal error" }, 500, corsHeaders);
+  }
+}
+
 async function handleGetAccount(
   chainId: number,
   safeAddress: `0x${string}`,
   chainRegistry: ChainRegistryLike,
-  _config: BundlerConfig,
+  config: BundlerConfig,
   corsHeaders: Record<string, string>,
   requestRpcUrl?: string,
 ): Promise<Response> {
@@ -150,6 +207,14 @@ async function handleGetAccount(
         entryPoint: info.entryPoint,
         safeAddress: info.safeAddress,
         activeDepositAddress: info.activeDepositAddress,
+        // Where the wallet should send the in-band gas reimbursement. Equals the
+        // deposit EOA normally; the treasury in vault mode (Stage 2 of
+        // docs/pool-queue-architecture.md). Wallets fall back to
+        // activeDepositAddress when this field is absent (old bundlers), and the
+        // bundle gate dual-accepts the EOA during rollout (old wallets).
+        settlementRecipient: vaultActiveForChain(config.settlementVaultChains, chainId)
+          ? config.treasuryAddress
+          : info.activeDepositAddress,
         oldDepositAddresses: info.oldDepositAddresses,
         onchainBalance: "0x" + info.onchainBalance.toString(16),
         reservedBalance: "0x" + info.reservedBalance.toString(16),

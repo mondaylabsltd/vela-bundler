@@ -17,6 +17,7 @@ export default defineWorkersProject({
           compatibilityFlags: ["nodejs_compat"],
           durableObjects: {
             BUNDLER: "BundlerDO",
+            RELAYER: "RelayerDO",
           },
           bindings: {
             OPERATOR_SECRET: "0x" + "ab".repeat(32),

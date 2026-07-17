@@ -6,6 +6,14 @@ import type { Env } from "./types.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
 
+/** BigInt env parse that treats present-but-EMPTY vars as unset. `BigInt("") === 0n`,
+ *  so a blank var in the CF dashboard would otherwise silently zero a money knob
+ *  (e.g. POOL_FLOAT_MIN_WEI=0 disables the float refill forever, without any error). */
+function envBigInt(raw: string | undefined, fallback: string): bigint {
+  const v = (raw ?? "").trim();
+  return BigInt(v === "" ? fallback : v);
+}
+
 /**
  * Build BundlerConfig from Cloudflare Worker environment bindings.
  */
@@ -44,6 +52,17 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     oldOperatorSecrets: (env.OLD_OPERATOR_SECRETS ?? "").split(",").map(s => s.trim()).filter(Boolean),
     treasuryAddress,
     splitterAddress: computeSplitterAddress(treasuryAddress),
+    // In-band settlement is the DEFAULT on every chain (operator decision 2026-07-17):
+    // unset → "all". Set INBAND_ENABLED="false" (or a chainId list) to narrow/roll back.
+    inBandChains: env.INBAND_ENABLED ?? "all",
+    // Vault settlement (fees → treasury) is the DEFAULT everywhere, Tempo included
+    // (operator decision 2026-07-17): unset → "all". Tempo's pathUSD float refills via
+    // topUpTempoFloat. SETTLEMENT_VAULT_ENABLED="false" (or a chainId CSV) rolls back.
+    settlementVaultChains: env.SETTLEMENT_VAULT_ENABLED ?? "all",
+    poolEoaChains: env.POOL_EOA_ENABLED ?? "",
+    queueTransportChains: env.QUEUE_TRANSPORT_ENABLED ?? "",
+    poolFloatMinWei: envBigInt(env.POOL_FLOAT_MIN_WEI, "500000000000000"), // 0.0005 native
+    poolFloatTargetWei: envBigInt(env.POOL_FLOAT_TARGET_WEI, "2000000000000000"), // 0.002 native
     apiRateLimitPerMinute: parseInt(env.API_RATE_LIMIT_PER_MINUTE ?? "60"),
     rateLimitAllowlist: (env.RATE_LIMIT_ALLOWLIST ?? "").split(",").map((s) => s.trim()).filter(Boolean),
     balanceReserveMultiplier: parseFloat(env.BALANCE_RESERVE_MULTIPLIER ?? "1"),

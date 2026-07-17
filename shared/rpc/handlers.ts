@@ -14,8 +14,10 @@ import {
 } from "./errors.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
+import { receiptToRpc, receiptToByHashRpc } from "./receipt-format.ts";
 import { validateUserOpFields, UserOpValidationError } from "../userop/validate.ts";
-import { isTempoChain, chainSupportsInBand, IN_BAND_MARKUP_X } from "../tempo.ts";
+import { EnqueueAmbiguousError } from "../bundler/index.ts";
+import { isTempoChain, inBandActiveForChain, vaultActiveForChain, IN_BAND_MARKUP_X } from "../tempo.ts";
 import { quoteNativeToStable, stableDecimals, requiredStableCharge } from "../gas/stable-rate.ts";
 import { getAddress } from "viem";
 import { getPublicClient } from "../utils/rpc-client.ts";
@@ -147,7 +149,7 @@ async function handleSendUserOperation(
     // ceiling is the Tempo ENVELOPE only. See docs/inband-gas-settlement.md.
     validateUserOpFields(
       userOp,
-      chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false),
+      inBandActiveForChain(config, reqCtx.chainId),
       isTempoChain(reqCtx.chainId),
     );
   } catch (err) {
@@ -187,7 +189,7 @@ async function handleSendUserOperation(
   // not a user deposit), so the native-balance / priority-fee-floor / gas-price-margin checks below
   // do not apply (maxFeePerGas = 0 is expected there, not a misconfiguration). See docs/.
   const tempo = isTempoChain(reqCtx.chainId);
-  const inBand = chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false);
+  const inBand = inBandActiveForChain(config, reqCtx.chainId);
 
   // Check balance — use chain-aware gas pricing
   let gasPrices;
@@ -322,21 +324,26 @@ async function handleSendUserOperation(
     );
   }
 
-  // Add to mempool
+  // Accept the validated op. Default path: add to the in-DO mempool + kick a bundle pass NOW
+  // (fire-and-forget) instead of waiting out the next 10s alarm/interval tick — for a 5-minute
+  // trading window those seconds are money. When queue transport is active on this chain
+  // (Stage 4, QUEUE_TRANSPORT_ENABLED) the same validated op is instead handed to a per-EOA
+  // RelayerDO via the queue; acceptUserOp encapsulates that choice and falls back to the
+  // mempool if the queue is unreachable, so a validated op is NEVER dropped. Flag off → this is
+  // byte-identical to the pre-Stage-4 mempool.add + requestBundleKick.
   try {
-    const userOpHash = chain.mempool.add(
+    return await chain.bundler.acceptUserOp(
       userOp,
       simResult.validationResult?.prefund ?? 0n,
       rpcOverride,
     );
-    // Kick a bundle pass NOW (fire-and-forget) instead of waiting out the next 10s
-    // alarm/interval tick — for a 5-minute trading window those seconds are money.
-    // Never blocks or fails this response; the periodic tick remains the safety net.
-    chain.bundler.requestBundleKick();
-    return userOpHash;
   } catch (err) {
     if (err instanceof UserOpValidationError) {
       throw bundlerError(err.code, err.message);
+    }
+    // Ambiguous enqueue → retryable degraded (the wallet re-sends; the RelayerDO dedups).
+    if (err instanceof EnqueueAmbiguousError) {
+      throw degradedFromError(err, "op transport");
     }
     throw err;
   }
@@ -421,7 +428,7 @@ async function handleGetInBandGasQuote(
   chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<Record<string, unknown>> {
-  if (!chainSupportsInBand(reqCtx.chainId, config.inBandEnabled ?? false)) {
+  if (!inBandActiveForChain(config, reqCtx.chainId)) {
     throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "in-band gas settlement is not enabled on this chain");
   }
   const chain = await resolveChain(reqCtx.chainId, chainRegistry, reqCtx);
@@ -438,11 +445,18 @@ async function handleGetInBandGasQuote(
   if (nativeCost <= 0n) throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "nativeCost must be > 0");
 
   const eoa = await chain.accountService.deriveEOA(getAddress(arg.safeAddress));
+  // Vault mode (Stage 2, docs/pool-queue-architecture.md): the reimbursement recipient is
+  // the treasury, not the per-safe EOA. Must move in lockstep with the bundle gate's
+  // recipient — a quote pointing at the EOA while the gate credits the treasury (or vice
+  // versa) silently strands every op at "reimbursement too low".
+  const recipient = vaultActiveForChain(config.settlementVaultChains, reqCtx.chainId)
+    ? config.treasuryAddress
+    : eoa.address;
   const requiredNative = nativeCost * IN_BAND_MARKUP_X;
 
   if (!arg.feeToken) {
     return {
-      recipient: eoa.address,
+      recipient,
       asset: "native",
       feeToken: null,
       requiredAmount: "0x" + requiredNative.toString(16),
@@ -451,8 +465,12 @@ async function handleGetInBandGasQuote(
   }
 
   // Stablecoin: must be whitelisted; priced by the chain's DEX; charge floored at $0.01.
+  // Read chain metadata from the RESOLVED chain services, falling back to config: in the
+  // CF worker this handler receives the GLOBAL config (chainInfo null, rpcUrl "") — reading
+  // config directly made every stablecoin quote 400 "unsupported" in production.
+  const chainInfo = chain.chainInfo ?? config.chainInfo;
   const stable = getAddress(arg.feeToken);
-  const stables = (config.chainInfo?.stables ?? []).map((s) => {
+  const stables = (chainInfo?.stables ?? []).map((s) => {
     try {
       return getAddress(s.contract);
     } catch {
@@ -462,12 +480,12 @@ async function handleGetInBandGasQuote(
   if (!stables.includes(stable)) {
     throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, `feeToken ${stable} is not a whitelisted stablecoin on this chain`);
   }
-  const quoter = config.chainInfo?.dex?.contracts?.quoterV2;
-  const wnative = config.chainInfo?.wrappedNativeToken;
+  const quoter = chainInfo?.dex?.contracts?.quoterV2;
+  const wnative = chainInfo?.wrappedNativeToken;
   if (!quoter || !wnative) {
     throw bundlerError(RPC_ERROR_CODES.INVALID_USEROPERATION, "stablecoin gas is unsupported on this chain (no DEX quoter / wrappedNative)");
   }
-  const client = getPublicClient(config.rpcUrl);
+  const client = getPublicClient(chain.rpcUrl || config.rpcUrl);
   const costStable = await quoteNativeToStable(client, { quoterV2: quoter, wrappedNative: wnative, stable }, nativeCost, reqCtx.chainId);
   if (costStable === null || costStable <= 0n) {
     throw degradedFromError(new Error("no DEX quote for stablecoin"), "stablecoin rate");
@@ -475,7 +493,7 @@ async function handleGetInBandGasQuote(
   const decimals = await stableDecimals(client, stable);
   const required = requiredStableCharge(costStable, decimals, IN_BAND_MARKUP_X);
   return {
-    recipient: eoa.address,
+    recipient,
     asset: "erc20",
     feeToken: stable,
     requiredAmount: "0x" + required.toString(16),
@@ -595,13 +613,7 @@ function handleGetUserOperationByHash(
 
     const receipt = chain.bundler.getReceipt(hash);
     if (receipt) {
-      return {
-        userOperation: { sender: receipt.sender, nonce: "0x" + receipt.nonce.toString(16) },
-        entryPoint: receipt.entryPoint,
-        blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
-        blockHash: receipt.receipt.blockHash,
-        transactionHash: receipt.receipt.transactionHash,
-      };
+      return receiptToByHashRpc(receipt);
     }
   }
 
@@ -626,37 +638,7 @@ function handleGetUserOperationReceipt(
   for (const chain of sortedChains) {
     const receipt = chain.bundler.getReceipt(hash);
     if (!receipt) continue;
-
-    return {
-      userOpHash: receipt.userOpHash,
-      entryPoint: receipt.entryPoint,
-      sender: receipt.sender,
-      nonce: "0x" + receipt.nonce.toString(16),
-      paymaster: receipt.paymaster ?? "0x0000000000000000000000000000000000000000",
-      actualGasCost: "0x" + receipt.actualGasCost.toString(16),
-      actualGasUsed: "0x" + receipt.actualGasUsed.toString(16),
-      success: receipt.success,
-      logs: receipt.logs.map((l) => ({
-        logIndex: "0x" + l.logIndex.toString(16),
-        address: l.address,
-        topics: l.topics,
-        data: l.data,
-        blockNumber: "0x" + l.blockNumber.toString(16),
-        blockHash: l.blockHash,
-        transactionHash: l.transactionHash,
-      })),
-      receipt: {
-        transactionHash: receipt.receipt.transactionHash,
-        transactionIndex: "0x" + receipt.receipt.transactionIndex.toString(16),
-        blockHash: receipt.receipt.blockHash,
-        blockNumber: "0x" + receipt.receipt.blockNumber.toString(16),
-        from: receipt.receipt.from,
-        to: receipt.receipt.to,
-        cumulativeGasUsed: "0x" + receipt.receipt.cumulativeGasUsed.toString(16),
-        gasUsed: "0x" + receipt.receipt.gasUsed.toString(16),
-        effectiveGasPrice: "0x" + receipt.receipt.effectiveGasPrice.toString(16),
-      },
-    };
+    return receiptToRpc(receipt);
   }
 
   return null;

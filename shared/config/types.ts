@@ -9,6 +9,7 @@ import type { ChainInfo } from "./chain-registry.ts";
 
 export type { ChainInfo };
 export { resolveChain, fetchChainInfo, filterPublicRpcUrls } from "./chain-registry.ts";
+export { settlementVaultEnabledFor } from "./vault.ts";
 
 /**
  * Global config — chain-independent settings.
@@ -60,6 +61,34 @@ export interface BundlerConfig {
    *  legacy native-self-pay/splitter route. Tempo chains are always in-band regardless.
    *  See docs/inband-gas-settlement.md. */
   readonly inBandEnabled?: boolean;
+  /** Per-chain canary spec for enabling in-band settlement on non-Tempo chains — the
+   *  raw INBAND_ENABLED value: "" | "true"/"all" | comma-separated chainIds. Resolved
+   *  together with inBandEnabled via inBandActiveForChain (shared/tempo.ts); this is
+   *  the ONLY way to enable in-band from the environment (the boolean has no env
+   *  plumbing — it exists for per-chain configs and tests). */
+  readonly inBandChains?: string;
+  /** Per-chain canary spec for treasury-as-vault settlement (redirects the in-band
+   *  reimbursement recipient to the treasury + enables the treasury→pool top-up loop).
+   *  Raw SETTLEMENT_VAULT_ENABLED value: "" | "true"/"all" | comma-separated chainIds.
+   *  Resolve with settlementVaultEnabledFor(spec, chainId) — never read directly.
+   *  Stage 2 of docs/pool-queue-architecture.md. */
+  readonly settlementVaultChains?: string;
+  /** Per-chain spec for Stage 3 pool relayers (POOL_EOA_ENABLED env: "" | "true"/"all" |
+   *  chainId CSV). Gates the pool top-up loop today (no money parked in idle pool EOAs
+   *  before Stage 3 activates them) and the multi-sender pool bundling when it lands.
+   *  Resolve via chainSpecEnables. */
+  readonly poolEoaChains?: string;
+  /** Per-chain spec for Stage 4 queue transport (QUEUE_TRANSPORT_ENABLED env: "" | "true"/"all"
+   *  | chainId CSV). When active on a chain, eth_sendUserOperation enqueues the validated op to
+   *  USEROP_QUEUE instead of mempool.add + kick, and the queue() consumer routes it by
+   *  hash(sender)%100 to a per-EOA RelayerDO. Requires pool mode (POOL_EOA_ENABLED) + vault.
+   *  Resolve via chainSpecEnables. Default off → the in-DO mempool path (Stage 3) unchanged. */
+  readonly queueTransportChains?: string;
+  /** Pool relayer float: top up a pool EOA when its native balance falls below this (wei).
+   *  Default 0.0005 native. Stage 2 top-up loop. */
+  readonly poolFloatMinWei?: bigint;
+  /** Pool relayer float: top up TO this native balance (wei). Default 0.002 native. */
+  readonly poolFloatTargetWei?: bigint;
   readonly apiRateLimitPerMinute: number;
   /** Client IPs exempt from rate limiting (comma-separated env RATE_LIMIT_ALLOWLIST) —
    *  the operator's own bot must never self-throttle its trading ops. */

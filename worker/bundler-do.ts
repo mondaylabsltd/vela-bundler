@@ -14,6 +14,8 @@
 import type { Env } from "./types.ts";
 import { buildConfig } from "./config.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
+import { vaultActiveForChain } from "../shared/tempo.ts";
+import { chainSpecEnables } from "../shared/config/vault.ts";
 import { resolveChain } from "../shared/config/chain-registry.ts";
 import { createSimulator } from "../shared/simulation/index.ts";
 import {
@@ -22,7 +24,9 @@ import {
   deserializeMempoolEntry,
   type SerializedMempoolEntry,
 } from "../shared/mempool/index.ts";
-import type { SerializedReceipt } from "../shared/bundler/index.ts";
+import { deserializeReceipt, type SerializedReceipt } from "../shared/bundler/index.ts";
+import { makeEnqueueHook } from "./producer.ts";
+import { receiptToRpc, receiptToByHashRpc } from "../shared/rpc/receipt-format.ts";
 import { redactError } from "../shared/reliability/log.ts";
 import { RepeatedErrorEscalator } from "../shared/monitoring/escalation.ts";
 import { maybeSendAliveHeartbeat } from "../shared/monitoring/operational.ts";
@@ -42,6 +46,7 @@ import {
   processRequest,
   jsonResponse,
   type RequestContext,
+  type JsonRpcResponse,
 } from "../shared/rpc/process.ts";
 import {
   parseError,
@@ -519,6 +524,13 @@ export class BundlerDO implements DurableObject {
     // for 5-minute trading windows).
     bundler.setKickHook(() => this.state.storage.setAlarm(Date.now()));
 
+    // Stage 4 producer: on chains where queue transport is active (QUEUE_TRANSPORT_ENABLED),
+    // acceptUserOp hands the validated op to this hook instead of the in-DO mempool — it
+    // enqueues to USEROP_QUEUE + writes the accepted-op KV marker. Wired unconditionally
+    // (harmless when the flag is off: acceptUserOp gates on queueModeActive, so it is never
+    // called); degrades to the mempool if USEROP_QUEUE is unbound at runtime.
+    bundler.setEnqueueHook(makeEnqueueHook(this.env, { chainId, entryPoint: chainConfig.entryPointAddress }));
+
     // Durably persist accepted-unbundled ops: a deploy/eviction used to wipe the in-memory
     // mempool, silently vanishing accepted ops (the wallet polls null forever — worse than
     // any failure). Per-hash keys; writes are fire-and-forget (never block acceptance).
@@ -694,11 +706,70 @@ export class BundlerDO implements DurableObject {
           ? r.value
           : { jsonrpc: "2.0" as const, id: (body[i]?.id as number | string) ?? null, error: internalError("Internal error") },
       );
+      await this.fillQueueModeReceiptLookups(body, responses);
       return jsonResponse(responses, corsHeaders);
     }
 
     const response = await processRequest(body, this.config, this.chainAdapter, reqCtx);
+    await this.fillQueueModeReceiptLookups(body, response);
     return jsonResponse(response, corsHeaders);
+  }
+
+  /**
+   * Stage 4 receipt lookup for queue-mode ops. In queue transport, a UserOp never enters this
+   * chain DO's own mempool/receipts (the producer enqueued it to a RelayerDO), so the in-DO
+   * eth_getUserOperationReceipt / eth_getUserOperationByHash resolve to null. A RelayerDO
+   * publishes the TERMINAL receipt to USEROP_STATUS KV on confirmation; read it here and fill
+   * the response so the wallet's poll resolves without fanning out to 100 DOs. Only runs when
+   * queue mode is active for this chain AND the in-DO lookup already returned null — non-queue
+   * chains (and any op already answered in-DO) are byte-identical to before. An accepted-but-
+   * not-yet-mined op has a marker without a receipt → left null (still pending), as today.
+   */
+  private async fillQueueModeReceiptLookups(
+    body: unknown,
+    response: JsonRpcResponse | JsonRpcResponse[],
+  ): Promise<void> {
+    const kv = this.env.USEROP_STATUS;
+    if (!kv) return;
+    if (!this.chainServices || !this.chainServices.bundler.queueModeActive()) return;
+
+    const fill = async (req: unknown, resp: JsonRpcResponse): Promise<void> => {
+      if (!req || typeof req !== "object") return;
+      const method = (req as { method?: unknown }).method;
+      if (method !== "eth_getUserOperationReceipt" && method !== "eth_getUserOperationByHash") return;
+      if (resp.result !== null) return; // in-DO lookup already answered (or it's an error)
+      const params = (req as { params?: unknown }).params;
+      const hash = Array.isArray(params) ? params[0] : undefined;
+      if (typeof hash !== "string" || !hash.startsWith("0x")) return;
+      const filled = await this.readStatusReceipt(method, hash).catch(() => undefined);
+      if (filled !== undefined) resp.result = filled;
+    };
+
+    if (Array.isArray(body) && Array.isArray(response)) {
+      await Promise.all(body.map((b, i) => (response[i] ? fill(b, response[i]!) : Promise.resolve())));
+    } else if (!Array.isArray(body) && !Array.isArray(response)) {
+      await fill(body, response);
+    }
+  }
+
+  /** Read a terminal receipt from USEROP_STATUS KV and format it for the given method. Returns
+   *  undefined when there is no KV entry or the op is still pending (marker without a receipt). */
+  private async readStatusReceipt(method: string, userOpHash: string): Promise<unknown | undefined> {
+    const kv = this.env.USEROP_STATUS;
+    if (!kv) return undefined;
+    const raw = await kv.get(userOpHash);
+    if (!raw) return undefined;
+    let record: { receipt?: SerializedReceipt } | null;
+    try {
+      record = JSON.parse(raw) as { receipt?: SerializedReceipt };
+    } catch {
+      return undefined;
+    }
+    if (!record?.receipt) return undefined; // accepted/pending → leave result null
+    const receipt = deserializeReceipt(record.receipt);
+    return method === "eth_getUserOperationReceipt"
+      ? receiptToRpc(receipt)
+      : receiptToByHashRpc(receipt);
   }
 
   private async handleRest(request: Request, doUrl: URL, _chainId: number): Promise<Response> {
@@ -865,6 +936,52 @@ export class BundlerDO implements DurableObject {
       } catch (err) {
         console.error(`[BundlerDO:${this.chainId}] Treasury monitor error:`, err);
         await this.escalator.note("treasury-monitor", this.chainId, err);
+      }
+
+      // Pool relayer float top-up: keep the 100 pool EOAs at their float target from
+      // the treasury. Gated on the STAGE-3 flag, not vault mode — with vault on
+      // everywhere, funding the pool before anything uses it would just park treasury
+      // money in 100 idle EOAs per chain. Internally rate-limited to one sweep per
+      // minute; serialized against the treasury nonce inside the service.
+      if (
+        this.sponsorService &&
+        vaultActiveForChain(this.config.settlementVaultChains, this.chainId)
+      ) {
+        if (chainSpecEnables(this.config.poolEoaChains, this.chainId)) {
+        try {
+          await this.sponsorService.topUpPoolEOAs(
+            this.chainId,
+            this.chainServices.rpcUrl,
+            async (i) => (await this.chainServices!.accountService.getPoolEOA(i)).address,
+          );
+          this.escalator.ok("pool-topup", this.chainId);
+        } catch (err) {
+          console.error(`[BundlerDO:${this.chainId}] Pool top-up error:`, err);
+          await this.escalator.note("pool-topup", this.chainId, err);
+        }
+        }
+
+        // Fronting-EOA float refill: in vault mode the reimbursement goes to the
+        // treasury, so the per-safe EOA that fronts the outer gas is no longer
+        // self-healing. When the bundle loop flags one as unable to afford the outer
+        // tx, refill it from the treasury (bounded + serialized inside the service).
+        const lowEoa = this.chainServices.bundler.insufficientFundsEoa;
+        if (lowEoa) {
+          try {
+            await this.sponsorService.topUpFloatEOA(
+              this.chainId,
+              this.chainServices.rpcUrl,
+              lowEoa,
+              // Size the refill to the ACTUAL prefund that bounced (×1.5 headroom), not a
+              // static target — a multi-sender pool bundle can need many× poolFloatTargetWei.
+              this.chainServices.bundler.insufficientFundsWei ?? undefined,
+            );
+            this.escalator.ok("float-topup", this.chainId);
+          } catch (err) {
+            console.error(`[BundlerDO:${this.chainId}] Float top-up error:`, err);
+            await this.escalator.note("float-topup", this.chainId, err);
+          }
+        }
       }
 
       // Operational-health monitor: alert on any STUCK condition (mempool op / pending bundle /

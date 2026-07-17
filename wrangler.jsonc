@@ -5,12 +5,21 @@
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
 
-  // One BundlerDO instance per chain — accessed via env.BUNDLER.idFromName(`chain-${chainId}`)
+  // Durable Objects:
+  //   BUNDLER — one instance per chain, env.BUNDLER.idFromName(`chain-${chainId}`)
+  //   RELAYER — one instance per (chain, pool index i), env.RELAYER.idFromName(`chain-${chainId}-eoa-${i}`)
+  //             (Stage 4, docs/pool-queue-architecture.md). A plain DO binding is deploy-safe,
+  //             so it is bound and LIVE now — the queue consumer routes to it once
+  //             QUEUE_TRANSPORT_ENABLED + the queue/KV bindings below are activated.
   "durable_objects": {
     "bindings": [
       {
         "name": "BUNDLER",
         "class_name": "BundlerDO"
+      },
+      {
+        "name": "RELAYER",
+        "class_name": "RelayerDO"
       }
     ]
   },
@@ -19,8 +28,39 @@
     {
       "tag": "v1",
       "new_classes": ["BundlerDO"]
+    },
+    {
+      "tag": "v2",
+      "new_classes": ["RelayerDO"]
     }
   ],
+
+  // --- Pool/queue rework bindings (docs/pool-queue-architecture.md) ---
+  // The RELAYER Durable Object above is LIVE. The queue producer/consumer + KV below stay
+  // commented until QUEUE_TRANSPORT_ENABLED (Stage 4): wrangler refuses to deploy a
+  // producer/consumer for a queue that doesn't exist yet, and the producer/consumer degrade
+  // gracefully (mempool fallback) while USEROP_QUEUE is unbound.
+  // To activate:
+  //   wrangler queues create vela-userops
+  //   wrangler queues create vela-userops-dlq
+  //   wrangler kv namespace create USEROP_STATUS   (put the id below)
+  // then uncomment:
+  //
+  // "queues": {
+  //   "producers": [
+  //     { "binding": "USEROP_QUEUE", "queue": "vela-userops" }
+  //   ],
+  //   "consumers": [
+  //     {
+  //       "queue": "vela-userops",
+  //       "max_retries": 3,
+  //       "dead_letter_queue": "vela-userops-dlq"
+  //     }
+  //   ]
+  // },
+  // "kv_namespaces": [
+  //   { "binding": "USEROP_STATUS", "id": "<created-namespace-id>" }
+  // ],
 
   // Liveness cron (dead-man switch, external layer): probes each ACTIVE_CHAINS DO every
   // 5 minutes and re-arms (+ alerts) a broken alarm chain. DO alarms self-sustain in normal

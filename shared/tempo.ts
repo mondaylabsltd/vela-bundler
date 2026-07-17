@@ -37,6 +37,7 @@ import { tempoActions } from "viem/tempo";
 import type { PackedUserOperation } from "./userop/types.ts";
 import { encodeHandleOps } from "./userop/encode.ts";
 import { ceilDiv } from "./gas/fee-model.ts";
+import { settlementVaultEnabledFor } from "./config/vault.ts";
 
 /** Tempo mainnet (4217) → its viem chain; Moderato testnet (42431) for dev. */
 const TEMPO_CHAINS: Record<number, Chain> = {
@@ -73,6 +74,32 @@ export function chainSupportsInBand(chainId: number, inBandEnabled = false): boo
   return isTempoChain(chainId) || inBandEnabled;
 }
 
+/** Vault-mode resolution for a chain — the settlementVaultChains spec. Tempo is included:
+ *  its pathUSD fronting float is refilled by SponsorService.topUpTempoFloat (treasury
+ *  pathUSD via a self-paying 0x76), so fees can flow to the treasury there too. Every
+ *  vault consumer (bundle gate, quote, /v1/account, healthLoop top-ups) MUST resolve
+ *  through this one helper so the recipient sites can never disagree.
+ *  See docs/pool-queue-architecture.md Stage 2. */
+export function vaultActiveForChain(spec: string | undefined, chainId: number): boolean {
+  return settlementVaultEnabledFor(spec, chainId);
+}
+
+/** Whether in-band settlement is active for a chain, combining every enable source:
+ *  Tempo (always), a per-chain config's inBandEnabled boolean (tests / future
+ *  registry-driven configs), and the INBAND_ENABLED env spec (the operator's
+ *  per-chain canary — the only environment-controlled path). All in-band consumers
+ *  MUST resolve through this one helper: the ingress gate, the bundle gate, and the
+ *  quote endpoint disagreeing on "is this chain in-band" strands ops. */
+export function inBandActiveForChain(
+  config: { inBandEnabled?: boolean; inBandChains?: string },
+  chainId: number,
+): boolean {
+  return chainSupportsInBand(
+    chainId,
+    (config.inBandEnabled ?? false) || settlementVaultEnabledFor(config.inBandChains, chainId),
+  );
+}
+
 /** Protocol-default fee token (pathUSD), used when a UserOp doesn't specify one. */
 export const TEMPO_DEFAULT_FEE_TOKEN = "0x20c0000000000000000000000000000000000000" as const;
 /** Every Tempo TIP-20 USD stablecoin uses 6 decimals (microdollar). */
@@ -88,9 +115,16 @@ export const TEMPO_BASE_FEE_ATTO = 20_000_000_000n;
  */
 export const TEMPO_COST_BUFFER_GAS = 80_000n;
 
-/** In-band markup: users pay this multiple of the bundler's real on-chain gas cost (see
- *  docs/inband-gas-settlement.md). 3× covers base-fee spikes between sign and inclusion + revenue. */
+/** In-band QUOTE markup: the wallet is told to transfer this multiple of the estimated gas
+ *  cost (see docs/inband-gas-settlement.md). 3× covers base-fee spikes + revenue. */
 export const IN_BAND_MARKUP_X = 3n;
+
+/** In-band GATE markup: at submit the bundler only requires this multiple of its REAL
+ *  (re-simulated) cost. Deliberately BELOW the 3× quote: the wallet signs exactly the
+ *  displayed 3×-quote amount and never re-quotes at send, so the 1.5× band between quote
+ *  and gate absorbs gas drift between display and submit instead of stranding the op.
+ *  The $0.01-per-stablecoin floor still applies on top. */
+export const IN_BAND_GATE_MARKUP_X = 2n;
 
 /** Cost-basis buffer for the generic native EIP-1559 in-band envelope: the outer tx's intrinsic
  *  21k + calldata-byte gas that an eth_simulateV1 of the handleOps CALL does not report. The

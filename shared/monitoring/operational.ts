@@ -140,9 +140,11 @@ export async function checkOperationalHealth(
   if (snap.insufficientFundsEoa) {
     await alerter.send(
       `eoa-underfunded-${snap.chainId}-${snap.insufficientFundsEoa}`,
-      `💸 Vela Bundler — dedicated EOA ${snap.insufficientFundsEoa} on ${label} cannot afford its ` +
-        `bundle (insufficient funds at broadcast). The user's ops will keep failing until the EOA is ` +
-        `topped up (user deposit) or gas falls.\nLast error: ${snap.lastSubmitError ?? "unknown"}`,
+      `💸 Vela Bundler — fronting EOA ${snap.insufficientFundsEoa} on ${label} cannot afford its ` +
+        `bundle (insufficient funds at broadcast). Ops keep failing until it is topped up or gas ` +
+        `falls. On in-band/vault chains this is an OPERATOR float — raise poolFloatTargetWei / fund ` +
+        `the treasury (the refill loop sizes to the shortfall); on legacy chains it is the user's ` +
+        `deposit.\nLast error: ${snap.lastSubmitError ?? "unknown"}`,
       { cooldownMs: STUCK_COOLDOWN_MS },
     );
   }

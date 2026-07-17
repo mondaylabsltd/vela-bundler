@@ -2,8 +2,9 @@
  * Cloudflare Worker entry point — routes requests to per-chain BundlerDO instances.
  */
 
-import type { Env } from "./types.ts";
+import type { Env, UserOpQueueMessage } from "./types.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { relayerIndexForSender } from "../shared/queue/routing.ts";
 import {
   computeSplitterAddress,
   SPLITTER_CREATION_CODE_HASH,
@@ -13,8 +14,9 @@ import {
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import { redactError } from "../shared/reliability/log.ts";
 
-// Re-export BundlerDO for wrangler to discover
+// Re-export the Durable Objects for wrangler to discover.
 export { BundlerDO } from "./bundler-do.ts";
+export { RelayerDO } from "./relayer-do.ts";
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -142,6 +144,79 @@ export default {
         }));
       })(),
     );
+  },
+
+  /**
+   * Queue consumer (Stage 4 of docs/pool-queue-architecture.md) — ACTIVE consumption of the
+   * `vela-userops` transport (not cron). Group the batch by (chainId, hash(sender)%pool), then
+   * for each group POST /submit to the per-EOA RelayerDO `chain-${chainId}-eoa-${index}`. A 2xx
+   * ACKs every message in the group; anything else RETRIES them (CF applies max_retries then
+   * routes to the DLQ). This handler NEVER throws: a throw would retry the WHOLE batch and can
+   * livelock a poison message — every failure path resolves to per-message ack/retry instead.
+   */
+  async queue(batch: MessageBatch<UserOpQueueMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    try {
+      // Group by (chainId, pool index). The routing hash MUST be the identical function the
+      // producer used to write the KV marker index — both import relayerIndexForSender.
+      const groups = new Map<string, { chainId: number; index: number; msgs: Message<UserOpQueueMessage>[] }>();
+      for (const msg of batch.messages) {
+        try {
+          const body = msg.body;
+          const sender = String((body?.rpcUserOp as { sender?: unknown } | undefined)?.sender ?? "");
+          const chainId = Number(body?.chainId);
+          if (!(chainId > 0) || !sender) {
+            // Malformed message → retry (DLQ after max_retries) rather than crash the batch.
+            msg.retry();
+            continue;
+          }
+          const index = relayerIndexForSender(sender);
+          const key = `${chainId}-${index}`;
+          let g = groups.get(key);
+          if (!g) { g = { chainId, index, msgs: [] }; groups.set(key, g); }
+          g.msgs.push(msg);
+        } catch (err) {
+          console.error(`[Worker] queue: could not route a message: ${redactError(err)}`);
+          try { msg.retry(); } catch { /* already settled */ }
+        }
+      }
+
+      if (!env.RELAYER) {
+        // The RELAYER binding is deploy-safe and always present, but guard anyway: without it
+        // we cannot route — retry so nothing is lost.
+        console.error("[Worker] queue: RELAYER binding missing — retrying batch");
+        for (const g of groups.values()) for (const m of g.msgs) m.retry();
+        return;
+      }
+
+      await Promise.allSettled([...groups.values()].map(async (g) => {
+        try {
+          const stub = env.RELAYER.get(env.RELAYER.idFromName(`chain-${g.chainId}-eoa-${g.index}`));
+          const res = await stub.fetch(
+            `https://relayer-do/submit?chainId=${g.chainId}&index=${g.index}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ops: g.msgs.map((m) => m.body) }),
+            },
+          );
+          if (res.ok) for (const m of g.msgs) m.ack();
+          else {
+            console.warn(`[Worker] queue: RelayerDO chain-${g.chainId}-eoa-${g.index} returned ${res.status} — retrying group`);
+            for (const m of g.msgs) m.retry();
+          }
+        } catch (err) {
+          console.error(`[Worker] queue: submit to chain-${g.chainId}-eoa-${g.index} failed: ${redactError(err)}`);
+          for (const m of g.msgs) m.retry();
+        }
+      }));
+    } catch (err) {
+      // Last-resort guard: never let queue() throw (that retries the whole batch). Retry each
+      // message individually instead.
+      console.error(`[Worker] queue handler error: ${redactError(err)}`);
+      for (const msg of batch.messages) {
+        try { msg.retry(); } catch { /* already settled */ }
+      }
+    }
   },
 };
 

@@ -3,7 +3,7 @@
  */
 
 import { it, expect } from "vitest";
-import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress, validateOperatorSecret } from "../shared/keys/derive.ts";
+import { deriveEOAPrivateKey, deriveEOAAddress, deriveTreasuryPrivateKey, deriveTreasuryAddress, derivePoolRelayerPrivateKey, derivePoolRelayerAddress, RELAYER_POOL_SIZE, validateOperatorSecret } from "../shared/keys/derive.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
 
 const TEST_SECRET =
@@ -201,6 +201,86 @@ it("deriveTreasuryAddress - different from per-user EOA", async () => {
   const treasury = await deriveTreasuryAddress(TEST_SECRET);
   const userEOA = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
   expect(treasury).not.toEqual(userEOA);
+});
+
+// --- Pool relayer derivation (Stage 0 of docs/pool-queue-architecture.md) ---
+
+// Golden vectors computed with an INDEPENDENT HKDF implementation (node:crypto
+// hkdfSync, not the WebCrypto path under test): HKDF-SHA256(IKM=secret,
+// salt="vela-bundler-dedicated-eoa-v1", info=`relayer-#${i}`, L=32). Any change
+// to the salt, info format, or counter scheme breaks these — that is the point:
+// the derivation is an on-chain-funds commitment and must never silently move.
+const POOL_GOLDEN_PK_0 =
+  "0xeca260badba16aa99814aafa0d11978ec3772bd088b294c9032ce278a5b8e2d3";
+const POOL_GOLDEN_ADDRS: Record<number, `0x${string}`> = {
+  0: "0x6d05a1d693ad0fc5189560d5456acde3afe31342",
+  1: "0x783346e3c11d430c523b41462f81aae91e57fd84",
+  2: "0xa97ac271de683cb40069aa1f457b7876d3f96995",
+  50: "0x23c64c8351d3307757bb664af9ca6fde89c40494",
+  99: "0xea1daafbdae5dea227cf045d99cd7e7f96f51865",
+};
+const POOL_GOLDEN_ADDR_0_SECRET_2 = "0xa5640ac2724e1d066d71e5b1d9c556184b5e68e5";
+
+it("derivePoolRelayerPrivateKey - matches golden vector for index 0", async () => {
+  const pk = await derivePoolRelayerPrivateKey(TEST_SECRET, 0);
+  expect(pk).toEqual(POOL_GOLDEN_PK_0);
+});
+
+it("derivePoolRelayerAddress - matches golden vectors", async () => {
+  for (const [index, expected] of Object.entries(POOL_GOLDEN_ADDRS)) {
+    const addr = await derivePoolRelayerAddress(TEST_SECRET, Number(index));
+    expect(addr, `pool relayer #${index}`).toEqual(expected);
+  }
+});
+
+it("derivePoolRelayerAddress - different secret produces different golden address", async () => {
+  const addr = await derivePoolRelayerAddress(TEST_SECRET_2, 0);
+  expect(addr).toEqual(POOL_GOLDEN_ADDR_0_SECRET_2);
+  expect(addr).not.toEqual(POOL_GOLDEN_ADDRS[0]);
+});
+
+it("pool relayer pool size is 100", () => {
+  expect(RELAYER_POOL_SIZE).toEqual(100);
+});
+
+it("all 100 pool relayer keys are valid and all addresses distinct", async () => {
+  const addrs = new Set<string>();
+  for (let i = 0; i < RELAYER_POOL_SIZE; i++) {
+    const pk = await derivePoolRelayerPrivateKey(TEST_SECRET, i);
+    const keyBigInt = BigInt(pk);
+    expect(keyBigInt > 0n).toBeTruthy();
+    expect(keyBigInt < SECP256K1_N).toBeTruthy();
+    addrs.add(await derivePoolRelayerAddress(TEST_SECRET, i));
+  }
+  expect(addrs.size).toEqual(RELAYER_POOL_SIZE);
+});
+
+it("pool relayer addresses are distinct from treasury and per-safe EOAs", async () => {
+  const treasury = await deriveTreasuryAddress(TEST_SECRET);
+  const perSafe = await deriveEOAAddress(TEST_SECRET, 1, ENTRY_POINT, SAFE_A);
+  const pool0 = await derivePoolRelayerAddress(TEST_SECRET, 0);
+  expect(pool0).not.toEqual(treasury);
+  expect(pool0).not.toEqual(perSafe);
+});
+
+it("derivePoolRelayerPrivateKey - rejects out-of-range or non-integer index", async () => {
+  await expect(derivePoolRelayerPrivateKey(TEST_SECRET, -1)).rejects.toThrow("index");
+  await expect(derivePoolRelayerPrivateKey(TEST_SECRET, RELAYER_POOL_SIZE)).rejects.toThrow("index");
+  await expect(derivePoolRelayerPrivateKey(TEST_SECRET, 1.5)).rejects.toThrow("index");
+  await expect(derivePoolRelayerPrivateKey(TEST_SECRET, NaN)).rejects.toThrow("index");
+});
+
+it("derivePoolRelayerPrivateKey - rejects a malformed secret", async () => {
+  await expect(derivePoolRelayerPrivateKey("0x1234", 0)).rejects.toThrow("at least 32 bytes");
+});
+
+it("LocalKeyManager - derivePoolEOA matches direct derivation and is deterministic", async () => {
+  const km = new LocalKeyManager({ operatorSecret: TEST_SECRET });
+  const eoa1 = await km.derivePoolEOA(0);
+  const eoa2 = await km.derivePoolEOA(0);
+  expect(eoa1.address).toEqual(POOL_GOLDEN_ADDRS[0]);
+  expect(eoa1.address).toEqual(eoa2.address);
+  expect(eoa1.privateKey).toEqual(POOL_GOLDEN_PK_0);
 });
 
 // --- Secret validation (fail-closed on a malformed/weak OPERATOR_SECRET) ---
