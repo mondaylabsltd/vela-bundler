@@ -83,6 +83,13 @@ export default {
         return routeToDO(env, request, chainId, "/rest", url.pathname);
       }
 
+      // /v1/treasury/:chainId — per-chain treasury balance + bootstrapNeeded (Stage 2). MUST reach
+      // the chain DO (rest-api.ts reads the on-chain balance there), so route it like account/sponsor.
+      const treasuryChainMatch = url.pathname.match(/^\/v1\/treasury\/(\d+)$/);
+      if (treasuryChainMatch && request.method === "GET") {
+        return routeToDO(env, request, parseInt(treasuryChainMatch[1]!), "/rest", url.pathname);
+      }
+
       // /v1/treasury — no chain needed, derive from OPERATOR_SECRET directly
       if (url.pathname === "/v1/treasury" && request.method === "GET") {
         const addr = await deriveTreasuryAddress(env.OPERATOR_SECRET);

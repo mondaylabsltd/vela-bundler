@@ -52,13 +52,20 @@
     { "binding": "USEROP_STATUS", "id": "local-userop-status" }
   ],
 
-  // Turn the whole rework ON for a local devnet chain so the queue/DO path runs.
-  // (In-band + vault already default "all"; pool + queue are opt-in — enable them here.)
+  // Turn the WHOLE rework on for every chain so local dev exercises the new pool-EOA +
+  // queue path end-to-end (miniflare emulates the queue locally). With these on, bundling
+  // switches from the per-safe EOA to a LEASED POOL EOA (#hash(sender)%100), and the op
+  // flows ingress → producer enqueue → queue consumer → RelayerDO → pool-EOA bundle.
+  // PREREQUISITE: the pool EOA that serves a given sender must hold native gas — the chain
+  // DO's healthLoop funds pool EOAs from the treasury (topUpPoolEOAs), so the treasury must
+  // have native balance on the chain under test, or the pool bundle DEFERS ("insufficient
+  // funds"). poolModeActive excludes Tempo automatically. Set a chainId CSV instead of "all"
+  // to scope it (e.g. "1,42161").
   "vars": {
     "INBAND_ENABLED": "all",
     "SETTLEMENT_VAULT_ENABLED": "all",
-    "POOL_EOA_ENABLED": "31337",
-    "QUEUE_TRANSPORT_ENABLED": "31337"
+    "POOL_EOA_ENABLED": "all",
+    "QUEUE_TRANSPORT_ENABLED": "all"
   },
 
   "observability": {
