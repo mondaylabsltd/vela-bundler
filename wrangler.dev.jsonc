@@ -1,0 +1,68 @@
+{
+  // ---------------------------------------------------------------------------
+  // LOCAL-DEV ONLY config — runs the FULL Stage-4 queue transport + per-EOA
+  // RelayerDO path under `wrangler dev` (miniflare emulates Queues + KV + DOs
+  // locally, so the "queue must exist" restriction that keeps these bindings
+  // commented in wrangler.jsonc does NOT apply here). Never `wrangler deploy`
+  // with this file — see docs/local-queue-dev.md.
+  //
+  //   wrangler dev -c wrangler.dev.jsonc
+  //
+  // The stage flags below are turned ON for chain 31337 (a local anvil/hardhat
+  // devnet) so ingress → producer enqueue → queue consumer → RelayerDO /submit
+  // exercises end-to-end. Point OPERATOR_SECRET at a throwaway key via .dev.vars.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "vela-bundler-dev",
+  "main": "worker/index.ts",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "BUNDLER", "class_name": "BundlerDO" },
+      { "name": "RELAYER", "class_name": "RelayerDO" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_classes": ["BundlerDO"] },
+    { "tag": "v2", "new_classes": ["RelayerDO"] }
+  ],
+
+  // Queue transport — LIVE locally (miniflare emulates the queue; no remote create needed).
+  "queues": {
+    "producers": [
+      { "binding": "USEROP_QUEUE", "queue": "vela-userops" }
+    ],
+    "consumers": [
+      {
+        "queue": "vela-userops",
+        "max_retries": 3,
+        "max_batch_size": 10,
+        "max_batch_timeout": 2,
+        "dead_letter_queue": "vela-userops-dlq"
+      }
+    ]
+  },
+
+  // Local KV for the accepted-op status / receipt index. The id is a local-only
+  // placeholder — `wrangler dev` keeps KV in a local store, it is never read remotely.
+  "kv_namespaces": [
+    { "binding": "USEROP_STATUS", "id": "local-userop-status" }
+  ],
+
+  // Turn the whole rework ON for a local devnet chain so the queue/DO path runs.
+  // (In-band + vault already default "all"; pool + queue are opt-in — enable them here.)
+  "vars": {
+    "INBAND_ENABLED": "all",
+    "SETTLEMENT_VAULT_ENABLED": "all",
+    "POOL_EOA_ENABLED": "31337",
+    "QUEUE_TRANSPORT_ENABLED": "31337"
+  },
+
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": true }
+  }
+}
