@@ -376,6 +376,26 @@ export class BundlerService {
    *  can be many× poolFloatTargetWei, so a static target would refill-yet-still-bounce
    *  forever. null when no shortfall this cycle. */
   insufficientFundsWei: bigint | null = null;
+  /** Fired the INSTANT a bundle can't afford its outer gas — the worker wires it to an
+   *  immediate treasury→EOA top-up so the refill doesn't wait for the next healthLoop tick
+   *  (up to an alarm interval away). Fire-and-forget + deduped by the caller; sizing comes
+   *  from insufficientFundsWei. */
+  private insufficientFundsHook?: (eoa: `0x${string}`, shortfallWei: bigint) => void;
+
+  setInsufficientFundsHook(hook: (eoa: `0x${string}`, shortfallWei: bigint) => void): void {
+    this.insufficientFundsHook = hook;
+  }
+
+  /** Record an underfunded EOA AND request an immediate top-up. Single choke point so every
+   *  "needs top-up" site both surfaces the alert state and kicks the refill without delay. */
+  private flagInsufficientFunds(eoa: `0x${string}`, shortfallWei: bigint): void {
+    this.insufficientFundsEoa = eoa;
+    this.insufficientFundsWei = shortfallWei;
+    this._cycleSawInsufficientFunds = true;
+    try {
+      this.insufficientFundsHook?.(eoa, shortfallWei);
+    } catch { /* the healthLoop refill is the backstop */ }
+  }
   /**
    * Durable-storage hook. In CF Worker mode the DO wires this to persist the in-flight
    * pending-receipt list to DO storage, so reconciliation survives eviction/crash. No-op
@@ -1403,9 +1423,7 @@ export class BundlerService {
             `(spendable=${balanceCheck.spendableBalance} < required=${balanceCheck.requiredBalance})`,
         );
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
-        this.insufficientFundsEoa = eoa.address;
-        this.insufficientFundsWei = expectedCost;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = `EOA balance insufficient: spendable ${balanceCheck.spendableBalance} < required ${balanceCheck.requiredBalance}`;
         return {
           submitted: false,
@@ -1569,9 +1587,7 @@ export class BundlerService {
       // drop→resubmit churn the maxFee-basis balance gate exists to prevent.
       if (isInsufficientFundsError(err)) {
         this.accountService.releaseBalance(eoa.address, expectedCost);
-        this.insufficientFundsEoa = eoa.address;
-        this.insufficientFundsWei = expectedCost;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = redactError(err);
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
         console.warn(`[Bundler] prepare hit insufficient funds for ${eoa.address} — keeping ops, needs top-up: ${redactError(err)}`);
@@ -1625,9 +1641,7 @@ export class BundlerService {
       // (see the identical prepare-stage branch above for the rationale).
       if (isInsufficientFundsError(err)) {
         this.accountService.releaseBalance(eoa.address, expectedCost);
-        this.insufficientFundsEoa = eoa.address;
-        this.insufficientFundsWei = expectedCost;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = redactError(err);
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
         console.warn(`[Bundler] broadcast hit insufficient funds for ${eoa.address} — keeping ops, needs top-up: ${redactError(err)}`);

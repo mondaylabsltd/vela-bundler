@@ -524,6 +524,21 @@ export class BundlerDO implements DurableObject {
     // for 5-minute trading windows).
     bundler.setKickHook(() => this.state.storage.setAlarm(Date.now()));
 
+    // Immediate float refill: the INSTANT a bundle can't afford its outer gas (a fresh pool EOA
+    // that the sweep hasn't funded yet, or a drained fronting EOA), request a treasury→EOA
+    // top-up NOW instead of waiting for the next healthLoop tick. topUpFloatEOA is bounded +
+    // in-flight-deduped, so repeated flags collapse to one send; the op stays in the mempool and
+    // retries on the next alarm, by which time the funding tx has mined. Only on vault chains —
+    // on a legacy deposit chain the EOA balance is the USER's, never operator-topped.
+    bundler.setInsufficientFundsHook((eoa, shortfallWei) => {
+      if (!this.sponsorService || !this.chainServices) return;
+      if (!vaultActiveForChain(this.config?.settlementVaultChains, this.chainId)) return;
+      void this.sponsorService
+        .topUpFloatEOA(this.chainId, this.chainServices.rpcUrl, eoa, shortfallWei)
+        .then(() => this.state.storage.setAlarm(Date.now())) // re-bundle promptly once funded
+        .catch((err: unknown) => console.warn(`[BundlerDO:${this.chainId}] immediate float top-up failed: ${redactError(err)}`));
+    });
+
     // Stage 4 producer: on chains where queue transport is active (QUEUE_TRANSPORT_ENABLED),
     // acceptUserOp hands the validated op to this hook instead of the in-DO mempool — it
     // enqueues to USEROP_QUEUE + writes the accepted-op KV marker. Wired unconditionally
