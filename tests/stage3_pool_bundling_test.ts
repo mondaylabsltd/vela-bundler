@@ -546,3 +546,39 @@ it("pool in-flight guard - a sender with a pending receipt is excluded from the 
   expect(acct.calls.lease, "no new lease when every sender is in flight").toEqual(before);
   expect(mempool.get(mempool.getAll()[0]!.userOpHash), "the op stays in the mempool").toBeDefined();
 });
+
+// ---------------------------------------------------------------------------
+// Immediate treasury top-up on insufficient funds (queue-mode funding gap fix)
+// ---------------------------------------------------------------------------
+
+it("insufficient-funds hook fires with the EOA + shortfall (drives the immediate top-up)", async () => {
+  // Legacy (non-in-band) path so the deterministic balance gate runs: checkBalance reports the
+  // EOA can't afford the prefund → flagInsufficientFunds → the hook fires. (In-band skips the
+  // balance gate and only trips at broadcast, which viem-mocking classifies as ambiguous.)
+  const acct = poolAccountService();
+  (acct as any).checkBalance = async () => ({ sufficient: false, spendableBalance: 1n, requiredBalance: 10n ** 15n });
+  const mempool = newMempool();
+  // A legacy op pays a real EntryPoint fee (maxFee > 0) so it passes validation and reaches the
+  // balance gate (a maxFee=0 op is only valid on an in-band chain).
+  const legacyOp = { ...makeInBandOp(SAFE_A, 1n), maxFeePerGas: 2_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n };
+  mempool.add(legacyOp);
+  const svc = new BundlerService(
+    poolConfig({ inBandChains: "", settlementVaultChains: "", poolEoaChains: "" }),
+    mempool, poolSimulator(), acct, { disableTimers: true },
+  );
+  stubPublicClient(svc, { nonce: 7 });
+
+  const flags: Array<{ eoa: string; shortfall: bigint }> = [];
+  svc.setInsufficientFundsHook((eoa, shortfall) => flags.push({ eoa: eoa.toLowerCase(), shortfall }));
+
+  const r = await svc.tryBundle();
+  expect(r.submitted).toEqual(false); // deferred, ops kept in the mempool
+
+  // The underfunded EOA is surfaced with a positive shortfall so the DO's immediate-refill
+  // wiring can fund it without waiting for the healthLoop.
+  expect(flags.length).toBeGreaterThanOrEqual(1);
+  expect(flags[0]!.eoa).toEqual(PER_SAFE_EOA);
+  expect(flags[0]!.shortfall).toBeGreaterThan(0n);
+  expect(svc.insufficientFundsEoa?.toLowerCase()).toEqual(PER_SAFE_EOA);
+  expect(svc.insufficientFundsWei).toEqual(flags[0]!.shortfall);
+});

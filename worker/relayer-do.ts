@@ -407,6 +407,23 @@ export class RelayerDO implements DurableObject {
     // /submit kick: an accepted op fires the alarm NOW (the alarm serializes with any run).
     bundler.setKickHook(() => this.state.storage.setAlarm(Date.now()));
 
+    // Pool EOA can't afford its bundle → ask the CHAIN DO to fund it. This DO must NOT send
+    // treasury txs itself: 100 RelayerDOs racing the treasury nonce would drop/replace each
+    // other's sends, so ALL treasury top-ups funnel through the single chain-DO SponsorService
+    // (runTreasuryExclusive) via /fund-eoa. Fire-and-forget; re-arm our alarm so the op
+    // re-bundles once the funding tx mines. Without this, a fresh pool EOA in queue mode would
+    // defer forever (the chain DO's sweep idle-stops when its own mempool is empty).
+    bundler.setInsufficientFundsHook((eoa, shortfallWei) => {
+      const stub = this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
+      const u = `https://bundler-do/fund-eoa?chainId=${this.chainId}&address=${eoa}&shortfall=${shortfallWei.toString()}`;
+      void stub.fetch(new Request(u, { method: "POST" }))
+        // Retry a few seconds out — long enough for the funding tx to mine on an L2 (not
+        // setAlarm(now), which would re-fire before it lands and tight-loop; topUpFloatEOA
+        // dedups the funding send meanwhile, and the normal alarm interval is the backstop).
+        .then(() => this.state.storage.setAlarm(Date.now() + 4_000))
+        .catch((err: unknown) => console.warn(`[RelayerDO:${this.chainId}#${this.poolIndex}] fund-eoa request failed: ${redactError(err)}`));
+    });
+
     // Durably persist accepted-unbundled ops (a deploy/eviction must not vanish them).
     mempool.setPersistenceHooks({
       put: (entry) => {

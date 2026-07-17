@@ -277,6 +277,14 @@ export class BundlerDO implements DurableObject {
         return this.handleHealth(chainId);
       }
 
+      // Treasury-serialized EOA top-up. A per-EOA RelayerDO whose pool EOA can't afford its
+      // outer gas calls this so ALL treasury sends go through the ONE chain DO's SponsorService
+      // (runTreasuryExclusive) — 100 RelayerDOs sending treasury txs directly would race its
+      // nonce. Internal (DO→DO) only. Fire-and-forget from the caller's view; returns the result.
+      if (url.pathname === "/fund-eoa" && request.method === "POST") {
+        return await this.handleFundEoa(url);
+      }
+
       return new Response("not found", { status: 404 });
     } catch (err) {
       console.error(`[BundlerDO:${this.chainId}] Error:`, err);
@@ -863,6 +871,35 @@ export class BundlerDO implements DurableObject {
     if (pending !== undefined && Array.isArray(pending) && pending.length > 0) return true;
     const ops = await this.state.storage.list({ prefix: MEMPOOL_KEY_PREFIX, limit: 1 });
     return ops.size > 0;
+  }
+
+  /** Top up ONE fronting/pool EOA from the treasury, serialized on the treasury nonce (all
+   *  callers funnel through this single chain-DO SponsorService). Called by a RelayerDO whose
+   *  pool EOA can't afford its bundle. Vault chains only — on a legacy deposit chain the EOA
+   *  balance is the USER's, never operator-topped. */
+  private async handleFundEoa(url: URL): Promise<Response> {
+    const address = url.searchParams.get("address");
+    if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      return Response.json({ error: "bad address" }, { status: 400 });
+    }
+    if (!this.sponsorService || !this.chainServices) {
+      return Response.json({ error: "not initialized" }, { status: 503 });
+    }
+    if (!vaultActiveForChain(this.config?.settlementVaultChains, this.chainId)) {
+      return Response.json({ error: "not a vault chain" }, { status: 409 });
+    }
+    let shortfallWei: bigint | undefined;
+    const raw = url.searchParams.get("shortfall");
+    if (raw) { try { shortfallWei = BigInt(raw); } catch { /* size to the static target */ } }
+    try {
+      const res = await this.sponsorService.topUpFloatEOA(
+        this.chainId, this.chainServices.rpcUrl, address.toLowerCase() as `0x${string}`, shortfallWei,
+      );
+      return Response.json(res);
+    } catch (err) {
+      console.error(`[BundlerDO:${this.chainId}] fund-eoa error for ${address}:`, redactError(err));
+      return Response.json({ toppedUp: false, reason: "internal_error" }, { status: 500 });
+    }
   }
 
   private handleHealth(requestedChainId: number = this.chainId): Response {
