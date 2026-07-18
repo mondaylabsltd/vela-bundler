@@ -134,19 +134,36 @@ it("topUpFloatEOA - an EOA already at/above target is left alone", async () => {
   } finally { s.restore(); }
 });
 
-it("topUpFloatEOA - SHORTFALL sizing: refills to shortfall×1.5 where a static-target refill would no-op", async () => {
-  // EOA balance is ABOVE the static target (so static-only would say already_funded) but a
-  // pool bundle prefund (shortfall) is 30× the target — the refill must size to it.
-  const shortfall = 60n * 10n ** 15n; // 0.06 native
-  const balance = 3n * 10n ** 15n;    // 0.003 native (> 0.002 static target)
+it("topUpFloatEOA - sizes the refill to the bounced-bundle gas × buffer (scales with bundle size, not a fixed target)", async () => {
+  // The shortfall is the WHOLE handleOps cost (all ops in a multi-sender bundle). The refill sizes
+  // to shortfall × FLOAT_REFILL_BUFFER_X (15), NOT the fixed 0.002 static target — so a costly /
+  // multi-op bundle is fully covered and a cheap L2 isn't over-provisioned.
+  const shortfall = 60n * 10n ** 15n; // 0.06 native (a whole-bundle cost)
+  const balance = 3n * 10n ** 15n;    // 0.003 native (> the old 0.002 static target)
   const s = stub({ eoaBalance: balance });
   try {
     const svc = new SponsorService(cfg(), fakeAlerter().alerter);
     const res = await svc.topUpFloatEOA(1, RPC, EOA, shortfall);
     expect(res.toppedUp).toEqual(true);
     expect(s.sends.length).toEqual(1);
-    // target = shortfall × 3/2 = 0.09; amount = target − balance.
-    expect(s.sends[0]!.value).toEqual((shortfall * 3n) / 2n - balance);
+    // target = shortfall × 15; amount = target − balance.
+    expect(s.sends[0]!.value).toEqual(shortfall * 15n - balance);
+  } finally { s.restore(); }
+});
+
+it("topUpFloatEOA - the Arbitrum incident: a near-old-floor treasury + tiny shortfall now SUCCEEDS", async () => {
+  // Regression for the real incident: treasury 0.0116 ETH ($21, plenty), a bounced bundle needing
+  // only ~0.0000114 ETH of gas. The OLD code (0.01 sponsorship floor + fixed 0.002 target) reported
+  // treasury_depleted and the op stuck. Now: size to shortfall×15 (~0.00017 ETH) and gate only on
+  // affordability → it funds the EOA and the op lands.
+  const shortfall = 11_391_051_060_000n;             // ~0.0000114 ETH (the real 2× gate cost)
+  const s = stub({ eoaBalance: 0n, treasuryBalance: 11_617_727_032_653_287n }); // the real 0.0116 ETH
+  try {
+    const svc = new SponsorService(cfg(), fakeAlerter().alerter);
+    const res = await svc.topUpFloatEOA(42161, RPC, EOA, shortfall);
+    expect(res.toppedUp, "a well-funded treasury must refill an operator EOA for a tiny gas need").toEqual(true);
+    expect(s.sends.length).toEqual(1);
+    expect(s.sends[0]!.value).toEqual(shortfall * 15n); // ~0.00017 ETH, not the old 0.002 target
   } finally { s.restore(); }
 });
 
@@ -160,9 +177,10 @@ it("topUpFloatEOA - defers when the treasury has an unconfirmed tx (pending nonc
   } finally { s.restore(); }
 });
 
-it("topUpFloatEOA - treasury below floor for the needed amount → depleted + alert, no send", async () => {
-  // Treasury just above the 0.01 floor but not enough for floor + amount + gas.
-  const s = stub({ eoaBalance: 0n, treasuryBalance: 10n ** 16n });
+it("topUpFloatEOA - treasury can't afford the refill amount → depleted + alert, no send", async () => {
+  // No sponsorship-floor gate on operator-EOA refills anymore — only affordability (amount + gas)
+  // + the 24h budget. 0.001 ETH treasury < one 0.002 refill → genuinely can't afford → depleted.
+  const s = stub({ eoaBalance: 0n, treasuryBalance: 10n ** 15n });
   const { alerter, ids } = fakeAlerter();
   try {
     const svc = new SponsorService(cfg(), alerter);
@@ -183,6 +201,28 @@ it("topUpFloatEOA - the same EOA is in-flight-skipped on an immediate second cal
     const second = await svc.topUpFloatEOA(1, RPC, EOA);
     expect(second).toEqual({ toppedUp: false, reason: "in_flight" });
     expect(s.sends.length).toEqual(1);
+  } finally { s.restore(); }
+});
+
+it("topUpFloatEOA - concurrent refills of two EOAs can't collectively over-commit the treasury", async () => {
+  // A2 race: N /fund-eoa handlers for DISTINCT EOAs each read the SAME stale pre-drain treasury
+  // balance and, without a reservation, all pass the affordability check and send — collectively
+  // over-committing. The reservation ledger must let exactly one through when only one is affordable.
+  const EOA2 = ("0x" + "d2".repeat(20)) as `0x${string}`;
+  const s = stub({ eoaBalance: 0n, treasuryBalance: 3n * 10n ** 15n }); // 0.003 ETH: fits ONE 0.002 refill, not two
+  const { alerter, ids } = fakeAlerter();
+  try {
+    const svc = new SponsorService(cfg(), alerter);
+    const [a, b] = await Promise.all([
+      svc.topUpFloatEOA(1, RPC, EOA),
+      svc.topUpFloatEOA(1, RPC, EOA2),
+    ]);
+    expect([a, b].filter((r) => r.toppedUp).length).toEqual(1);        // exactly one refill went out
+    const deferred = [a, b].filter((r) => !r.toppedUp);
+    expect(deferred.length).toEqual(1);
+    expect(deferred[0]!.reason).toEqual("treasury_depleted");
+    expect(s.sends.length).toEqual(1);                                 // only ONE broadcast — floor preserved
+    expect(ids.some((id) => id.startsWith("float-topup-depleted"))).toBeTruthy();
   } finally { s.restore(); }
 });
 

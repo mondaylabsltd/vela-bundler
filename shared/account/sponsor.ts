@@ -131,9 +131,19 @@ const POOL_TOPUP_MAX_SENDS_PER_SWEEP = 3;
  *  the pool (or a mispriced float target) must not siphon the treasury dry. */
 const POOL_TOPUP_DAILY_MAX_WEI = 1_000_000_000_000_000_000n;
 
-/** Default float bounds — overridable via config.poolFloatMinWei/poolFloatTargetWei. */
+/** Default float bounds — overridable via config.poolFloatMinWei/poolFloatTargetWei. Used by the
+ *  PROACTIVE round-robin sweep (topUpPoolEOAs). The EVENT-DRIVEN refill (topUpFloatEOA) instead
+ *  sizes to the actual bounced-bundle gas (see FLOAT_REFILL_BUFFER_X) so a fixed target can't
+ *  over-provision a cheap L2 or under-provision a costly mainnet bundle. */
 const POOL_FLOAT_MIN_WEI_DEFAULT = 500_000_000_000_000n; // 0.0005 native
 const POOL_FLOAT_TARGET_WEI_DEFAULT = 2_000_000_000_000_000n; // 0.002 native
+
+/** Event-driven float refill buffer: fund this many of the bounced bundle's gas cost, so an
+ *  operator-controlled fronting/pool EOA is refilled to cover ~this many future bundles of that
+ *  size (not a treasury tx per bundle). The shortfall handed to topUpFloatEOA is the WHOLE
+ *  handleOps outer cost (all ops in a multi-sender bundle), so this already scales with bundle
+ *  size AND per-chain gas. Worst-case drain stays bounded by POOL_TOPUP_DAILY_MAX_WEI. */
+const FLOAT_REFILL_BUFFER_X = 15n;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -455,6 +465,16 @@ export class SponsorService {
       return { sponsored: false, dryRun: true, eligible: true };
     }
 
+    // Treasury-stuck guard (mirrors the top-up paths): if the treasury already has an
+    // unconfirmed tx (pending nonce > latest), a fresh grant auto-fetches the pending nonce and
+    // queues BEHIND the wedged tx — it never mines, the confirm wait below swallows the timeout,
+    // and we'd return sponsored:true against a still-EMPTY gas account (the wallet then proceeds
+    // as if funded). Defer with a retryable reason so the wallet re-asks once the jam clears
+    // (treasuryTxStuck itself alerts the operator after 5 min).
+    if (await this.treasuryTxStuck(client, chainId)) {
+      return { sponsored: false, reason: "treasury_tx_stuck" };
+    }
+
     // 7. Execute transfer from treasury
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     const account = privateKeyToAccount(treasuryPrivateKey);
@@ -594,6 +614,13 @@ export class SponsorService {
       return { sponsored: false, dryRun: true, eligible: true };
     }
 
+    // Treasury-stuck guard — see _doSponsor. sponsorTempoPathUsd waits for the receipt so a jam
+    // wouldn't fake success here, but the grant would still queue behind the wedged tx and time
+    // out; defer with a retryable reason instead.
+    if (await this.treasuryTxStuck(client, chainId)) {
+      return { sponsored: false, reason: "treasury_tx_stuck" };
+    }
+
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     console.log(
       `[Sponsor][Tempo] treasury → ${relayerAddress} (chain ${chainId}): ${amount} pathUSD units`,
@@ -620,15 +647,55 @@ export class SponsorService {
   // Pool relayer top-up (Stage 2 of docs/pool-queue-architecture.md)
   // ---------------------------------------------------------------------------
 
-  /** Pool EOAs with a top-up broadcast still presumed in flight: address → sent-at ms.
-   *  Skipped until this ages out — sweeps don't wait for confirmation, and re-reading a
-   *  not-yet-landed balance next sweep would double-fund the same EOA. */
+  /** DEDUP markers: address(lower) → expiresAt. Skips re-funding the same EOA until it expires —
+   *  a not-yet-landed balance re-read would otherwise double-fund it. The round-robin sweep uses a
+   *  long window; the EVENT-DRIVEN float refill a SHORT one so a re-drained fronting EOA is
+   *  refillable promptly. DISTINCT from the treasury reservation ledger below (different lifetime). */
   private readonly topUpInFlight = new Map<string, number>();
-  private static readonly TOPUP_INFLIGHT_TTL_MS = 10 * 60 * 1000;
+  /** Long dedup window for the round-robin pool sweep (no urgency — funds only to the static target). */
+  private static readonly SWEEP_INFLIGHT_TTL_MS = 10 * 60 * 1000;
+  /** Short dedup window for the event-driven float refill — enough for an L2 tx to mine, short
+   *  enough that a re-drained fronting EOA isn't locked out of its next refill for long. */
+  private static readonly FLOAT_INFLIGHT_TTL_MS = 90 * 1000;
+
+  /** SHORT-LIVED reservation ledger of committed-but-not-yet-reflected treasury outflow. The floor
+   *  guard subtracts the live sum from the (possibly stale) on-chain treasury balance so a burst of
+   *  concurrent /fund-eoa calls that all read the same pre-drain balance can't collectively drain
+   *  past TREASURY_FLOOR / the 24h ceiling. Each entry is a DISTINCT object (never keyed by EOA, so
+   *  concurrent same-EOA reserves can't overwrite/leak — the earlier bug) and self-expires quickly:
+   *  long enough to cover the concurrent-burst window, short enough that a LATER balance read (which
+   *  already reflects a mined send) doesn't double-count it. Released explicitly on send failure. */
+  private treasuryReservations: { wei: bigint; expiresAt: number }[] = [];
+  private static readonly RESERVATION_TTL_MS = 45_000;
 
   /** First time we observed an unconfirmed treasury tx (pending nonce > latest), or null. */
   private treasuryStuckSince: number | null = null;
   private static readonly TREASURY_STUCK_ALERT_MS = 5 * 60 * 1000;
+
+  /** Live reserved treasury outflow (prunes expired entries first). */
+  private reservedTreasuryWei(now: number): bigint {
+    this.treasuryReservations = this.treasuryReservations.filter((r) => r.expiresAt > now && r.wei > 0n);
+    let sum = 0n;
+    for (const r of this.treasuryReservations) sum += r.wei;
+    return sum;
+  }
+
+  /** Reserve `wei` of treasury outflow (short-lived). MUST be called with NO await between the
+   *  floor/budget check and this call so the check-and-reserve is atomic against concurrent callers.
+   *  Returns a release handle to call on a send failure (the outflow never happened). */
+  private reserveTreasury(wei: bigint, now: number): { release: () => void } {
+    const entry = { wei, expiresAt: now + SponsorService.RESERVATION_TTL_MS };
+    this.treasuryReservations.push(entry);
+    return { release: () => { entry.wei = 0n; entry.expiresAt = 0; } };
+  }
+
+  /** Set / clear the per-EOA dedup marker (does NOT touch the reservation ledger). */
+  private markInFlight(key: string, ttlMs: number): void {
+    this.topUpInFlight.set(key, Date.now() + ttlMs);
+  }
+  private clearInFlight(key: string): void {
+    this.topUpInFlight.delete(key);
+  }
 
   /**
    * Defer top-ups while the treasury has an unconfirmed tx. A tx wedged below the
@@ -725,9 +792,9 @@ export class SponsorService {
       this.topUpBudget = { windowStart: now, totalWei: 0n };
     }
 
-    // Age out stale in-flight markers.
-    for (const [addr, at] of this.topUpInFlight) {
-      if (now - at > SponsorService.TOPUP_INFLIGHT_TTL_MS) this.topUpInFlight.delete(addr);
+    // Age out expired in-flight markers (releasing their treasury reservations).
+    for (const [addr, expiresAt] of this.topUpInFlight) {
+      if (now > expiresAt) this.topUpInFlight.delete(addr);
     }
 
     // Round-robin balance scan.
@@ -780,19 +847,25 @@ export class SponsorService {
     const walletClient = createWalletClient({ account, transport: http(rpcUrl) });
 
     let toppedUp = 0;
-    let projectedSpend = 0n;
     for (const { address, balance } of low.slice(0, POOL_TOPUP_MAX_SENDS_PER_SWEEP)) {
+      const key = address.toLowerCase();
+      // A concurrent /fund-eoa may have marked this EOA in flight between our scan and here —
+      // re-check so we don't double-fund it (and double-charge the 24h budget).
+      if (this.topUpInFlight.has(key)) continue;
       const amount = targetWei - balance;
       if (amount <= 0n) continue;
 
       const transferGas = await this.estimateTransferGas(client, address, amount);
-      // Hard bounds: never breach the treasury floor and never exceed the 24h ceiling.
       const gasCost = transferGas * maxFee;
-      if (treasuryBalance - projectedSpend < TREASURY_FLOOR + amount + gasCost) {
+      // Hard bounds: never breach the treasury floor and never exceed the 24h ceiling. Subtract
+      // ALL in-flight reservations (this sweep's prior sends + any concurrent float refills) from
+      // the freshly-read balance; the check-and-reserve below is atomic (no await in between).
+      const available = treasuryBalance - this.reservedTreasuryWei(now);
+      if (available < TREASURY_FLOOR + amount + gasCost) {
         await this.alerter.send(
           `pool-topup-depleted-${chainId}`,
           `💸 Vela Bundler — treasury too low for pool top-up on chain ${chainId}.\n` +
-            `balance ${treasuryBalance - projectedSpend} wei, needs ${TREASURY_FLOOR + amount + gasCost} wei ` +
+            `balance ${available > 0n ? available : 0n} wei (after in-flight reservations), needs ${TREASURY_FLOOR + amount + gasCost} wei ` +
             `(pool EOA ${address} at ${balance} < ${minWei}).\nPool float refill is failing closed — top up the treasury.`,
         );
         break;
@@ -803,8 +876,8 @@ export class SponsorService {
       }
 
       this.topUpBudget.totalWei += amount;
-      projectedSpend += amount + gasCost;
-      this.topUpInFlight.set(address.toLowerCase(), Date.now());
+      this.markInFlight(key, SponsorService.SWEEP_INFLIGHT_TTL_MS);
+      const reservation = this.reserveTreasury(amount + gasCost, now);
       try {
         const txHash = await this.runTreasuryExclusive(() => walletClient.sendTransaction({
           to: address,
@@ -819,7 +892,8 @@ export class SponsorService {
         console.log(`[PoolTopUp] treasury → ${address} (chain ${chainId}): ${amount} wei (${txHash})`);
       } catch (err) {
         this.topUpBudget.totalWei = this.topUpBudget.totalWei > amount ? this.topUpBudget.totalWei - amount : 0n;
-        this.topUpInFlight.delete(address.toLowerCase());
+        reservation.release();
+        this.clearInFlight(key);
         console.error(`[PoolTopUp] transfer to ${address} failed on chain ${chainId}: ${redactError(err)}`);
         // The money-moving step failing must reach the operator — the healthLoop only
         // sees thrown exceptions, and this loop deliberately doesn't throw per-transfer.
@@ -856,11 +930,11 @@ export class SponsorService {
   ): Promise<{ toppedUp: boolean; reason?: string }> {
     const key = eoaAddress.toLowerCase();
     const now = Date.now();
-    const inFlightAt = this.topUpInFlight.get(key);
-    if (inFlightAt !== undefined && now - inFlightAt <= SponsorService.TOPUP_INFLIGHT_TTL_MS) {
+    const inFlightUntil = this.topUpInFlight.get(key);
+    if (inFlightUntil !== undefined && now <= inFlightUntil) {
       return { toppedUp: false, reason: "in_flight" };
     }
-    this.topUpInFlight.delete(key);
+    this.clearInFlight(key); // expired (or absent) marker
 
     // Tempo: the fronting float is pathUSD, not native — refill it with a treasury
     // pathUSD transfer (0x76 envelope pays its own gas in pathUSD). This is what lets
@@ -874,12 +948,15 @@ export class SponsorService {
       this.topUpBudget = { windowStart: now, totalWei: 0n };
     }
 
-    // Target the LARGER of the static float target and the actual bounced prefund ×1.5, so a
-    // pool bundle needing many× the static target is refilled enough to clear on the next pass
-    // instead of bouncing forever while the refill reports "already_funded".
+    // Size the refill to the ACTUAL gas the bounced bundle needs (shortfallWei = the WHOLE
+    // handleOps outer cost, so a multi-op bundle is fully covered), × a buffer to cover a few
+    // future bundles. The fronting/pool EOAs are OPERATOR-controlled, so we fund them to exactly
+    // what the work requires, scaling per chain — NOT a fixed 0.002 target (which was ~175 txs on
+    // Arbitrum and made a well-funded treasury look "depleted"). No shortfall hint (the proactive
+    // sweep, or a legacy caller) → fall back to the configured static target.
     const staticTarget = this.config.poolFloatTargetWei ?? POOL_FLOAT_TARGET_WEI_DEFAULT;
-    const targetWei = shortfallWei !== undefined && (shortfallWei * 3n) / 2n > staticTarget
-      ? (shortfallWei * 3n) / 2n
+    const targetWei = shortfallWei !== undefined && shortfallWei > 0n
+      ? shortfallWei * FLOAT_REFILL_BUFFER_X
       : staticTarget;
     const client = getPublicClient(rpcUrl);
 
@@ -905,11 +982,25 @@ export class SponsorService {
     const gasCost = transferGas * maxFee;
 
     const treasuryBalance = await client.getBalance({ address: this.config.treasuryAddress });
-    if (treasuryBalance < TREASURY_FLOOR + amount + gasCost) {
+
+    // Derive the treasury account BEFORE the guard so NO await sits between the check and the
+    // reservation (the derivation is pure/cheap; a rare wasted derive on a depleted return is fine).
+    const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
+    const account = privateKeyToAccount(treasuryPrivateKey);
+    const walletClient = createWalletClient({ account, transport: http(rpcUrl) });
+
+    // --- atomic check-and-reserve (NO await between the guard and the reservation) ---
+    // Keeping the OPERATOR-controlled fronting EOA funded IS the service — a running bundler that
+    // can't onboard beats a bundler that can't run — so this refill is NOT gated by the
+    // sponsorship TREASURY_FLOOR (that reserve is for NEW-user grants in _doSponsor). Gate only on
+    // "can the treasury afford THIS send" (minus live reservations, so a concurrent /fund-eoa burst
+    // still can't over-commit) and the 24h ceiling, which is the sole hard bound on drain.
+    const available = treasuryBalance - this.reservedTreasuryWei(now);
+    if (available < amount + gasCost) {
       await this.alerter.send(
         `float-topup-depleted-${chainId}`,
-        `💸 Vela Bundler — treasury too low to refill fronting EOA on chain ${chainId}.\n` +
-          `balance ${treasuryBalance} wei, needs ${TREASURY_FLOOR + amount + gasCost} wei ` +
+        `💸 Vela Bundler — treasury can't afford to refill the fronting EOA on chain ${chainId}.\n` +
+          `balance ${available > 0n ? available : 0n} wei (after in-flight reservations), needs ${amount + gasCost} wei ` +
           `(EOA ${eoaAddress} at ${balance}).\nIn-band submits are deferring — top up the treasury ` +
           `(or ask a user to bootstrap it via /v1/treasury/${chainId}).`,
       );
@@ -920,12 +1011,10 @@ export class SponsorService {
       return { toppedUp: false, reason: "budget_exhausted" };
     }
 
-    const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
-    const account = privateKeyToAccount(treasuryPrivateKey);
-    const walletClient = createWalletClient({ account, transport: http(rpcUrl) });
-
     this.topUpBudget.totalWei += amount;
-    this.topUpInFlight.set(key, Date.now());
+    this.markInFlight(key, SponsorService.FLOAT_INFLIGHT_TTL_MS);
+    const reservation = this.reserveTreasury(amount + gasCost, now);
+    // --- end atomic block ---
     try {
       const txHash = await this.runTreasuryExclusive(() => walletClient.sendTransaction({
         to: eoaAddress,
@@ -940,7 +1029,8 @@ export class SponsorService {
       return { toppedUp: true };
     } catch (err) {
       this.topUpBudget.totalWei = this.topUpBudget.totalWei > amount ? this.topUpBudget.totalWei - amount : 0n;
-      this.topUpInFlight.delete(key);
+      reservation.release();
+      this.clearInFlight(key);
       console.error(`[FloatTopUp] transfer to ${eoaAddress} failed on chain ${chainId}: ${redactError(err)}`);
       await this.alerter.send(
         `float-topup-failed-${chainId}`,
@@ -1001,7 +1091,9 @@ export class SponsorService {
 
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     this.topUpBudgetPathUsd.totalUnits += amount;
-    this.topUpInFlight.set(key, now);
+    // Tempo drains pathUSD (bounded by topUpBudgetPathUsd), NOT native — so only the dedup marker
+    // matters here; it must not touch the native reservation ledger.
+    this.markInFlight(key, SponsorService.FLOAT_INFLIGHT_TTL_MS);
     try {
       await this.runTreasuryExclusive(() => sponsorTempoPathUsd({
         chainId,
@@ -1011,14 +1103,14 @@ export class SponsorService {
         amount,
       }));
       // sendTransactionSync waited for the receipt — the balance is live now.
-      this.topUpInFlight.delete(key);
+      this.clearInFlight(key);
       console.log(`[FloatTopUp][Tempo] treasury → ${eoaAddress} (chain ${chainId}): ${amount} pathUSD units`);
       return { toppedUp: true };
     } catch (err) {
       this.topUpBudgetPathUsd.totalUnits = this.topUpBudgetPathUsd.totalUnits > amount
         ? this.topUpBudgetPathUsd.totalUnits - amount
         : 0n;
-      this.topUpInFlight.delete(key);
+      this.clearInFlight(key);
       console.error(`[FloatTopUp][Tempo] transfer to ${eoaAddress} failed on chain ${chainId}: ${redactError(err)}`);
       await this.alerter.send(
         `float-topup-failed-${chainId}`,

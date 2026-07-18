@@ -44,6 +44,8 @@ interface StubOpts {
   indexStatus?: number;
   /** JSON-RPC error message for eth_sendRawTransaction (simulates a failing transfer). */
   sendRawError?: string;
+  /** Simulate a wedged treasury tx: pending nonce > latest (jams all treasury sends). */
+  treasuryStuck?: boolean;
 }
 
 interface StubLog {
@@ -62,9 +64,11 @@ function stubFetch(opts: StubOpts): { log: StubLog; restore: () => void } {
       case "eth_chainId": return "0x1";
       case "eth_getTransactionCount": {
         const addr = String((params as string[])[0]).toLowerCase();
-        return addr === RELAYER.toLowerCase()
-          ? "0x" + (opts.relayerNonce ?? 0).toString(16)
-          : "0x0";
+        const tag = (params as string[])[1];
+        if (addr === RELAYER.toLowerCase()) return "0x" + (opts.relayerNonce ?? 0).toString(16);
+        // Treasury nonce: treasuryStuck makes pending (1) > latest (0) — a wedged tx.
+        if (addr === TREASURY.toLowerCase() && opts.treasuryStuck) return tag === "pending" ? "0x1" : "0x0";
+        return "0x0";
       }
       case "eth_getBalance": {
         const addr = String((params as string[])[0]).toLowerCase();
@@ -193,6 +197,19 @@ it("gate: relayer nonce past the new-user window denies, and the denial is cache
     const second = await svc.sponsor(1, SAFE_A, RELAYER, RPC);
     expect(second.reason).toEqual("nonce_exceeded");
     expect(log.rpcMethods.length).toEqual(callsAfterFirst); // served from denial cache
+  } finally { restore(); }
+});
+
+it("gate: a wedged treasury tx (pending > latest) defers the grant instead of falsely reporting success", async () => {
+  // Without the guard, viem auto-fetches the pending nonce and the grant queues BEHIND the
+  // wedged tx: it never mines, the 15s confirm wait swallows the timeout, and the method returns
+  // sponsored:true against a still-empty gas account — the wallet then proceeds as if funded.
+  const { log, restore } = stubFetch({ balances: eligibleBalances(), treasuryStuck: true });
+  try {
+    const svc = new SponsorService(config(), fakeAlerter().alerter);
+    const result = await svc.sponsor(1, SAFE_A, RELAYER, RPC);
+    expect(result).toEqual({ sponsored: false, reason: "treasury_tx_stuck" });
+    expect(log.rawTxCount).toEqual(0); // NOTHING was broadcast behind the wedged tx
   } finally { restore(); }
 });
 
