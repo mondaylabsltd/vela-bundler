@@ -10,13 +10,20 @@ Runs on **Cloudflare Workers** (Durable Objects, edge).
 
 ```bash
 npm install
-npx wrangler secret put OPERATOR_SECRET     # 32+ byte hex secret for key derivation
-npx wrangler secret put ALCHEMY_API_KEY     # optional
-npm run deploy
-npx wrangler dev -c wrangler.dev.jsonc
+
+# secrets (encrypted store; also settable in .dev.vars for local dev)
+npx wrangler secret put OPERATOR_SECRET     # required — 32+ byte hex, derives every EOA + treasury
+npx wrangler secret put ALCHEMY_API_KEY     # recommended — preferred (paid) RPC
+npx wrangler secret put TELEGRAM_BOT_TOKEN  # set both in prod — operator alerts
+npx wrangler secret put TELEGRAM_CHAT_ID
+
+npm run dev                                 # local dev → wrangler.jsonc (the production shape)
+npm run deploy                              # deploy → see the queue prerequisite under Deployment
 ```
 
 Any EVM chain is supported automatically — the first request for a chain creates its Durable Object.
+
+**Two local configs:** `npm run dev` uses `wrangler.jsonc` (exactly what production runs). `npx wrangler dev -c wrangler.dev.jsonc` forces pool+queue on with a fully miniflare-emulated queue/KV — use it to exercise the Stage-3/4 transport in isolation.
 
 ## How It Works
 
@@ -118,9 +125,20 @@ npm run test:worker        # worker/ runtime tests only (vitest + miniflare)
 **Secrets** (set via `npx wrangler secret put`):
 
 - `OPERATOR_SECRET` — required
-- `ALCHEMY_API_KEY` — optional, for preferred RPCs
+- `ALCHEMY_API_KEY` — recommended, for preferred RPCs
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — set both in production for operator alerts
 
-**How it works**: Each chain gets its own Durable Object instance (`BundlerDO`), created on first request. The DO encapsulates mempool, EOA locks, reputation, and auto-bundling via alarms (replaces `setInterval`). Requests are routed by `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. DO alarms persist across eviction, every activated chain self-registers with a `chain-registry` DO, and a 5-minute cron probes each registered chain (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains (e.g. one-off testnets someone activated via `X-Rpc-Url`) stop their own alarm after ~5 minutes and wake instantly on the next accepted op.
+**Deploy prerequisite (queue transport):** when `QUEUE_TRANSPORT_ENABLED` covers any chain, the queues must exist remotely before `wrangler deploy` (local `wrangler dev` auto-creates them via miniflare):
+
+```bash
+wrangler queues create vela-userops
+wrangler queues create vela-userops-dlq
+# USEROP_STATUS KV: the id in wrangler.jsonc must exist — `wrangler kv namespace list`
+```
+
+Also ensure each active chain's **treasury holds native ETH** — the pool EOAs front gas and refill from it.
+
+**How it works**: Each chain gets a `BundlerDO` (created on first request) holding its mempool, EOA locks, reputation, and alarm-driven auto-bundling. Requests route `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. In **queue mode** ingress instead enqueues to `USEROP_QUEUE`; the consumer routes `hash(sender)%100` to a per-index `RelayerDO`, each pinned to one pool EOA (its input gate is that EOA's lock). DO alarms persist across eviction; every activated chain self-registers with a `chain-registry` DO, and a 5-minute cron probes each registered chain **and each stranded RelayerDO** (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains stop their alarm after ~5 minutes and wake instantly on the next accepted op.
 
 ## Key Derivation
 
@@ -144,6 +162,8 @@ Treasury address is also derived from `operatorSecret` (same on all chains).
 | 2        | Alchemy RPC        | If`ALCHEMY_API_KEY` set + chain supported |
 | 3        | Chain registry     | Public RPCs, health-checked               |
 
+For **gas-price reads**, when the primary is the paid managed (Alchemy) RPC it is the *sole* authority — no public-RPC fallback (they can be flaky or return a different price the user then signs). Public fallback applies only when the primary is itself a public/user-supplied RPC. State-override simulation likewise stays on the managed RPC.
+
 ## API
 
 ### JSON-RPC: `POST /:chainId`
@@ -163,12 +183,24 @@ All methods support `X-Rpc-Url` header. Batch requests capped at 20.
 ### REST API
 
 
-| Endpoint                            | Method | Description                           |
-| ------------------------------------- | -------- | --------------------------------------- |
-| `/v1/account/:chainId/:safeAddress` | GET    | Account info (balance, nonce, status) |
-| `/v1/treasury`                      | GET    | Treasury address                      |
-| `/v1/sponsor/:chainId/:safeAddress` | POST   | Request gas sponsorship               |
-| `/health`                           | GET    | Service health + stats                |
+| Endpoint                            | Method | Description                                          |
+| ------------------------------------- | -------- | ----------------------------------------------------- |
+| `/v1/account/:chainId/:safeAddress` | GET    | Account info (fronting EOA, balance, nonce, status)  |
+| `/v1/treasury`                      | GET    | Treasury address                                     |
+| `/v1/treasury/:chainId`             | GET    | Per-chain treasury balance + `bootstrapNeeded`       |
+| `/v1/splitter`                      | GET    | Settlement splitter address + derivation inputs      |
+| `/v1/sponsor/:chainId/:safeAddress` | POST   | Request gas sponsorship (new-user grant)             |
+| `/health` · `/health/:chainId`      | GET    | Global (minimal) · per-chain degraded state          |
+
+### Observability
+
+| Endpoint                        | Method | Description                                                        |
+| --------------------------------- | -------- | ------------------------------------------------------------------- |
+| `/debug`                        | GET    | Single-page UserOp inspector UI (enter chainId + hash)             |
+| `/v1/debug/:chainId/:hash`      | GET    | Per-op lifecycle: stage, storage, fronting EOA + its gas balance, submit RPC, KV marker, chain health |
+| `/v1/pool/:chainId`             | GET    | Treasury + all 100 pool EOAs' native balances (one Multicall3 read) |
+
+Open **`/debug`** to watch an op move through Ingress → Mempool → In-flight → Terminal, see **which EOA pays the gas and whether it can**, the submission RPC, and a per-chain **fleet-balances grid** (treasury + 100 pool EOAs, 🔴 empty · 🟡 low · 🟢 ok). Every money-stuck condition also fires a de-duplicated **Telegram alert**.
 
 ### Health Endpoint
 
@@ -198,10 +230,17 @@ force a chain init.
 
 Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 
+**Transport & settlement flags** take a per-chain spec: `""` / `false` = off, `all` / `true` = every chain, or a chainId CSV like `1,42161`. Rollback/canary is instant — narrow the spec and redeploy, no code change.
 
 | Variable                                  | Default                                      | Description                                                                                                                                                                                                                       |
 | ------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `OPERATOR_SECRET`                         | —                                           | **Required.** 32+ byte hex secret                                                                                                                                                                                                 |
+| `INBAND_ENABLED`                          | `all`                                        | In-band gas settlement (EOA fronts gas, repaid in-band) — per-chain spec                                                                                                                                                          |
+| `SETTLEMENT_VAULT_ENABLED`                | `all`                                        | Vault mode: reimbursement + beneficiary → treasury, EOA float refilled from it — per-chain spec                                                                                                                                   |
+| `POOL_EOA_ENABLED`                        | `""` (off)                                   | Stage 3: bundle from the 100-EOA shared pool instead of per-safe EOAs — per-chain spec                                                                                                                                            |
+| `QUEUE_TRANSPORT_ENABLED`                 | `""` (off)                                   | Stage 4: route ingress via the Cloudflare Queue to per-index RelayerDOs — per-chain spec (requires pool)                                                                                                                          |
+| `POOL_FLOAT_MIN_WEI`                      | `500000000000000` (0.0005)                   | Round-robin sweep: refill a pool EOA when below this                                                                                                                                                                              |
+| `POOL_FLOAT_TARGET_WEI`                   | `2000000000000000` (0.002)                   | Round-robin sweep target (the event-driven refill instead sizes to the bounced bundle's gas)                                                                                                                                      |
 | `ENTRY_POINT_ADDRESS`                     | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7                                                                                                                                                                                                                   |
 | `BUNDLING_MODE`                           | `auto`                                       | `auto` or `manual`                                                                                                                                                                                                                |
 | `MAX_BUNDLE_SIZE`                         | `10`                                         | Max UserOps per bundle                                                                                                                                                                                                            |
@@ -225,7 +264,8 @@ Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 ## Known Limitations
 
 - **No external database** — money-path state persists in Durable Object storage and survives eviction; ephemeral caches (reputation decay, circuit-breaker state) reset on cold start.
-- **One Durable Object per chain** — each chain's throughput is bounded by its single DO (auto-bundling serialized per chain by design; the fund-custody EOA locking requires it).
+- **Throughput** — in per-safe mode a chain is bounded by its single `BundlerDO` (serialized by design). In **pool+queue mode** the 100 per-index `RelayerDO`s parallelize a chain, each its own serialization point.
+- **Native/stablecoin float imbalance** — the operator fronts native gas but is repaid in the fee token; on a native-gas chain paid in a stablecoin the treasury's native balance only drains, so it needs periodic top-ups (or a stablecoin→native swap).
 - **No opcode tracing** — ERC-7562 not implemented.
 - **No aggregator support.**
 - **Conservative restart** — unknown pending nonce locks the EOA until the alarm health loop recovers it.
