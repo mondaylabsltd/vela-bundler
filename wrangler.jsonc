@@ -36,31 +36,43 @@
   ],
 
   // --- Pool/queue rework bindings (docs/pool-queue-architecture.md) ---
-  // The RELAYER Durable Object above is LIVE. The queue producer/consumer + KV below stay
-  // commented until QUEUE_TRANSPORT_ENABLED (Stage 4): wrangler refuses to deploy a
-  // producer/consumer for a queue that doesn't exist yet, and the producer/consumer degrade
-  // gracefully (mempool fallback) while USEROP_QUEUE is unbound.
-  // To activate:
+  // The RELAYER Durable Object above and the queue producer/consumer + KV below are LIVE (bound).
+  // NOTE they stay INERT at runtime until QUEUE_TRANSPORT_ENABLED is set for a chain: with it unset
+  // the producer hook never enqueues and everything degrades to the in-DO mempool path — so binding
+  // them is safe. PREREQUISITE for `wrangler deploy`: the queues must already exist remotely, else
+  // deploy fails (local `wrangler dev` auto-creates them via miniflare). Create once with:
   //   wrangler queues create vela-userops
   //   wrangler queues create vela-userops-dlq
-  //   wrangler kv namespace create USEROP_STATUS   (put the id below)
-  // then uncomment:
-  //
-  // "queues": {
-  //   "producers": [
-  //     { "binding": "USEROP_QUEUE", "queue": "vela-userops" }
-  //   ],
-  //   "consumers": [
-  //     {
-  //       "queue": "vela-userops",
-  //       "max_retries": 3,
-  //       "dead_letter_queue": "vela-userops-dlq"
-  //     }
-  //   ]
-  // },
-  // "kv_namespaces": [
-  //   { "binding": "USEROP_STATUS", "id": "<created-namespace-id>" }
-  // ],
+  //   wrangler kv namespace create USEROP_STATUS   (id already filled in below)
+  "queues": {
+    "producers": [
+      { "binding": "USEROP_QUEUE", "queue": "vela-userops" }
+    ],
+    "consumers": [
+      {
+        "queue": "vela-userops",
+        // Batch window: hold up to 10 ops / 2s so same-pool-index ops assemble into ONE handleOps
+        // (pinned explicitly rather than relying on the CF default, which is not deterministic
+        // across versions). Keep it short — this is a latency-sensitive 5-minute-window product.
+        "max_batch_size": 10,
+        "max_batch_timeout": 2,
+        "max_retries": 3,
+        "dead_letter_queue": "vela-userops-dlq"
+      },
+      {
+        // Dead-letter consumer (B5): ops that exhausted delivery retries. handleDeadLetterBatch
+        // writes a terminal 'failed' receipt (so the wallet stops polling null) + alerts, then
+        // acks. NO dead_letter_queue here — a DLQ must never dead-letter into itself.
+        "queue": "vela-userops-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 1
+      }
+    ]
+  },
+  "kv_namespaces": [
+    { "binding": "USEROP_STATUS", "id": "c39d877fcae0464c9ac0924e1f91a4f2" }
+  ],
 
   // Liveness cron (dead-man switch, external layer): probes each ACTIVE_CHAINS DO every
   // 5 minutes and re-arms (+ alerts) a broken alarm chain. DO alarms self-sustain in normal

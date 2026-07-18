@@ -32,9 +32,9 @@ import { packUserOp } from "../shared/userop/pack.ts";
 import { getUserOpHash } from "../shared/userop/hash.ts";
 import { userOpToRpc } from "../shared/userop/normalize.ts";
 import { relayerIndexForSender, RELAYER_POOL_SIZE } from "../shared/queue/routing.ts";
-import { relayerSubmit } from "../worker/relayer-do.ts";
+import { relayerSubmit, fundingUnderway } from "../worker/relayer-do.ts";
 import { makeEnqueueHook } from "../worker/producer.ts";
-import workerEntry from "../worker/index.ts";
+import workerEntry, { deadLetterFailedMarker, handleDeadLetterBatch } from "../worker/index.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import type { Simulator } from "../shared/simulation/index.ts";
 import type { AccountService } from "../shared/account/index.ts";
@@ -308,6 +308,42 @@ it("producer - USEROP_QUEUE unbound: falls back to mempool.add, no throw", async
   expect(mempool.size).toEqual(1);
 });
 
+it("B2: a CHAIN DO (no fixedPoolIndex) in queue mode bundles fallback ops via the per-safe path, never leasing a shared pool EOA", async () => {
+  // When the queue producer is unbound at runtime, acceptUserOp falls back to the chain DO's own
+  // mempool. Its alarm must NOT pool-bundle those ops — leaseFreePoolEOA would sign with a pool
+  // EOA that a RelayerDO also owns (independent nonce/lock isolates → same-nonce/AA25 collision).
+  // The single-owner-per-EOA invariant requires the chain DO route them to the per-safe path.
+  const acct = poolAccountService();
+  const mempool = newMempool();
+  mempool.add(makeInBandOp(SAFE_A, 1n)); // a fallback op sitting in the chain DO mempool
+  const svc = new BundlerService(poolConfig(), mempool, poolSimulator(), acct, { disableTimers: true }); // NO fixedPoolIndex = chain DO
+  stubPublicClient(svc, { nonce: 7 });
+  const sentRaw: string[] = [];
+  const restore = stubBroadcastFetch(sentRaw);
+  try {
+    await svc.tryBundle();
+  } finally { restore(); }
+  expect(acct.calls.lease, "chain DO must NOT lease a shared pool EOA in queue mode").toEqual(0);
+  expect(acct.calls.getPoolEOA, "chain DO must NOT pin a pool EOA either").toEqual([]);
+  expect(acct.calls.deriveEOA, "fallback op bundled via its per-safe dedicated EOA").toContain(SAFE_A.toLowerCase());
+});
+
+it("B2 contrast: a RelayerDO (fixedPoolIndex set) still bundles with its OWN pinned pool EOA", async () => {
+  const acct = poolAccountService();
+  const mempool = newMempool();
+  mempool.add(makeInBandOp(SAFE_A, 1n));
+  const svc = new BundlerService(poolConfig(), mempool, poolSimulator(), acct, { disableTimers: true, fixedPoolIndex: 3 });
+  stubPublicClient(svc, { nonce: 7 });
+  const sentRaw: string[] = [];
+  const restore = stubBroadcastFetch(sentRaw);
+  try {
+    await svc.tryBundle();
+  } finally { restore(); }
+  expect(acct.calls.getPoolEOA, "RelayerDO pins its own pool EOA #3").toContain(3);
+  expect(acct.calls.lease, "RelayerDO never leases a free pool EOA").toEqual(0);
+  expect(acct.calls.deriveEOA, "RelayerDO does not use the per-safe path").toEqual([]);
+});
+
 it("producer - flag off: enqueue hook never called even when wired", async () => {
   const acct = poolAccountService();
   const mempool = newMempool();
@@ -347,7 +383,9 @@ function fakeRelayerEnv(status: number) {
         fetch: async (_url: string, init: { body: string }) => {
           const body = JSON.parse(init.body) as { ops: UserOpQueueMessage[] };
           posts.push({ name: id.name, ops: body.ops });
-          return new Response(JSON.stringify({ accepted: [] }), { status });
+          // Echo every delivered hash as accepted (relayerSubmit's handled-everything case).
+          const accepted = body.ops.map((o) => o.userOpHash);
+          return new Response(JSON.stringify({ accepted }), { status });
         },
       }),
     },
@@ -395,6 +433,93 @@ it("consumer - same (chain,sender) ops collapse into ONE group / one POST", asyn
   expect(posts.length, "one POST for the single (chain,index) group").toEqual(1);
   expect(posts[0]!.ops.length).toEqual(2);
   expect(m1.acked && m2.acked).toEqual(true);
+});
+
+it("consumer - a hash LEFT OUT of `accepted` (transient mempool-full) is retried, the rest acked (B3)", async () => {
+  // relayerSubmit omits a transient mempool-full op from `accepted` so it is redelivered instead
+  // of killed with a terminal receipt. The consumer must ack only the accepted hashes.
+  const posts: Array<{ ops: UserOpQueueMessage[] }> = [];
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+  const m2 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 2n), 1)); // same (chain,index) group
+  const acceptOnly = m1.body.userOpHash; // m2 is the "mempool full" op → left out
+  const env = {
+    RELAYER: {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({
+        fetch: async (_url: string, init: { body: string }) => {
+          const body = JSON.parse(init.body) as { ops: UserOpQueueMessage[] };
+          posts.push({ ops: body.ops });
+          return new Response(JSON.stringify({ accepted: [acceptOnly] }), { status: 200 });
+        },
+      }),
+    },
+  } as any;
+
+  await (workerEntry as any).queue({ messages: [m1, m2] } as any, env, {} as any);
+
+  expect(m1.acked, "accepted op is acked").toEqual(true);
+  expect(m1.retried).toEqual(false);
+  expect(m2.acked, "mempool-full op is NOT acked").toEqual(false);
+  expect(m2.retried, "mempool-full op is retried for redelivery").toEqual(true);
+});
+
+it("fundingUnderway (B4) - fast-retry only when funding is progressing, back off on non-actionable reasons", () => {
+  // Fast-retry (~4s): a send went out / is in flight / the EOA is already funded.
+  expect(fundingUnderway(true, { toppedUp: true })).toEqual(true);
+  expect(fundingUnderway(true, { toppedUp: false, reason: "in_flight" })).toEqual(true);
+  expect(fundingUnderway(true, { toppedUp: false, reason: "already_funded" })).toEqual(true);
+  // Back off (normal cadence): hammering these every 4s only loads an unhealthy endpoint.
+  expect(fundingUnderway(true, { toppedUp: false, reason: "treasury_depleted" })).toEqual(false);
+  expect(fundingUnderway(true, { toppedUp: false, reason: "treasury_tx_stuck" })).toEqual(false);
+  expect(fundingUnderway(true, { toppedUp: false, reason: "budget_exhausted" })).toEqual(false);
+  expect(fundingUnderway(false, { toppedUp: true })).toEqual(false); // non-2xx → back off regardless
+  expect(fundingUnderway(true, null)).toEqual(false);                // unparseable → back off
+});
+
+it("DLQ (B5) - deadLetterFailedMarker builds a resolvable terminal failed receipt", () => {
+  const msg = { chainId: 1, userOpHash: ("0x" + "ab".repeat(32)) as `0x${string}`, rpcUserOp: { sender: SAFE_A, nonce: "0x5" }, prefund: "0" } as UserOpQueueMessage;
+  const parsed = JSON.parse(deadLetterFailedMarker(msg)) as { status: string; receipt: { userOpHash: string; success: boolean; sender: string; nonce: string } };
+  expect(parsed.status).toEqual("failed");
+  expect(parsed.receipt.success).toEqual(false);       // wallet reads success=false → "failed, resubmit"
+  expect(parsed.receipt.userOpHash).toEqual(msg.userOpHash);
+  expect(parsed.receipt.sender.toLowerCase()).toEqual(SAFE_A.toLowerCase());
+  expect(parsed.receipt.nonce).toEqual("0x5");
+});
+
+it("DLQ (B5) - handleDeadLetterBatch writes the failed receipt to KV and ACKs every dead op", async () => {
+  const kv = new Map<string, string>();
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+  const m2 = fakeMsg(msgFor(makeInBandOp(SAFE_B, 1n), 1));
+  const env = {
+    USEROP_STATUS: { put: async (k: string, v: string) => { kv.set(k, v); } },
+    TELEGRAM_BOT_TOKEN: "", TELEGRAM_CHAT_ID: "",
+  } as any;
+  const batch = { queue: "vela-userops-dlq", messages: [m1, m2] } as any;
+
+  await handleDeadLetterBatch(batch, env);
+
+  // Both wallets can now resolve their poll to a terminal 'failed' instead of null forever.
+  for (const m of [m1, m2]) {
+    const stored = kv.get(String(m.body.userOpHash));
+    expect(stored, "terminal receipt written to USEROP_STATUS").toBeDefined();
+    expect(JSON.parse(stored!).status).toEqual("failed");
+    expect(m.acked, "dead op is acked (never loops the DLQ)").toEqual(true);
+  }
+});
+
+it("DLQ (B5) - queue() routes a *-dlq batch to the dead-letter handler (terminal receipt, not re-submit)", async () => {
+  const kv = new Map<string, string>();
+  const posts: unknown[] = [];
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+  const env = {
+    USEROP_STATUS: { put: async (k: string, v: string) => { kv.set(k, v); } },
+    RELAYER: { idFromName: () => ({ name: "x" }), get: () => ({ fetch: async () => { posts.push(1); return new Response("{}"); } }) },
+    TELEGRAM_BOT_TOKEN: "", TELEGRAM_CHAT_ID: "",
+  } as any;
+  await (workerEntry as any).queue({ queue: "vela-userops-dlq", messages: [m1] } as any, env, {} as any);
+  expect(posts.length, "DLQ batch must NOT be re-submitted to a RelayerDO").toEqual(0);
+  expect(kv.get(String(m1.body.userOpHash)), "DLQ batch writes a terminal receipt").toBeDefined();
+  expect(m1.acked).toEqual(true);
 });
 
 it("consumer - non-2xx from a RelayerDO retries the whole group (no ack)", async () => {
@@ -552,4 +677,26 @@ it("relayerSubmit - a mempool-rejected op gets a TERMINAL failed receipt (wallet
   const rcptB = svc.getReceipt(hashOf(opB));
   expect(rcptB, "rejected op has a terminal receipt").toBeDefined();
   expect(rcptB?.success).toEqual(false);
+});
+
+it("relayerSubmit - a TRANSIENT mempool-full op is left OUT of `accepted` (retried), NO terminal receipt (B3)", async () => {
+  const acct = poolAccountService();
+  // Capacity-1 mempool: the first op fills it; the next (DIFFERENT sender) hits "Mempool is full".
+  const mempool = new Mempool({ entryPointAddress: ENTRY_POINT, chainId: 1, maxMempoolSize: 1, stakedSenderMaxOps: 4 });
+  const svc = new BundlerService(poolConfig(), mempool, poolSimulator(), acct, { disableTimers: true, fixedPoolIndex: 0 });
+  stubPublicClient(svc, { nonce: 7 });
+  const seen = new Set<string>();
+  mempool.add(makeInBandOp(SAFE_A, 1n), 0n, undefined); // fill to capacity
+
+  const opFull = makeInBandOp(SAFE_B, 1n); // different sender → the size cap, not the one-op guard
+  const restore = stubBroadcastFetch([]);
+  let accepted: `0x${string}`[];
+  try {
+    ({ accepted } = await relayerSubmit({ ops: [msgFor(opFull)], mempool, bundler: svc, seen }));
+  } finally {
+    restore();
+  }
+  expect(accepted, "mempool-full op is NOT acked → it gets redelivered").toEqual([]);
+  expect(svc.getReceipt(hashOf(opFull)), "no terminal receipt — the op is valid, just deferred").toBeUndefined();
+  expect(seen.has(hashOf(opFull)), "not marked seen → a redelivery is re-attempted").toEqual(false);
 });

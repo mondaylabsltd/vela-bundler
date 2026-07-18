@@ -42,6 +42,13 @@
         "max_batch_size": 10,
         "max_batch_timeout": 2,
         "dead_letter_queue": "vela-userops-dlq"
+      },
+      {
+        // Dead-letter consumer (B5) — write a terminal failed receipt + alert, then ack.
+        "queue": "vela-userops-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 1
       }
     ]
   },

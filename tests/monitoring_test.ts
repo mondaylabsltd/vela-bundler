@@ -180,6 +180,25 @@ it("checkOperationalHealth - repeated broadcast failures fire submit-failing", a
   expect(alerter.sent[0]!.message.includes("nonce too low")).toBeTruthy();
 });
 
+it("checkOperationalHealth - poolIndex namespaces the alert id + label (B6, per-RelayerDO)", async () => {
+  const alerter = new RecordingAlerter();
+  await checkOperationalHealth(
+    healthySnap({ poolIndex: 7, lockedEoaCount: 1, oldestLockedAgeMs: 200_000 }),
+    DEFAULT_OPERATIONAL_THRESHOLDS, alerter,
+  );
+  expect(alerter.sent.length).toEqual(1);
+  // Without the suffix all 100 relayers on chain 1 would dedup to `stuck-eoa-1` and only ONE
+  // would ever alert — masking 99 stuck pool EOAs.
+  expect(alerter.sent[0]!.id).toEqual("stuck-eoa-1-eoa7");
+  expect(alerter.sent[0]!.message.includes("pool EOA #7"), "label distinguishes the index").toBeTruthy();
+});
+
+it("checkOperationalHealth - without poolIndex the ids are unchanged (chain BundlerDO)", async () => {
+  const alerter = new RecordingAlerter();
+  await checkOperationalHealth(healthySnap({ lockedEoaCount: 1, oldestLockedAgeMs: 200_000 }), DEFAULT_OPERATIONAL_THRESHOLDS, alerter);
+  expect(alerter.sent[0]!.id).toEqual("stuck-eoa-1"); // no suffix — backward compatible
+});
+
 it("checkOperationalHealth - a streak below the threshold stays quiet", async () => {
   const alerter = new RecordingAlerter();
   await checkOperationalHealth(

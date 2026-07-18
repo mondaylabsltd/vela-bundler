@@ -26,6 +26,7 @@ import {
   Mempool,
   serializeMempoolEntry,
   deserializeMempoolEntry,
+  isMempoolFullError,
   type SerializedMempoolEntry,
 } from "../shared/mempool/index.ts";
 import type { SerializedReceipt } from "../shared/bundler/index.ts";
@@ -40,6 +41,8 @@ import { metrics, logEvent, redactError } from "../shared/reliability/log.ts";
 import { normalizeUserOp } from "../shared/userop/normalize.ts";
 import { createAlerter, type Alerter } from "../shared/monitoring/telegram.ts";
 import { RepeatedErrorEscalator } from "../shared/monitoring/escalation.ts";
+import { checkOperationalHealth, DEFAULT_OPERATIONAL_THRESHOLDS } from "../shared/monitoring/operational.ts";
+import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 
 /** Fallback alarm interval before config loads; honours AUTO_BUNDLE_INTERVAL_MS once inited. */
 const DEFAULT_ALARM_INTERVAL_MS = 10_000;
@@ -68,6 +71,19 @@ const STATUS_RECEIPT_TTL_SECONDS = 24 * 60 * 60;
 /** Accepted/pending status marker TTL (no receipt yet). */
 const STATUS_PENDING_TTL_SECONDS = 900;
 
+/** Extra times a terminal receipt is re-published to USEROP_STATUS KV on later alarms. The
+ *  initial write is one fire-and-forget put, and the chain DO's queue-mode poll reads ONLY this
+ *  KV (never fans out to 100 DOs) — so a single dropped put would strand a confirmed op with the
+ *  wallet polling null forever. Re-asserting a couple more times makes that vanishingly unlikely. */
+const KV_RECEIPT_REASSERT_ATTEMPTS = 2;
+/** Bound on the pending re-assert set (backpressure; the alarm drains it within a few cycles). */
+const KV_REASSERT_MAX = 512;
+
+/** How often a stranded RelayerDO re-asserts its dead-man registration with the chain DO. Much
+ *  shorter than the 5-min cron so a registration is always fresh when the cron reads it, but far
+ *  longer than the ~10s alarm so 100 relayers don't hammer the chain DO. */
+const WATCH_REG_REFRESH_MS = 90_000;
+
 /**
  * Dedup + enqueue a batch of queued ops into a per-EOA RelayerDO's mempool, then kick a
  * bundle pass. Exported for direct unit testing (the DO wraps it with its persisted seen-set
@@ -75,6 +91,20 @@ const STATUS_PENDING_TTL_SECONDS = 900;
  * persisted seen-set, the mempool, in-flight pending receipts and terminal receipts; a
  * duplicate is still ACKed (returned in `accepted`) so redelivery does not retry forever.
  */
+/** Shape of the chain-DO /fund-eoa response body (SponsorService.topUpFloatEOA result). */
+export interface FundEoaResult { toppedUp?: boolean; reason?: string }
+
+/**
+ * Whether a /fund-eoa response means funding is UNDER WAY, so the RelayerDO should fast-retry
+ * (~4s, expecting the L2 funding tx to mine) rather than back off to the normal alarm cadence.
+ * Non-actionable reasons (treasury_depleted / treasury_tx_stuck / budget_exhausted / transfer_
+ * failed / not-a-vault chain / a non-2xx) return false — fast-retrying those just hammers an
+ * already-unhealthy RPC endpoint (100 relayers × ~4s × ~7 reads) and can prolong the outage.
+ */
+export function fundingUnderway(ok: boolean, body: FundEoaResult | null): boolean {
+  return ok && (body?.toppedUp === true || body?.reason === "in_flight" || body?.reason === "already_funded");
+}
+
 export async function relayerSubmit(params: {
   ops: UserOpQueueMessage[];
   mempool: Mempool;
@@ -84,13 +114,16 @@ export async function relayerSubmit(params: {
   markStatus?: (userOpHash: `0x${string}`, status: "submitted" | "pending") => void;
 }): Promise<{ accepted: `0x${string}`[]; added: number }> {
   const { ops, mempool, bundler, seen } = params;
+  // A hash is added to `accepted` ONLY when the delivery is fully handled (admitted, already
+  // known, unparseable, or DEFINITIVELY rejected). A TRANSIENT rejection (mempool full) is left
+  // OUT so the consumer retries that message once the backlog drains — see the catch below.
   const accepted: `0x${string}`[] = [];
   let added = 0;
   for (const op of ops) {
     const hash = op.userOpHash;
-    accepted.push(hash); // ack every delivery (dedup below decides whether to re-add)
     if (seen.has(hash) || mempool.get(hash) || bundler.getReceipt(hash) || bundler.hasPending(hash)) {
-      continue; // already known → idempotent, do not re-add
+      accepted.push(hash); // already known → idempotent ack
+      continue;
     }
     let userOp;
     try {
@@ -98,6 +131,7 @@ export async function relayerSubmit(params: {
     } catch (err) {
       console.warn(`[RelayerDO] dropping unparseable queued op ${hash}: ${redactError(err)}`);
       seen.add(hash);
+      accepted.push(hash); // a retry can't fix a malformed op — ack (don't loop to the DLQ pointlessly)
       continue;
     }
     try {
@@ -105,12 +139,20 @@ export async function relayerSubmit(params: {
       seen.add(hash);
       added++;
       params.markStatus?.(hash, "pending");
+      accepted.push(hash); // admitted → ack
     } catch (err) {
-      // Definitive admission rejection (one-op-per-sender guard, mempool full, reputation).
-      // The wallet was told SUCCESS at ingress and is polling this hash — so we must store a
-      // TERMINAL failed receipt (which fires the KV persist hook), NOT just seen.add + ACK, or
-      // the poll never resolves and the op looks lost forever. ACK regardless (retrying the
-      // batch would re-hit the same rejection).
+      if (isMempoolFullError(err)) {
+        // TRANSIENT capacity condition (a load spike saturating this pool index). It CLEARS as
+        // bundles land, so this op just needs to wait — do NOT seen.add and do NOT store a
+        // terminal failed receipt (which would permanently kill a valid op and lie to the
+        // polling wallet). Leave it OUT of `accepted` so the consumer redelivers it; a SUSTAINED
+        // overload eventually routes it to the DLQ (max_retries), which the DLQ consumer handles.
+        console.warn(`[RelayerDO] mempool full — deferring queued op ${hash} for redelivery`);
+        continue;
+      }
+      // Definitive admission rejection (one-op-per-sender guard, reputation ban). The wallet was
+      // told SUCCESS at ingress and is polling this hash — store a TERMINAL failed receipt (fires
+      // the KV persist hook) so the poll resolves, then ACK (a retry would re-hit the same reject).
       console.warn(`[RelayerDO] mempool rejected queued op ${hash}: ${redactError(err)}`);
       seen.add(hash);
       try {
@@ -118,6 +160,7 @@ export async function relayerSubmit(params: {
       } catch (e) {
         console.warn(`[RelayerDO] failed to store terminal receipt for ${hash}: ${redactError(e)}`);
       }
+      accepted.push(hash);
     }
   }
   if (added > 0) await bundler.kickBundle();
@@ -138,6 +181,13 @@ export class RelayerDO implements DurableObject {
   /** In-memory mirror of the persisted dedup seen-set (loaded in _init). */
   private seen = new Set<string>();
   private idleCycles = 0;
+  /** Terminal receipts whose KV publication is re-asserted on the next few alarms (see
+   *  KV_RECEIPT_REASSERT_ATTEMPTS): hash → { serialized receipt, remaining re-asserts }. */
+  private readonly kvReassert = new Map<string, { receipt: SerializedReceipt; remaining: number }>();
+  /** Chain-DO dead-man registration state (see updateChainWatch): whether this index is currently
+   *  registered as stranded, and when it was last (re)asserted. */
+  private watchRegistered = false;
+  private lastWatchRegAt = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -175,6 +225,10 @@ export class RelayerDO implements DurableObject {
 
     if (url.pathname === "/health") {
       return this.handleHealth();
+    }
+
+    if (url.pathname === "/ensure-alarm") {
+      return await this.handleEnsureAlarm();
     }
 
     return new Response("not found", { status: 404 });
@@ -222,6 +276,44 @@ export class RelayerDO implements DurableObject {
       }
     }
     return Response.json({ accepted });
+  }
+
+  /**
+   * Cron-driven liveness probe (dead-man switch, layer 2), STORAGE-ONLY. The RelayerDO alarm
+   * self-re-arms (layer 1), but a storage error during setAlarm or an exhausted CF alarm-retry
+   * budget can kill it permanently — and in queue mode this DO holds the money-path state
+   * (persisted mempool ops / pending receipts / locked pool EOA), so a dead alarm silently stops
+   * reconciliation for that pool index. The chain BundlerDO's cron fan-out probes this (only for
+   * indices registered as stranded), re-arming + alerting if the alarm chain broke.
+   */
+  private async handleEnsureAlarm(): Promise<Response> {
+    const alarmAt = await this.state.storage.getAlarm();
+    if (alarmAt !== null) return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
+    const chainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+    const index = await this.state.storage.get<number>(STORAGE_KEY_POOL_INDEX);
+    if (chainId === undefined || index === undefined) return Response.json({ rearmed: false, unknown: true });
+    const idle = await this.state.storage.get<boolean>(STORAGE_KEY_ALARM_IDLE);
+    const hasInFlight = await this.hasPersistedInFlightState();
+    if (idle && !hasInFlight) return Response.json({ rearmed: false, idle: true, index });
+    await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
+    await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
+    console.error(`[RelayerDO:${chainId}#${index}] alarm chain was BROKEN — re-armed by cron liveness check`);
+    await this.alerter.send(
+      `relayer-alarm-rearmed-${chainId}-${index}`,
+      `🚑 Vela Bundler — RelayerDO chain ${chainId} pool EOA #${index}'s alarm chain was BROKEN` +
+        `${hasInFlight ? " WITH in-flight money state" : ""} and was re-armed by the cron liveness check. ` +
+        `Reconciliation for that pool index had stopped — investigate why the alarm died (logs around now).`,
+    );
+    return Response.json({ rearmed: true, chainId, index });
+  }
+
+  /** True when durable storage holds money-path state reconciliation must finish (persisted
+   *  pending receipts or accepted-unbundled mempool ops). Readable without a full init. */
+  private async hasPersistedInFlightState(): Promise<boolean> {
+    const pending = await this.state.storage.get(STORAGE_KEY_PENDING_RECEIPTS);
+    if (pending !== undefined && Array.isArray(pending) && pending.length > 0) return true;
+    const ops = await this.state.storage.list({ prefix: MEMPOOL_KEY_PREFIX, limit: 1 });
+    return ops.size > 0;
   }
 
   private handleHealth(): Response {
@@ -295,6 +387,10 @@ export class RelayerDO implements DurableObject {
 
       cs.bundler.cleanExpiredReceipts();
 
+      // Re-assert recent terminal-receipt KV writes (belt-and-suspenders for a dropped put; the
+      // chain DO's queue-mode poll reads ONLY this KV).
+      this.drainKvReassert();
+
       const mempoolSize = cs.mempool.size;
       const pendingReceipts = cs.bundler.pendingReceiptCount;
       const lockedEOAs = cs.accountService.lockManager.getLockedEOAs().length;
@@ -309,16 +405,49 @@ export class RelayerDO implements DurableObject {
         locked_eoas: lockedEOAs,
       });
 
-      // Idle stop: nothing queued, nothing in flight, EOA free → stop the alarm (flagged
-      // deliberate). A /submit re-arms instantly via the kick hook, so no op is ever stranded.
-      if (mempoolSize === 0 && pendingReceipts === 0 && lockedEOAs === 0) {
+      // Operational-health monitor (B6). In queue transport mode the money-path state (stuck
+      // mempool op, unconfirmed bundle, LOCKED_PENDING_UNKNOWN pool EOA, broadcast-failure streak,
+      // underfunded EOA) lives HERE, not in the chain BundlerDO — whose own monitor reads all-zero
+      // in queue mode. Without this a stuck pool EOA / backlog on a RelayerDO is invisible to the
+      // operator. Index-namespaced dedup keys (poolIndex) keep the 100 relayers' alerts distinct.
+      try {
+        await checkOperationalHealth({
+          chainId: this.chainId,
+          chainName: cs.chainInfo?.name ?? null,
+          poolIndex: this.poolIndex,
+          oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
+          lockedEoaCount: lockedEOAs,
+          oldestLockedAgeMs: cs.accountService.lockManager.oldestLockedAgeMs(),
+          pendingReceiptCount: pendingReceipts,
+          oldestPendingReceiptAgeMs: cs.bundler.oldestPendingReceiptAgeMs(),
+          circuitDegraded: reliabilityHealth().circuit.degraded,
+          reputationBannedSenders: cs.mempool.reputation.countPenalized("sender").banned,
+          submitFailureStreak: cs.bundler.submitFailureStreak,
+          lastSubmitError: cs.bundler.lastSubmitError,
+          insufficientFundsEoa: cs.bundler.insufficientFundsEoa,
+        }, DEFAULT_OPERATIONAL_THRESHOLDS, this.alerter);
+        this.escalator.ok("relayer-operational", this.chainId);
+      } catch (err) {
+        console.error(`[RelayerDO:${this.chainId}#${this.poolIndex}] operational monitor error:`, err);
+        await this.escalator.note("relayer-operational", this.chainId, err);
+      }
+
+      // Register with the chain DO's dead-man watch list while we hold stranded money-path state,
+      // so the 5-min cron fan-out can re-arm this alarm if it dies; deregister once drained.
+      this.updateChainWatch(mempoolSize > 0 || pendingReceipts > 0 || lockedEOAs > 0);
+
+      // Idle stop: nothing queued, nothing in flight, EOA free, no KV re-asserts pending → stop
+      // the alarm (flagged deliberate). A /submit re-arms instantly via the kick hook, so no op is
+      // ever stranded; the kvReassert guard keeps the alarm alive until receipts are re-published.
+      if (mempoolSize === 0 && pendingReceipts === 0 && lockedEOAs === 0 && this.kvReassert.size === 0) {
         this.idleCycles++;
         if (this.idleCycles >= IDLE_STOP_CYCLES) {
           const live = this.chainServices;
           const stillIdle = live !== null &&
             live.mempool.size === 0 &&
             live.bundler.pendingReceiptCount === 0 &&
-            live.accountService.lockManager.getLockedEOAs().length === 0;
+            live.accountService.lockManager.getLockedEOAs().length === 0 &&
+            this.kvReassert.size === 0;
           if (stillIdle) {
             this.idleCycles = 0;
             await this.state.storage.put(STORAGE_KEY_ALARM_IDLE, true);
@@ -417,10 +546,15 @@ export class RelayerDO implements DurableObject {
       const stub = this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
       const u = `https://bundler-do/fund-eoa?chainId=${this.chainId}&address=${eoa}&shortfall=${shortfallWei.toString()}`;
       void stub.fetch(new Request(u, { method: "POST" }))
-        // Retry a few seconds out — long enough for the funding tx to mine on an L2 (not
-        // setAlarm(now), which would re-fire before it lands and tight-loop; topUpFloatEOA
-        // dedups the funding send meanwhile, and the normal alarm interval is the backstop).
-        .then(() => this.state.storage.setAlarm(Date.now() + 4_000))
+        .then(async (res) => {
+          // Only fast-retry (~4s, expecting an L2 funding tx to mine) when funding is actually
+          // under way. On a NON-actionable reason (treasury depleted / stuck nonce / budget
+          // exhausted / not-a-vault chain), re-firing /fund-eoa every 4s just piles RPC load on an
+          // already-unhealthy endpoint (100 relayers × 4s × ~7 reads) and can prolong the outage —
+          // fall back to the normal alarm cadence (the alarm self-re-arms; a /submit kicks sooner).
+          const body = await res.json().catch(() => null) as FundEoaResult | null;
+          if (fundingUnderway(res.ok, body)) await this.state.storage.setAlarm(Date.now() + 4_000);
+        })
         .catch((err: unknown) => console.warn(`[RelayerDO:${this.chainId}#${this.poolIndex}] fund-eoa request failed: ${redactError(err)}`));
     });
 
@@ -452,11 +586,11 @@ export class RelayerDO implements DurableObject {
       put: (userOpHash, receipt, expiresAt) => {
         void this.state.storage.put(RECEIPT_KEY_PREFIX + userOpHash, { userOpHash, receipt, expiresAt })
           .catch((err: unknown) => console.warn(`[RelayerDO] receipt persist failed: ${redactError(err)}`));
-        const kv = this.env.USEROP_STATUS;
-        if (kv) {
-          const status = receipt.success ? "submitted" : "failed";
-          void kv.put(userOpHash, JSON.stringify({ status, receipt }), { expirationTtl: STATUS_RECEIPT_TTL_SECONDS })
-            .catch((err: unknown) => console.warn(`[RelayerDO] status receipt write failed for ${userOpHash}: ${redactError(err)}`));
+        this.writeReceiptKv(userOpHash, receipt);
+        // Re-assert the KV publication on the next few alarms — a single dropped put would
+        // otherwise strand a confirmed op (the chain DO's poll reads only this KV).
+        if (this.kvReassert.size < KV_REASSERT_MAX) {
+          this.kvReassert.set(userOpHash, { receipt, remaining: KV_RECEIPT_REASSERT_ATTEMPTS });
         }
       },
       delete: (userOpHash) => {
@@ -485,6 +619,59 @@ export class RelayerDO implements DurableObject {
     if (!existing) await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
 
     console.log(`[RelayerDO] Initialized chain ${chainId} pool EOA #${index} (${resolved.chain?.name ?? "unknown"})`);
+  }
+
+  /** Publish (or re-publish) a terminal receipt to USEROP_STATUS KV. Fire-and-forget; the
+   *  alarm re-asserts it a couple more times (kvReassert) to survive a dropped put. */
+  private writeReceiptKv(userOpHash: string, receipt: SerializedReceipt): void {
+    const kv = this.env.USEROP_STATUS;
+    if (!kv) return;
+    const status = receipt.success ? "submitted" : "failed";
+    void kv.put(userOpHash, JSON.stringify({ status, receipt }), { expirationTtl: STATUS_RECEIPT_TTL_SECONDS })
+      .catch((err: unknown) => console.warn(`[RelayerDO] status receipt write failed for ${userOpHash}: ${redactError(err)}`));
+  }
+
+  /** Re-assert the recent terminal-receipt KV writes (one per scheduled attempt), then drop
+   *  each entry once its attempts are exhausted. Called from the alarm. */
+  private drainKvReassert(): void {
+    if (this.kvReassert.size === 0) return;
+    for (const [hash, entry] of this.kvReassert) {
+      this.writeReceiptKv(hash, entry.receipt);
+      if (--entry.remaining <= 0) this.kvReassert.delete(hash);
+    }
+  }
+
+  /** Register (or deregister) this pool index with the chain DO's dead-man watch list. Registered
+   *  when it holds stranded money-path state so the cron fan-out probes it; deregistered when idle.
+   *  Edge-triggered, with a throttled re-assert so a lost registration self-heals. */
+  private updateChainWatch(stranded: boolean): void {
+    const now = Date.now();
+    if (stranded) {
+      if (this.watchRegistered && now - this.lastWatchRegAt < WATCH_REG_REFRESH_MS) return;
+      this.watchRegistered = true;
+      this.lastWatchRegAt = now;
+      this.chainWatchFetch("PUT");
+    } else if (this.watchRegistered) {
+      this.watchRegistered = false;
+      this.lastWatchRegAt = 0;
+      this.chainWatchFetch("DELETE");
+    }
+  }
+
+  private chainWatchFetch(method: "PUT" | "DELETE"): void {
+    const stub = this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
+    const u = `https://bundler-do/relayer-watch?index=${this.poolIndex}`;
+    void stub.fetch(new Request(u, { method }))
+      .then((res) => {
+        // A failed PUT means we are NOT actually registered — reset so the very next alarm re-PUTs
+        // immediately instead of waiting out the 90s throttle (which would leave a stranded index
+        // with no layer-2 dead-man coverage if the alarm then died).
+        if (method === "PUT" && !res.ok) { this.watchRegistered = false; this.lastWatchRegAt = 0; }
+      })
+      .catch((err: unknown) => {
+        if (method === "PUT") { this.watchRegistered = false; this.lastWatchRegAt = 0; }
+        console.warn(`[RelayerDO:${this.chainId}#${this.poolIndex}] watch ${method} failed: ${redactError(err)}`);
+      });
   }
 
   /** Persist the seen-set (bounded FIFO) — fire-and-forget. */

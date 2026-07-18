@@ -34,7 +34,7 @@ import { AccountService } from "../shared/account/index.ts";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
-import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
@@ -93,6 +93,9 @@ const STORAGE_KEY_LAST_HEARTBEAT = "lastHeartbeatAt";
  *  each write stays O(1). */
 const MEMPOOL_KEY_PREFIX = "mp:";
 const RECEIPT_KEY_PREFIX = "rc:";
+/** Dead-man watch registry (B6): a RelayerDO registers `rwatch:<index>` while it holds stranded
+ *  money-path state; the cron liveness probe fans out to each registered index's /ensure-alarm. */
+const RELAYER_WATCH_PREFIX = "rwatch:";
 
 /** DO storage flag: the alarm was stopped DELIBERATELY (chain fully idle / abandoned) —
  *  distinguishes "healthy idle" from "alarm chain broken" for the cron liveness probe. */
@@ -230,6 +233,12 @@ export class BundlerDO implements DurableObject {
     // armed alarm re-initializes the chain itself on its next firing.
     if (url.pathname === "/ensure-alarm") {
       return await this.handleEnsureAlarm();
+    }
+
+    // Dead-man watch registry (B6): a RelayerDO PUTs/DELETEs its index here while it holds
+    // stranded money-path state. Storage-only, no init needed.
+    if (url.pathname === "/relayer-watch") {
+      return await this.handleRelayerWatch(url, request.method);
     }
 
     if (chainId > 0) {
@@ -838,7 +847,57 @@ export class BundlerDO implements DurableObject {
    *   - no alarm otherwise (or idle flag but money in flight — inconsistent) → BROKEN:
    *     re-arm + alert. The armed alarm re-initializes the chain itself when it fires.
    */
+  /** Register/deregister a RelayerDO pool index in the dead-man watch list (B6). Storage-only. */
+  private async handleRelayerWatch(url: URL, method: string): Promise<Response> {
+    const index = parseInt(url.searchParams.get("index") ?? "-1");
+    if (!(index >= 0 && index < RELAYER_POOL_SIZE)) {
+      return Response.json({ error: "bad index" }, { status: 400 });
+    }
+    const key = RELAYER_WATCH_PREFIX + index;
+    if (method === "DELETE") {
+      await this.state.storage.delete(key);
+      return Response.json({ watching: false, index });
+    }
+    await this.state.storage.put(key, Date.now());
+    return Response.json({ watching: true, index });
+  }
+
+  /**
+   * Cron fan-out (B6): probe every RelayerDO pool index registered as holding stranded money-path
+   * state. Their own alarm is layer 1; this is the ONLY layer that catches a RelayerDO whose alarm
+   * chain itself died (queue transport puts the money-path state in the 100 RelayerDOs, not here).
+   * A probe that reports idle/unknown → the relayer drained (or its deregister was lost) → stop
+   * watching it. Bounded to the registered set (usually small), never throws.
+   */
+  private async probeRegisteredRelayers(): Promise<void> {
+    let watched: Map<string, number>;
+    try {
+      watched = await this.state.storage.list<number>({ prefix: RELAYER_WATCH_PREFIX });
+    } catch { return; }
+    if (watched.size === 0) return;
+    const knownChain = (await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID)) ?? this.chainId;
+    if (!(knownChain > 0) || !this.env.RELAYER) return;
+    await Promise.allSettled([...watched.keys()].map(async (key) => {
+      const index = parseInt(key.slice(RELAYER_WATCH_PREFIX.length));
+      if (!(index >= 0 && index < RELAYER_POOL_SIZE)) { await this.state.storage.delete(key); return; }
+      try {
+        const stub = this.env.RELAYER.get(this.env.RELAYER.idFromName(`chain-${knownChain}-eoa-${index}`));
+        const res = await stub.fetch(new Request("https://relayer-do/ensure-alarm"));
+        const body = await res.json().catch(() => null) as { rearmed?: boolean; idle?: boolean; unknown?: boolean } | null;
+        if (body?.rearmed) console.error(`[BundlerDO:${knownChain}] cron re-armed a BROKEN RelayerDO alarm for pool index ${index}`);
+        if (body?.idle || body?.unknown) await this.state.storage.delete(key); // drained → stop watching
+      } catch (err) {
+        console.error(`[BundlerDO:${knownChain}] relayer liveness probe failed for index ${index}: ${redactError(err)}`);
+      }
+    }));
+  }
+
   private async handleEnsureAlarm(): Promise<Response> {
+    // Always fan out to the registered RelayerDOs first — a relayer's alarm can be dead even when
+    // THIS chain DO's alarm is healthy (they are separate isolates), so this must not be gated on
+    // the chain DO's own alarm status below.
+    await this.probeRegisteredRelayers();
+
     const alarmAt = await this.state.storage.getAlarm();
     if (alarmAt !== null) {
       return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });

@@ -13,10 +13,73 @@ import {
 } from "../shared/contracts/splitter.ts";
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import { redactError } from "../shared/reliability/log.ts";
+import { createAlerter } from "../shared/monitoring/telegram.ts";
 
 // Re-export the Durable Objects for wrangler to discover.
 export { BundlerDO } from "./bundler-do.ts";
 export { RelayerDO } from "./relayer-do.ts";
+
+/** Terminal-receipt KV TTL for a dead-lettered op (matches the RelayerDO's 24h). */
+const DLQ_STATUS_TTL_SECONDS = 24 * 60 * 60;
+const ENTRYPOINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as const;
+const ZERO_HASH32 = ("0x" + "00".repeat(32)) as `0x${string}`;
+
+/**
+ * Build the USEROP_STATUS KV value for a dead-lettered (permanently-undeliverable) op: a TERMINAL
+ * failed receipt so the wallet's eth_getUserOperationReceipt poll resolves to "failed, resubmit"
+ * instead of returning null forever. Exported for tests.
+ */
+export function deadLetterFailedMarker(msg: UserOpQueueMessage): string {
+  const rpc = (msg.rpcUserOp ?? {}) as { sender?: unknown; nonce?: unknown };
+  const sender = (typeof rpc.sender === "string" ? rpc.sender : "0x" + "00".repeat(20)) as `0x${string}`;
+  const nonce = (typeof rpc.nonce === "string" || typeof rpc.nonce === "number") ? String(rpc.nonce) : "0";
+  const receipt = {
+    userOpHash: msg.userOpHash, entryPoint: ENTRYPOINT_V07, sender, nonce, paymaster: null,
+    actualGasCost: "0", actualGasUsed: "0", success: false, logs: [] as unknown[],
+    receipt: {
+      transactionHash: ZERO_HASH32, transactionIndex: 0, blockHash: ZERO_HASH32, blockNumber: "0",
+      from: sender, to: ENTRYPOINT_V07, cumulativeGasUsed: "0", gasUsed: "0", effectiveGasPrice: "0",
+    },
+  };
+  return JSON.stringify({ status: "failed", receipt });
+}
+
+/**
+ * Dead-letter consumer (Stage 4). A batch from `vela-userops-dlq` = ops that exhausted the
+ * transport's delivery retries (sustained RelayerDO init/RPC failure, or a poison message). They
+ * will NEVER execute, and nothing else writes their terminal receipt — so without this the wallet
+ * polls null forever and the operator gets no signal. For each dead op: write a terminal failed
+ * receipt to USEROP_STATUS (wallet resolves to "failed, resubmit") and page the operator; then ACK
+ * (a dead op must not loop the DLQ). Exported for tests.
+ */
+export async function handleDeadLetterBatch(batch: MessageBatch<UserOpQueueMessage>, env: Env): Promise<void> {
+  const dead: string[] = [];
+  for (const msg of batch.messages) {
+    try {
+      const body = msg.body;
+      if (env.USEROP_STATUS && body?.userOpHash) {
+        await env.USEROP_STATUS.put(String(body.userOpHash), deadLetterFailedMarker(body), { expirationTtl: DLQ_STATUS_TTL_SECONDS });
+      }
+      dead.push(`${body?.chainId}:${body?.userOpHash}`);
+    } catch (err) {
+      console.error(`[Worker] DLQ handler error: ${redactError(err)}`);
+    } finally {
+      try { msg.ack(); } catch { /* already settled */ }
+    }
+  }
+  if (dead.length > 0) {
+    const alerter = createAlerter(
+      { telegramBotToken: env.TELEGRAM_BOT_TOKEN || null, telegramChatId: env.TELEGRAM_CHAT_ID || null },
+      { quiet: true },
+    );
+    await alerter.send(
+      `dlq-${batch.queue}`,
+      `🪦 Vela Bundler — ${dead.length} UserOp(s) hit the dead-letter queue (${batch.queue}); the pool ` +
+        `transport gave up after retries. A terminal 'failed' receipt was written so wallets can ` +
+        `resubmit. First: ${dead.slice(0, 20).join(", ")}`,
+    ).catch((err: unknown) => console.error(`[Worker] DLQ alert failed: ${redactError(err)}`));
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -162,6 +225,11 @@ export default {
    * livelock a poison message — every failure path resolves to per-message ack/retry instead.
    */
   async queue(batch: MessageBatch<UserOpQueueMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    // A batch from the dead-letter queue = ops that exhausted delivery retries and will NEVER
+    // execute. Write their terminal failed receipt + alert (see handleDeadLetterBatch), then ack.
+    if (typeof batch.queue === "string" && batch.queue.endsWith("-dlq")) {
+      return await handleDeadLetterBatch(batch, env);
+    }
     try {
       // Group by (chainId, pool index). The routing hash MUST be the identical function the
       // producer used to write the KV marker index — both import relayerIndexForSender.
@@ -206,8 +274,24 @@ export default {
               body: JSON.stringify({ ops: g.msgs.map((m) => m.body) }),
             },
           );
-          if (res.ok) for (const m of g.msgs) m.ack();
-          else {
+          if (res.ok) {
+            // ACK only the hashes the RelayerDO fully handled; RETRY the rest. A transient
+            // mempool-full rejection is deliberately left OUT of `accepted` (relayerSubmit) so it
+            // is redelivered once the backlog drains instead of being killed with a terminal
+            // receipt. If the body can't be parsed, fall back to acking the whole group (the
+            // added ops dedup on any redelivery — safer than looping).
+            const body = await res.json().catch(() => null) as { accepted?: string[] } | null;
+            if (body && Array.isArray(body.accepted)) {
+              const ackSet = new Set(body.accepted.map((h) => String(h).toLowerCase()));
+              for (const m of g.msgs) {
+                const h = String((m.body as { userOpHash?: unknown }).userOpHash ?? "").toLowerCase();
+                if (ackSet.has(h)) m.ack();
+                else m.retry(); // transient (mempool full) — redeliver
+              }
+            } else {
+              for (const m of g.msgs) m.ack();
+            }
+          } else {
             console.warn(`[Worker] queue: RelayerDO chain-${g.chainId}-eoa-${g.index} returned ${res.status} — retrying group`);
             for (const m of g.msgs) m.retry();
           }
