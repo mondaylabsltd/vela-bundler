@@ -37,6 +37,7 @@ import { RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
 import type { ChainServices } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { metrics, logEvent, redactError } from "../shared/reliability/log.ts";
 import { normalizeUserOp } from "../shared/userop/normalize.ts";
 import { createAlerter, type Alerter } from "../shared/monitoring/telegram.ts";
@@ -188,6 +189,17 @@ export class RelayerDO implements DurableObject {
    *  registered as stranded, and when it was last (re)asserted. */
   private watchRegistered = false;
   private lastWatchRegAt = 0;
+  /** Cached chain-DO stub for watch PUT/DELETEs. One stub → Cloudflare delivers its calls in
+   *  issue order, so an admission-time PUT can never be processed after an older drain-time
+   *  DELETE (which would silently drop dead-man coverage while the 90s throttle suppresses the
+   *  re-PUT). Reset on error — a broken stub loses its ordering guarantee. */
+  private watchStub: DurableObjectStub | null = null;
+  /** Wall-clock start of the alarm invocation currently running in this isolate, if any. An
+   *  ingress kick (setAlarm(now)) landing DURING a slow invocation makes getAlarm() read
+   *  past-due while the loop is demonstrably alive — this flag lets the liveness guards tell
+   *  "slow but running" (leave alone) from zombie/wedged (re-arm/alert). In-memory on purpose:
+   *  a process restart (the zombie scenario) must NOT inherit it. */
+  private alarmInFlightSince: number | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -292,13 +304,25 @@ export class RelayerDO implements DurableObject {
     // kickBundle directly, not the kick hook). On a WARM DO that has idle-stopped (deleteAlarm),
     // nothing would then run checkPendingReceipts — the receipt would never be captured (wallet
     // polls null) and the pinned pool EOA would stay LOCKED_PENDING_UNKNOWN forever, bricking
-    // this relayer index. Ensure an alarm is armed whenever there is now anything to reconcile.
+    // this relayer index. Ensure a LIVE alarm whenever there is now anything to reconcile —
+    // a persisted alarm whose scheduled time is already past is a zombie (armed but never
+    // delivered, e.g. orphaned across a dev reload) and must be replaced, not trusted.
     if (added > 0 || this.chainServices.bundler.pendingReceiptCount > 0 || this.chainServices.mempool.size > 0) {
       this.idleCycles = 0;
       await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
-      if ((await this.state.storage.getAlarm()) === null) {
+      // TIGHT grace: work was just admitted, so trusting a zombie strands it (in dev no cron
+      // ever catches it), while re-arming a nearly-due alarm merely runs one duplicate latched
+      // cycle. Skip only when an invocation is running right now in this isolate — then a
+      // past-due reading is just a queued ingress kick behind the running body.
+      const inFlight = this.alarmInFlightSince !== null && Date.now() - this.alarmInFlightSince < ALARM_IN_FLIGHT_WEDGE_MS;
+      if (!inFlight && !alarmIsLive(await this.state.storage.getAlarm(), this.alarmIntervalMs(), Date.now(), ALARM_TIGHT_GRACE_MS)) {
         await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
       }
+      // Register with the chain DO's dead-man watch list NOW, not only from the alarm body:
+      // if the alarm dies before its first post-/submit cycle (the only other place that
+      // registers), the cron fan-out would have no entry for this index and could never
+      // re-arm it — the one gap layer 2 was built to cover. Throttled + fire-and-forget.
+      this.updateChainWatch(true);
     }
     return Response.json({ accepted });
   }
@@ -312,8 +336,20 @@ export class RelayerDO implements DurableObject {
    * indices registered as stranded), re-arming + alerting if the alarm chain broke.
    */
   private async handleEnsureAlarm(): Promise<Response> {
+    // An invocation demonstrably running in this isolate is alive no matter what getAlarm()
+    // reads (an ingress kick landing mid-run parks a past-due alarm behind the running body).
+    // Beyond the wedge limit it is NOT alive — fall through and page the operator.
+    if (this.alarmInFlightSince !== null && Date.now() - this.alarmInFlightSince < ALARM_IN_FLIGHT_WEDGE_MS) {
+      return Response.json({ rearmed: false, healthy: true, inFlight: true });
+    }
     const alarmAt = await this.state.storage.getAlarm();
-    if (alarmAt !== null) return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
+    // A scheduled-in-the-past alarm is NOT healthy: the alarm body re-arms as its first
+    // statement, so a live loop always keeps this in the future. Past-due means the delivery
+    // died (or an in-flight invocation is wedged) — fall through to the broken path.
+    if (alarmIsLive(alarmAt, this.alarmIntervalMs())) {
+      return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
+    }
+    const stale = alarmAt !== null;
     const chainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
     const index = await this.state.storage.get<number>(STORAGE_KEY_POOL_INDEX);
     if (chainId === undefined || index === undefined) return Response.json({ rearmed: false, unknown: true });
@@ -322,14 +358,15 @@ export class RelayerDO implements DurableObject {
     if (idle && !hasInFlight) return Response.json({ rearmed: false, idle: true, index });
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
-    console.error(`[RelayerDO:${chainId}#${index}] alarm chain was BROKEN — re-armed by cron liveness check`);
+    const how = stale ? `ZOMBIE (armed for ${new Date(alarmAt).toISOString()} but never delivered)` : "BROKEN";
+    console.error(`[RelayerDO:${chainId}#${index}] alarm chain was ${how} — re-armed by cron liveness check`);
     await this.alerter.send(
       `relayer-alarm-rearmed-${chainId}-${index}`,
-      `🚑 Vela Bundler — RelayerDO chain ${chainId} pool EOA #${index}'s alarm chain was BROKEN` +
+      `🚑 Vela Bundler — RelayerDO chain ${chainId} pool EOA #${index}'s alarm chain was ${how}` +
         `${hasInFlight ? " WITH in-flight money state" : ""} and was re-armed by the cron liveness check. ` +
         `Reconciliation for that pool index had stopped — investigate why the alarm died (logs around now).`,
     );
-    return Response.json({ rearmed: true, chainId, index });
+    return Response.json({ rearmed: true, chainId, index, stale });
   }
 
   /** True when durable storage holds money-path state reconciliation must finish (persisted
@@ -357,6 +394,15 @@ export class RelayerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    this.alarmInFlightSince = Date.now();
+    try {
+      await this.alarmBody();
+    } finally {
+      this.alarmInFlightSince = null;
+    }
+  }
+
+  private async alarmBody(): Promise<void> {
     // Re-arm FIRST — the reschedule must never depend on the body completing (an escaped
     // exception past the setAlarm could exhaust CF's bounded alarm-retry budget and end
     // reconciliation for this EOA forever). A /submit kick may overwrite this with an earlier
@@ -640,8 +686,14 @@ export class RelayerDO implements DurableObject {
     await this.state.storage.put(STORAGE_KEY_CHAIN_ID, chainId);
     await this.state.storage.put(STORAGE_KEY_POOL_INDEX, index);
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
+    // Arm unless a LIVE alarm exists — TIGHT grace: trusting any non-null alarm here once
+    // stranded a mempool op past its TTL (a zombie orphaned by a dev-server reload kept every
+    // guard convinced the loop was alive), and a wrongly-replaced nearly-due alarm costs only
+    // one duplicate latched cycle.
     const existing = await this.state.storage.getAlarm();
-    if (!existing) await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
+    if (!alarmIsLive(existing, this.alarmIntervalMs(), Date.now(), ALARM_TIGHT_GRACE_MS)) {
+      await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
+    }
 
     console.log(`[RelayerDO] Initialized chain ${chainId} pool EOA #${index} (${resolved.chain?.name ?? "unknown"})`);
   }
@@ -684,9 +736,13 @@ export class RelayerDO implements DurableObject {
   }
 
   private chainWatchFetch(method: "PUT" | "DELETE"): void {
-    const stub = this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
+    // Reuse ONE stub for all watch calls: same-stub calls are delivered in issue order, so a
+    // /submit-time PUT can never be processed after an older drain-time DELETE it raced (fresh
+    // stubs carry no cross-stub ordering guarantee, and a reordered pair would silently drop
+    // dead-man coverage while the 90s throttle believes the index is registered).
+    this.watchStub ??= this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
     const u = `https://bundler-do/relayer-watch?index=${this.poolIndex}`;
-    void stub.fetch(new Request(u, { method }))
+    void this.watchStub.fetch(new Request(u, { method }))
       .then((res) => {
         // A failed PUT means we are NOT actually registered — reset so the very next alarm re-PUTs
         // immediately instead of waiting out the 90s throttle (which would leave a stranded index
@@ -694,6 +750,8 @@ export class RelayerDO implements DurableObject {
         if (method === "PUT" && !res.ok) { this.watchRegistered = false; this.lastWatchRegAt = 0; }
       })
       .catch((err: unknown) => {
+        // A stub that errored may have lost its in-order guarantee — drop it and re-create.
+        this.watchStub = null;
         if (method === "PUT") { this.watchRegistered = false; this.lastWatchRegAt = 0; }
         console.warn(`[RelayerDO:${this.chainId}#${this.poolIndex}] watch ${method} failed: ${redactError(err)}`);
       });

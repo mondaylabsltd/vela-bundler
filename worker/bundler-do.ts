@@ -37,6 +37,7 @@ import { LocalKeyManager } from "../shared/keys/local.ts";
 import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 import { metrics, logEvent, redactUrl } from "../shared/reliability/log.ts";
 import { relayerIndexForSender } from "../shared/queue/routing.ts";
@@ -184,6 +185,12 @@ export class BundlerDO implements DurableObject {
   /** Consecutive fully-idle alarm cycles — see IDLE_STOP_CYCLES. Reset by any activity;
    *  an eviction resets it too (counting simply restarts — the safe direction). */
   private idleCycles = 0;
+  /** Wall-clock start of the alarm invocation currently running in this isolate, if any. An
+   *  ingress kick (setAlarm(now)) landing DURING a slow invocation makes getAlarm() read
+   *  past-due while the loop is demonstrably alive — this flag lets the liveness guards tell
+   *  "slow but running" (leave alone) from zombie/wedged (re-arm/alert). In-memory on purpose:
+   *  a process restart (the zombie scenario) must NOT inherit it. */
+  private alarmInFlightSince: number | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -315,6 +322,15 @@ export class BundlerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    this.alarmInFlightSince = Date.now();
+    try {
+      await this.alarmBody();
+    } finally {
+      this.alarmInFlightSince = null;
+    }
+  }
+
+  private async alarmBody(): Promise<void> {
     // Re-arm FIRST — the reschedule must never depend on the body completing. Cloudflare's
     // automatic alarm retry budget is BOUNDED: an error thrown past the old end-of-body
     // setAlarm could exhaust it and end auto-bundling for this chain FOREVER, silently,
@@ -668,11 +684,13 @@ export class BundlerDO implements DurableObject {
       console.warn(`[BundlerDO] chain-registry registration failed: ${redactError(err)}`);
     }
 
-    // Schedule first alarm if none exists; an init means the chain is ACTIVE again, so any
-    // deliberate-idle flag is stale.
+    // Schedule first alarm unless a LIVE one exists (TIGHT grace); an init means the chain is
+    // ACTIVE again, so any deliberate-idle flag is stale. A non-null but past-due alarm is a
+    // zombie (armed but never delivered, e.g. orphaned across a dev reload) — replace it,
+    // don't trust it; a wrongly-replaced nearly-due alarm costs one duplicate latched cycle.
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     const existing = await this.state.storage.getAlarm();
-    if (!existing) {
+    if (!alarmIsLive(existing, this.alarmIntervalMs(), Date.now(), ALARM_TIGHT_GRACE_MS)) {
       await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
     }
   }
@@ -908,10 +926,20 @@ export class BundlerDO implements DurableObject {
     // the chain DO's own alarm status below.
     await this.probeRegisteredRelayers();
 
+    // An invocation demonstrably running in this isolate is alive no matter what getAlarm()
+    // reads (an ingress kick landing mid-run parks a past-due alarm behind the running body).
+    // Beyond the wedge limit it is NOT alive — fall through and page the operator.
+    if (this.alarmInFlightSince !== null && Date.now() - this.alarmInFlightSince < ALARM_IN_FLIGHT_WEDGE_MS) {
+      return Response.json({ rearmed: false, healthy: true, inFlight: true });
+    }
     const alarmAt = await this.state.storage.getAlarm();
-    if (alarmAt !== null) {
+    // A scheduled-in-the-past alarm is NOT healthy: the alarm body re-arms first thing, so a
+    // live loop always keeps this in the future. Past-due = dead delivery or a wedged in-flight
+    // invocation — fall through to the broken path.
+    if (alarmIsLive(alarmAt, this.alarmIntervalMs())) {
       return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
     }
+    const stale = alarmAt !== null;
     const knownChain = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
     if (knownChain === undefined) {
       return Response.json({ rearmed: false, unknown: true });
@@ -923,14 +951,15 @@ export class BundlerDO implements DurableObject {
     }
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
-    console.error(`[BundlerDO:${knownChain}] alarm chain was BROKEN — re-armed by cron liveness check`);
+    const how = stale ? `ZOMBIE (armed for ${new Date(alarmAt).toISOString()} but never delivered)` : "BROKEN";
+    console.error(`[BundlerDO:${knownChain}] alarm chain was ${how} — re-armed by cron liveness check`);
     await this.alerter.send(
       `alarm-rearmed-${knownChain}`,
-      `🚑 Vela Bundler — chain ${knownChain}'s Worker alarm chain was BROKEN (auto-bundling had ` +
+      `🚑 Vela Bundler — chain ${knownChain}'s Worker alarm chain was ${how} (auto-bundling had ` +
         `stopped${hasInFlight ? " WITH in-flight state" : ""}) and has been re-armed by the cron ` +
         `liveness check. Investigate why it died (logs around this time).`,
     );
-    return Response.json({ rearmed: true, chainId: knownChain });
+    return Response.json({ rearmed: true, chainId: knownChain, stale });
   }
 
   /** True when durable storage holds money-path state that reconciliation must finish:
@@ -997,7 +1026,16 @@ export class BundlerDO implements DurableObject {
         } else { kv = { present: false }; }
       } catch { kv = null; marker = null; }
     }
-    const kvIndex = kv?.index;
+    // Pool index for the RelayerDO fan-out: normally from the KV marker, but the pending marker
+    // expires after 900s — past that, a still-stranded op (e.g. behind a dead alarm loop) would
+    // be uninspectable AND untouchable, with no manual recovery vector. `?index=N` lets an
+    // operator aim the fan-out directly; the touch also rehydrates the RelayerDO, whose _init
+    // re-arms a zombie alarm and lets the next cycle TTL-evict the op to a terminal receipt.
+    let kvIndex = kv?.index;
+    if (kvIndex === undefined) {
+      const idxParam = parseInt(url.searchParams.get("index") ?? "");
+      if (Number.isInteger(idxParam) && idxParam >= 0 && idxParam < RELAYER_POOL_SIZE) kvIndex = idxParam;
+    }
 
     // Resolve an 'unknown' local result via the KV (queue mode): prefer a terminal receipt in the
     // KV (op landed; its receipt lives in the RelayerDO + KV, not here) → build the terminal stage;

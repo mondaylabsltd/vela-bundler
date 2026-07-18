@@ -13,6 +13,7 @@ import {
   serviceDegraded,
 } from "./errors.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
+import { TREASURY_FLOOR } from "../account/sponsor.ts";
 import { normalizeUserOp, userOpToRpc } from "../userop/normalize.ts";
 import { receiptToRpc, receiptToByHashRpc } from "./receipt-format.ts";
 import { validateUserOpFields, UserOpValidationError } from "../userop/validate.ts";
@@ -369,6 +370,28 @@ async function handleSendUserOperation(
       execResult.errorCode ?? RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED,
       execResult.errorMessage ?? "Execution simulation failed",
     );
+  }
+
+  // Admission gate — reject UP FRONT when this network's relayer treasury can't front the op's
+  // native gas. On vault chains the bundler fronts gas from config.treasuryAddress; if it sits
+  // below its operating floor, the op would otherwise be ADMITTED (a hash is returned → the wallet
+  // shows "submitted") then stall in the mempool with no gas to bundle and eventually drop — a dead
+  // receipt with no explanation. Rejecting here surfaces a stable, wallet-recognized error so the
+  // client shows the "start this network's relayer" bootstrap flow instead. FAIL-OPEN on a read
+  // error: a transient RPC blip must never block otherwise-healthy sends.
+  if (!isTempoChain(reqCtx.chainId) && vaultActiveForChain(config.settlementVaultChains, reqCtx.chainId)) {
+    let treasuryBalance: bigint | null = null;
+    try {
+      treasuryBalance = await getPublicClient(chain.rpcUrl || config.rpcUrl).getBalance({ address: config.treasuryAddress });
+    } catch (err) {
+      console.warn(`[Gate] treasury balance read failed for chain ${reqCtx.chainId} — allowing send (fail-open): ${String(err)}`);
+    }
+    if (treasuryBalance !== null && treasuryBalance < TREASURY_FLOOR) {
+      throw bundlerError(
+        RPC_ERROR_CODES.PAYMASTER_BALANCE_INSUFFICIENT,
+        "gas relayer is unavailable — this network's relayer treasury needs a bootstrap deposit before it can package transactions",
+      );
+    }
   }
 
   // Accept the validated op. Default path: add to the in-DO mempool + kick a bundle pass NOW
