@@ -134,6 +134,12 @@ export default {
       return stub.fetch(new Request(doUrl.toString(), request));
     }
 
+    // Fleet balances: GET /v1/pool/:chainId → treasury + 100 pool EOAs' native balances on a chain.
+    const poolMatch = url.pathname.match(/^\/v1\/pool\/(\d+)$/);
+    if (poolMatch && request.method === "GET") {
+      return routeToDO(env, request, parseInt(poolMatch[1]!), "/pool-balances");
+    }
+
     // Per-chain health: GET /health/:chainId → the chain's DO (real degraded status: locked
     // EOAs, pending receipts, circuit breaker). Read-only — does not force a chain init.
     const perChainHealth = url.pathname.match(/^\/health\/(\d+)$/);

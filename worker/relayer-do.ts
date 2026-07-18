@@ -234,8 +234,24 @@ export class RelayerDO implements DurableObject {
     if (url.pathname === "/inspect" && request.method === "GET") {
       const hash = (url.searchParams.get("hash") ?? "").trim();
       if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return Response.json({ error: "bad hash" }, { status: 400 });
-      if (!this.chainServices) return Response.json({ op: { hash, stage: "unknown", detail: "RelayerDO not initialized" } });
-      return Response.json({ op: this.chainServices.bundler.inspectOp(hash), poolIndex: this.poolIndex });
+      // A hibernated DO loses in-memory chainServices, but the op's state is durable (mp:/rc: keys).
+      // The inspect fan-out does NOT carry chainId/index, so rehydrate from the persisted pair the
+      // same way the alarm does — otherwise inspect after an idle-stop spuriously reports "not
+      // initialized" for an op that's actually sitting in the persisted mempool.
+      if (!this.chainServices) {
+        const chainId = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
+        const index = await this.state.storage.get<number>(STORAGE_KEY_POOL_INDEX);
+        if (chainId === undefined || index === undefined) {
+          return Response.json({ op: { hash, stage: "unknown", detail: "RelayerDO never initialized (no persisted state)" } });
+        }
+        try {
+          await this.ensureInitialized(chainId, index);
+        } catch (err) {
+          console.warn(`[RelayerDO:${chainId}#${index}] inspect rehydrate failed: ${redactError(err)}`);
+          return Response.json({ op: { hash, stage: "unknown", detail: "RelayerDO rehydrate failed during inspect" } });
+        }
+      }
+      return Response.json({ op: this.chainServices!.bundler.inspectOp(hash), poolIndex: this.poolIndex });
     }
 
     return new Response("not found", { status: 404 });

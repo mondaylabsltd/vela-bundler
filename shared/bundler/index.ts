@@ -595,6 +595,11 @@ export class BundlerService {
     return chainSpecEnables(this.config.queueTransportChains, this.config.chainId) && this.poolModeActive();
   }
 
+  /** Public read of pool-mode status (for the /debug inspector's fronting-EOA resolution). */
+  get poolActive(): boolean {
+    return this.poolModeActive();
+  }
+
   /**
    * Single acceptance choke point for a validated ingress op (called by
    * handleSendUserOperation after validate+simulate). Default: mempool.add + ingress bundle

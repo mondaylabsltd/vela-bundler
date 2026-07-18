@@ -38,7 +38,9 @@ import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
-import { metrics, logEvent } from "../shared/reliability/log.ts";
+import { metrics, logEvent, redactUrl } from "../shared/reliability/log.ts";
+import { relayerIndexForSender } from "../shared/queue/routing.ts";
+import { encodeFunctionData, decodeFunctionResult, parseAbi } from "viem";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
@@ -288,6 +290,10 @@ export class BundlerDO implements DurableObject {
 
       if (url.pathname === "/inspect" && request.method === "GET") {
         return await this.handleInspect(url, chainId);
+      }
+
+      if (url.pathname === "/pool-balances" && request.method === "GET") {
+        return await this.handlePoolBalances(chainId);
       }
 
       // Treasury-serialized EOA top-up. A per-EOA RelayerDO whose pool EOA can't afford its
@@ -977,26 +983,33 @@ export class BundlerDO implements DurableObject {
 
     let op = cs.bundler.inspectOp(hash);
 
-    // KV status marker (queue-mode 'accepted'/'pending' + terminal receipts). The 'accepted' and
-    // 'pending' markers also carry the pool INDEX so we can fan out to the owning RelayerDO.
+    // KV status marker (queue mode): 'accepted'/'pending' carry the pool INDEX (+ sender); terminal
+    // markers carry the receipt. Keep the parsed marker so we can (a) derive a terminal stage from
+    // the KV receipt when this chain DO doesn't hold it locally, and (b) fan out to the RelayerDO.
     let kv: { present: boolean; status?: string; hasReceipt?: boolean; index?: number } | null = null;
-    let kvIndex: number | undefined;
+    let marker: { status?: string; receipt?: SerializedReceipt; index?: number; sender?: string } | null = null;
     if (this.env.USEROP_STATUS) {
       try {
         const raw = await this.env.USEROP_STATUS.get(hash);
         if (raw) {
-          const p = JSON.parse(raw) as { status?: string; receipt?: unknown; index?: number };
-          kvIndex = typeof p.index === "number" ? p.index : undefined;
-          kv = { present: true, status: p.status, hasReceipt: p.receipt !== undefined, index: kvIndex };
-        } else {
-          kv = { present: false };
-        }
-      } catch { kv = null; }
+          marker = JSON.parse(raw) as { status?: string; receipt?: SerializedReceipt; index?: number; sender?: string };
+          kv = { present: true, status: marker.status, hasReceipt: marker.receipt !== undefined, index: typeof marker.index === "number" ? marker.index : undefined };
+        } else { kv = { present: false }; }
+      } catch { kv = null; marker = null; }
     }
+    const kvIndex = kv?.index;
 
-    // Queue mode: the op body lives in a per-index RelayerDO, not here. If we didn't find it locally
-    // and the KV marker names its index, fan out to that RelayerDO's /inspect for the real detail.
-    if (op.stage === "unknown" && kvIndex !== undefined && this.env.RELAYER) {
+    // Resolve an 'unknown' local result via the KV (queue mode): prefer a terminal receipt in the
+    // KV (op landed; its receipt lives in the RelayerDO + KV, not here) → build the terminal stage;
+    // else fan out to the owning RelayerDO for its live mempool/in-flight body.
+    if (op.stage === "unknown" && marker?.receipt) {
+      const r = marker.receipt;
+      op = {
+        hash, stage: r.success ? "confirmed" : "failed",
+        detail: r.success ? "landed on-chain (terminal — receipt from KV)" : "terminal failure (receipt from KV) — the wallet should resubmit",
+        receipt: { success: r.success, txHash: r.receipt?.transactionHash, actualGasCost: r.actualGasCost, actualGasUsed: r.actualGasUsed },
+      };
+    } else if (op.stage === "unknown" && kvIndex !== undefined && this.env.RELAYER) {
       try {
         const stub = this.env.RELAYER.get(this.env.RELAYER.idFromName(`chain-${chainId}-eoa-${kvIndex}`));
         const res = await stub.fetch(new Request(`https://relayer-do/inspect?hash=${hash}`));
@@ -1006,6 +1019,10 @@ export class BundlerDO implements DurableObject {
         console.warn(`[BundlerDO:${chainId}] inspect fan-out to relayer #${kvIndex} failed: ${redactError(err)}`);
       }
     }
+
+    // WHO pays the gas (fronting EOA) + its native balance, and WHICH RPC the submit uses.
+    const eoa = await this.resolveFrontingEoa(cs, op, kvIndex, marker?.sender);
+    const submitRpc = redactUrl(op.mempool?.rpcUrlOverride ?? cs.rpcUrl);
 
     const chain = {
       chainId,
@@ -1018,7 +1035,75 @@ export class BundlerDO implements DurableObject {
       oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
     };
 
-    return Response.json({ op, kv, chain }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
+    return Response.json({ op, kv, eoa, submitRpc, chain }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
+  }
+
+  /** Which EOA will (or did) front this op's gas, its role, and its native balance. In-flight →
+   *  the actual signer; queue mode → pool EOA #(hash(sender)%100); per-safe → deriveEOA(sender). */
+  private async resolveFrontingEoa(
+    cs: NonNullable<BundlerDO["chainServices"]>,
+    op: ReturnType<BundlerService["inspectOp"]>,
+    kvIndex: number | undefined,
+    kvSender: string | undefined,
+  ): Promise<{ address: string; role: string; balanceWei?: string } | null> {
+    const sender = op.mempool?.sender ?? kvSender;
+    let address: string | undefined;
+    let role = "";
+    if (op.inFlight?.eoaAddress) { address = op.inFlight.eoaAddress; role = "fronting EOA (in-flight)"; }
+    else if (kvIndex !== undefined) { address = (await cs.accountService.getPoolEOA(kvIndex)).address; role = `pool EOA #${kvIndex}`; }
+    else if (op.stage === "confirmed" || op.stage === "failed") { role = op.receipt?.txHash ? "see the tx from-address" : "terminal"; }
+    else if (sender) {
+      if (cs.bundler.queueModeActive()) {
+        const i = relayerIndexForSender(sender);
+        address = (await cs.accountService.getPoolEOA(i)).address; role = `pool EOA #${i} (queue-routed)`;
+      } else if (cs.bundler.poolActive) {
+        role = "a leased pool EOA (index assigned at bundle time)";
+      } else {
+        address = (await cs.accountService.deriveEOA(sender as `0x${string}`)).address; role = "per-safe EOA";
+      }
+    }
+    if (!address) return role ? { address: "", role } : null;
+    let balanceWei: string | undefined;
+    try { balanceWei = (await getPublicClient(cs.rpcUrl).getBalance({ address: address as `0x${string}` })).toString(); } catch { /* leave undefined */ }
+    return { address, role, balanceWei };
+  }
+
+  /** Fleet view: the treasury + all 100 pool EOAs' native balances on THIS chain (one Multicall3
+   *  read, so it's easy on the paid RPC). Powers the /debug balances panel. Read-only. */
+  private async handlePoolBalances(chainId: number): Promise<Response> {
+    const cs = this.chainServices;
+    if (!cs || !this.config) return Response.json({ error: "chain not initialized" }, { status: 503, headers: CORS_HEADERS });
+    const treasury = this.config.treasuryAddress;
+    const poolAddrs = await Promise.all(
+      Array.from({ length: RELAYER_POOL_SIZE }, (_, i) => cs.accountService.getPoolEOA(i).then((e) => e.address)),
+    );
+    const balances = await this.readNativeBalances(cs.rpcUrl, [treasury, ...poolAddrs]);
+    return Response.json({
+      chainId,
+      treasury: { address: treasury, balanceWei: balances[0]?.toString() ?? null },
+      pool: poolAddrs.map((address, i) => ({ index: i, address, balanceWei: balances[i + 1]?.toString() ?? null })),
+    }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
+  }
+
+  /** Batch native balances via Multicall3 (1 eth_call). Falls back to parallel getBalance on a
+   *  chain without Multicall3 or a decode error. */
+  private async readNativeBalances(rpcUrl: string, addresses: string[]): Promise<(bigint | null)[]> {
+    const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
+    const client = getPublicClient(rpcUrl);
+    try {
+      const mc = parseAbi(["function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[] returnData)"]);
+      const bal = parseAbi(["function getEthBalance(address addr) view returns (uint256)"]);
+      const calls = addresses.map((a) => ({
+        target: MULTICALL3, allowFailure: true,
+        callData: encodeFunctionData({ abi: bal, functionName: "getEthBalance", args: [a as `0x${string}`] }),
+      }));
+      const res = await client.call({ to: MULTICALL3, data: encodeFunctionData({ abi: mc, functionName: "aggregate3", args: [calls] }) });
+      if (!res.data) throw new Error("no data");
+      const decoded = decodeFunctionResult({ abi: mc, functionName: "aggregate3", data: res.data }) as readonly { success: boolean; returnData: `0x${string}` }[];
+      return decoded.map((d) => (d.success && d.returnData && d.returnData !== "0x" ? BigInt(d.returnData) : null));
+    } catch {
+      return Promise.all(addresses.map((a) => client.getBalance({ address: a as `0x${string}` }).then((b) => b as bigint | null).catch(() => null)));
+    }
   }
 
   private handleHealth(requestedChainId: number = this.chainId): Response {

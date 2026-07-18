@@ -64,6 +64,14 @@ export const DEBUG_PAGE_HTML = `<!doctype html>
     <div class="card"><h2>This op</h2><div id="op"></div></div>
     <div class="card"><h2>Chain health &amp; funding</h2><div id="chain"></div></div>
   </div>
+  <div class="card" style="margin-top:16px">
+    <h2>Fleet balances — treasury + 100 pool EOAs</h2>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input id="bchains" placeholder="chainIds, comma-sep (blank = use the chain above)" style="flex:1" />
+      <button id="bload">Load balances</button>
+    </div>
+    <div id="bal"><span class="muted">Enter chain(s) and Load. 🔴 empty · 🟡 &lt;0.0001 ETH · 🟢 ok.</span></div>
+  </div>
   <div class="foot" id="ts"></div>
   <div class="foot">Stages: <b>Ingress</b> validate+simulate+gate → <b>Mempool</b> (DO storage <code>mp:</code>, retried ~10s, 5-min TTL) →
     <b>In-flight</b> (pending receipt, fee-bump→cancellation) → <b>Confirmed</b>/<b>Failed</b> (receipt store <code>rc:</code> + KV).
@@ -78,6 +86,8 @@ function pill(text, cls){ return '<span class="pill '+cls+'">'+text+'</span>'; }
 function rows(obj){ return Object.entries(obj).filter(([,v])=>v!==undefined&&v!==null&&v!=='')
   .map(([k,v])=>'<div class="row"><span class="lab">'+k+'</span><span class="val">'+v+'</span></div>').join(''); }
 function ms(x){ return x==null?'':(x<1000?x+'ms':(x/1000).toFixed(1)+'s'); }
+function eth(wei){ if(wei==null) return '?'; const n=Number(BigInt(wei))/1e18; return (n<0.001?n.toFixed(7):n.toFixed(4))+' ETH'; }
+function balClass(wei){ if(wei==null) return 'p-idle'; const w=BigInt(wei); if(w===0n) return 'p-bad'; if(w<100000000000000n) return 'p-warn'; return 'p-ok'; }
 
 function renderPipe(stage){
   const idx = {mempool:1,"in-flight":2,confirmed:3,failed:3}[stage];
@@ -116,6 +126,10 @@ function render(d){
   if(op.inFlight) o+=rows({ where:'pending receipt (in-flight)', txHash:op.inFlight.txHash, txNonce:op.inFlight.txNonce, 'fronting EOA':op.inFlight.eoaAddress, 'reconcile checks':op.inFlight.checkCount, 'fee-bumps':op.inFlight.bumpCount, cancelAttempted:op.inFlight.lastCancelAt?'yes':'no', 'in-flight for':ms(op.inFlight.ageMs), priorHashes:(op.inFlight.priorTxHashes||[]).join(', ') });
   if(op.receipt) o+=rows({ where:'receipt store (rc:) + KV', success:op.receipt.success, txHash:op.receipt.txHash, actualGasCost:op.receipt.actualGasCost, actualGasUsed:op.receipt.actualGasUsed });
   if(kv) o+=rows({ 'KV marker':kv.present?('status='+(kv.status||'?')+(kv.index!=null?' · RelayerDO #'+kv.index:'')+(kv.hasReceipt?' (has receipt)':'')):'none' });
+  // WHO pays the gas + can they, and WHICH RPC submits.
+  if(d.eoa) o+='<div class="row"><span class="lab">fronting EOA</span><span class="val">'+(d.eoa.address||'')+' '+pill(d.eoa.role,'p-idle')+'</span></div>'
+    +'<div class="row"><span class="lab">EOA gas balance</span><span class="val">'+(d.eoa.balanceWei!=null?pill(eth(d.eoa.balanceWei),balClass(d.eoa.balanceWei))+(BigInt(d.eoa.balanceWei)===0n?' ⚠ can\\'t pay gas':''):'—')+'</span></div>';
+  if(d.submitRpc) o+=rows({ 'submit RPC':d.submitRpc });
   $('op').innerHTML=o;
 
   // chain card
@@ -137,6 +151,25 @@ async function poll(){
     render(d);
   }catch(e){ $('banner').innerHTML='<div class="banner bad">fetch failed: '+e+'</div>'; }
 }
+async function loadBalances(){
+  const chains=($('bchains').value.trim()||$('chain').value.trim()).split(',').map(s=>s.trim()).filter(Boolean);
+  if(!chains.length){ $('bal').innerHTML='<div class="banner warn">Enter at least one chainId.</div>'; return; }
+  $('bal').innerHTML='<span class="muted">loading '+chains.length+' chain(s)… (1 Multicall3 read each)</span>';
+  let html='';
+  for(const c of chains){
+    try{
+      const r=await fetch('/v1/pool/'+c,{cache:'no-store'}); const d=await r.json();
+      if(d.error){ html+='<div class="banner warn">chain '+c+': '+d.error+'</div>'; continue; }
+      const empty=d.pool.filter(p=>p.balanceWei==='0'||p.balanceWei==null).length;
+      html+='<div style="margin:16px 0 6px"><b>chain '+c+'</b> &nbsp; treasury '+pill(eth(d.treasury.balanceWei),balClass(d.treasury.balanceWei))
+        +' <span class="muted" title="'+d.treasury.address+'">'+d.treasury.address.slice(0,10)+'…</span> &nbsp; <span class="muted">'+empty+'/100 pool EOAs empty</span></div>';
+      html+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:4px">'+
+        d.pool.map(p=>'<span class="pill '+balClass(p.balanceWei)+'" title="'+p.address+'" style="text-align:left;font-size:11px">#'+p.index+' · '+eth(p.balanceWei)+'</span>').join('')+'</div>';
+    }catch(e){ html+='<div class="banner bad">chain '+c+': '+e+'</div>'; }
+  }
+  $('bal').innerHTML=html;
+}
+$('bload').onclick=loadBalances;
 $('go').onclick=poll;
 $('hash').addEventListener('keydown',e=>{ if(e.key==='Enter') poll(); });
 $('auto').onclick=function(){

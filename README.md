@@ -13,19 +13,64 @@ npm install
 npx wrangler secret put OPERATOR_SECRET     # 32+ byte hex secret for key derivation
 npx wrangler secret put ALCHEMY_API_KEY     # optional
 npm run deploy
+npx wrangler dev -c wrangler.dev.jsonc
 ```
 
 Any EVM chain is supported automatically — the first request for a chain creates its Durable Object.
 
 ## How It Works
 
-1. Each user's **safeAddress** gets a **dedicated bundler EOA**, deterministically derived from `(chainId, entryPoint, safeAddress, operatorSecret)`.
-2. Users deposit native tokens to their dedicated EOA (or a `pathUSD` stablecoin float on Tempo).
-3. The bundler submits `handleOps` when the EOA has sufficient balance.
-4. Each bundle contains ops from **one safeAddress only**, signed by its dedicated EOA.
-5. On native chains the `handleOps` **beneficiary is the `VelaGasSettlementSplitter`**, whose `receive()` splits the EntryPoint gas refund 50/50 between the EOA and the treasury. On Tempo the bundler is repaid by an in-band stablecoin transfer. (There is no periodic treasury sweep — that mechanism was removed in favor of the on-chain splitter.)
+- **In-band gas settlement** (all EVM chains): a bundler-controlled EOA fronts the native gas for `handleOps`; the UserOp batches an in-band transfer that repays it. The wallet quotes/signs **3× the real gas**; the bundler gate accepts **≥ 2×** (stablecoins floored at ~$0.01-equiv, native has no floor). In **vault** mode the reimbursement + the EntryPoint beneficiary are the **treasury**, and the fronting EOA's native float is refilled from the treasury on demand.
+- **Two transports, flag-gated** (`POOL_EOA_ENABLED` / `QUEUE_TRANSPORT_ENABLED`, per-chain):
+  - **Per-safe** (default): each safe has a dedicated EOA `deriveEOA(sender)`; the chain DO bundles it directly.
+  - **Pool + queue** (Stage 3/4): a **100-EOA HKDF pool** (same address on every chain, no chainId) + a Cloudflare Queue; each `(chain, pool index)` is its own **RelayerDO** whose input gate is the per-EOA lock.
 
-No external database — money-path state (accepted ops, in-flight receipts, terminal receipts) is persisted in per-chain Durable Object storage; the rest is derived or in-memory.
+No external database — money-path state (accepted ops, in-flight receipts, terminal receipts, dead-man registrations) is persisted in per-chain / per-index Durable Object storage; the rest is derived or in-memory.
+
+## Transaction Lifecycle
+
+Where a UserOp flows and how each failure is handled. Watch any op live at **`GET /debug`** (enter chainId + hash); fleet balances (treasury + 100 pool EOAs per chain) are on the same page.
+
+```
+ WALLET ──POST /:chainId──▶ Worker ──idFromName(chain-N)──▶ BundlerDO (one per chain)
+
+ 1. INGRESS  handleSendUserOperation
+    validate → simulate validation → simulate execution (eth_simulateV1) → gas price
+    → in-band reimbursement gate (≥2× real gas; stablecoins floored at $0.01)
+    ✗ reject → synchronous JSON-RPC error to the wallet (nothing stored)
+
+ 2. ACCEPT  acceptUserOp — transport is flag-gated:
+    ├─ QUEUE off ─▶ DO mempool  (persisted mp:<hash>)  ── kicks the alarm
+    └─ QUEUE on  ─▶ Cloudflare Queue + KV 'accepted' marker
+                     └─ consumer routes hash(sender)%100 ─▶ RelayerDO /submit
+                          └─▶ RelayerDO mempool  (persisted mp:<hash>)
+       ✗ queue send ambiguous → NOT dropped (wallet retries, deduped)   ✗ unbound → mempool fallback
+
+ 3. BUNDLE  ~10s alarm → kickBundle → build ONE handleOps
+    select ops → simulate bundle → in-band gate → sign with the FRONTING EOA
+    (per-safe: deriveEOA(sender) · pool: pool EOA #i) → broadcast → PENDING receipt (persisted)
+    ✗ EOA can't afford gas → KEEP the op, flag the EOA, refill it from the treasury, retry each alarm
+    ✗ one op underpays (pool) → drop only that op (failed receipt), reassemble the survivors
+
+ 4. RECONCILE  alarm → checkPendingReceipts
+    confirmed → TERMINAL receipt (success) → rc:<hash> (+ KV in queue mode) → wallet reads it
+    ✗ reverted / no UserOperationEvent → TERMINAL failed receipt
+    ✗ underpriced / stuck             → fee-bump (≤2×) → same-nonce CANCELLATION (unbricks the EOA)
+    ✗ dropped (nonce consumed, no rcpt) → TERMINAL failed receipt
+```
+
+**Failure / retry summary**
+
+| Situation | Handling | Bound |
+|---|---|---|
+| Fronting EOA out of gas | keep op · refill EOA from treasury (sized to the bundle's gas) · retry | 5-min mempool TTL |
+| Mempool TTL reached | evict → terminal **failed** receipt (wallet resubmits) | 5 min |
+| Tx stuck / underpriced | fee-bump ≤2× → same-nonce cancellation | ~1h abandonment |
+| Treasury can't fund the EOA | defer + `float-topup-depleted` alert; self-heals on top-up | — |
+| Queue delivery fails (queue mode) | CF retries ×3 → **DLQ** consumer writes a failed receipt + pages | 3 retries |
+| RelayerDO alarm dies (queue mode) | 5-min cron dead-man probe re-arms + alerts | 5-min cron |
+
+Every money-stuck condition (stuck mempool, unconfirmed bundle, locked EOA, underfunded EOA, DLQ arrival, degraded pricing) fires a de-duplicated **Telegram alert**. Durable state survives DO eviction; a 5-minute liveness cron revives any broken alarm chain (chain DO **and** RelayerDOs).
 
 ## Architecture
 
@@ -46,8 +91,11 @@ shared/              Platform-agnostic bundler logic (consumed by the worker)
 └── utils/           Hex utilities, RPC client factory
 
 worker/              Cloudflare Workers runtime
-├── index.ts         Fetch handler — routes by chainId to DO
+├── index.ts         Fetch handler + queue consumer + DLQ + /debug routes
 ├── bundler-do.ts    BundlerDO — one Durable Object per chain
+├── relayer-do.ts    RelayerDO — one per (chain, pool index) for queue transport
+├── producer.ts      Queue enqueue hook (ingress → USEROP_QUEUE + KV marker)
+├── debug-page.ts    /debug observability UI (self-contained HTML)
 ├── config.ts        Env-based config (CF bindings)
 └── types.ts         Env interface
 
@@ -68,6 +116,7 @@ npm run test:worker        # worker/ runtime tests only (vitest + miniflare)
 ```
 
 **Secrets** (set via `npx wrangler secret put`):
+
 - `OPERATOR_SECRET` — required
 - `ALCHEMY_API_KEY` — optional, for preferred RPCs
 
@@ -88,35 +137,38 @@ Treasury address is also derived from `operatorSecret` (same on all chains).
 
 ## RPC URL Priority
 
-| Priority | Source | Scope |
-|----------|--------|-------|
-| 1 | `X-Rpc-Url` header | Per-request |
-| 2 | Alchemy RPC | If `ALCHEMY_API_KEY` set + chain supported |
-| 3 | Chain registry | Public RPCs, health-checked |
+
+| Priority | Source             | Scope                                     |
+| ---------- | -------------------- | ------------------------------------------- |
+| 1        | `X-Rpc-Url` header | Per-request                               |
+| 2        | Alchemy RPC        | If`ALCHEMY_API_KEY` set + chain supported |
+| 3        | Chain registry     | Public RPCs, health-checked               |
 
 ## API
 
 ### JSON-RPC: `POST /:chainId`
 
-| Method | Description |
-|--------|-------------|
-| `eth_sendUserOperation` | Submit UserOp (checks balance, binding, profitability) |
-| `eth_estimateUserOperationGas` | Estimate gas limits |
-| `eth_getUserOperationByHash` | Get UserOp by hash |
-| `eth_getUserOperationReceipt` | Get receipt |
-| `eth_supportedEntryPoints` | List EntryPoints |
-| `eth_chainId` | Chain ID |
+
+| Method                         | Description                                            |
+| -------------------------------- | -------------------------------------------------------- |
+| `eth_sendUserOperation`        | Submit UserOp (checks balance, binding, profitability) |
+| `eth_estimateUserOperationGas` | Estimate gas limits                                    |
+| `eth_getUserOperationByHash`   | Get UserOp by hash                                     |
+| `eth_getUserOperationReceipt`  | Get receipt                                            |
+| `eth_supportedEntryPoints`     | List EntryPoints                                       |
+| `eth_chainId`                  | Chain ID                                               |
 
 All methods support `X-Rpc-Url` header. Batch requests capped at 20.
 
 ### REST API
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/account/:chainId/:safeAddress` | GET | Account info (balance, nonce, status) |
-| `/v1/treasury` | GET | Treasury address |
-| `/v1/sponsor/:chainId/:safeAddress` | POST | Request gas sponsorship |
-| `/health` | GET | Service health + stats |
+
+| Endpoint                            | Method | Description                           |
+| ------------------------------------- | -------- | --------------------------------------- |
+| `/v1/account/:chainId/:safeAddress` | GET    | Account info (balance, nonce, status) |
+| `/v1/treasury`                      | GET    | Treasury address                      |
+| `/v1/sponsor/:chainId/:safeAddress` | POST   | Request gas sponsorship               |
+| `/health`                           | GET    | Service health + stats                |
 
 ### Health Endpoint
 
@@ -146,28 +198,29 @@ force a chain init.
 
 Only `OPERATOR_SECRET` is required. Treasury address is derived from it.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPERATOR_SECRET` | — | **Required.** 32+ byte hex secret |
-| `ENTRY_POINT_ADDRESS` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7 |
-| `BUNDLING_MODE` | `auto` | `auto` or `manual` |
-| `MAX_BUNDLE_SIZE` | `10` | Max UserOps per bundle |
-| `MAX_BUNDLE_GAS` | `5000000` | Max gas per bundle |
-| `AUTO_BUNDLE_INTERVAL_MS` | `10000` | Auto-bundling interval (ms) |
-| `OLD_OPERATOR_SECRETS` | — | Old secrets for draining rotated EOAs (comma-separated) |
-| `ALCHEMY_API_KEY` | — | Alchemy API key for preferred RPCs |
-| `USE_EIP1559` | `true` | Enable EIP-1559 gas pricing |
-| `BASE_FEE_MULTIPLIER` | `1.25` | Base fee buffer multiplier |
-| `BUNDLER_TIP_GWEI` | `0.5` | Fallback priority fee (Gwei) |
-| `MIN_PRIORITY_FEE_PER_GAS` | `0` | Minimum priority fee (wei) |
-| `MIN_PROFIT_MARGIN_BPS` | `1000` | Minimum margin (10%) |
-| `MAX_PROFIT_MARGIN_BPS` | `15000` | Maximum margin cap |
-| `API_RATE_LIMIT_PER_MINUTE` | `60` | Rate limit per IP |
-| `RATE_LIMIT_ALLOWLIST` | — | Comma-separated client IPs exempt from rate limiting (your own bot) |
-| `BALANCE_RESERVE_MULTIPLIER` | `1` | Balance reserve multiplier |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | **Set both in production.** Telegram alerts for every intervention-worthy state (stuck money, broadcast failures, treasury low, code errors) + 6h alive heartbeat. Unset = disabled (loud warning; `alerting` field in `/health`) |
-| `TREASURY_ALERT_THRESHOLD_WEI` | `0.02 ETH` | Treasury alert floor (auto-raised to the sponsor's dynamic fail-closed floor on native chains) |
-| `TREASURY_ALERT_THRESHOLD_PATHUSD` | `0.5` | Tempo treasury alert floor (6-dec units) |
+
+| Variable                                  | Default                                      | Description                                                                                                                                                                                                                       |
+| ------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPERATOR_SECRET`                         | —                                           | **Required.** 32+ byte hex secret                                                                                                                                                                                                 |
+| `ENTRY_POINT_ADDRESS`                     | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | EntryPoint v0.7                                                                                                                                                                                                                   |
+| `BUNDLING_MODE`                           | `auto`                                       | `auto` or `manual`                                                                                                                                                                                                                |
+| `MAX_BUNDLE_SIZE`                         | `10`                                         | Max UserOps per bundle                                                                                                                                                                                                            |
+| `MAX_BUNDLE_GAS`                          | `5000000`                                    | Max gas per bundle                                                                                                                                                                                                                |
+| `AUTO_BUNDLE_INTERVAL_MS`                 | `10000`                                      | Auto-bundling interval (ms)                                                                                                                                                                                                       |
+| `OLD_OPERATOR_SECRETS`                    | —                                           | Old secrets for draining rotated EOAs (comma-separated)                                                                                                                                                                           |
+| `ALCHEMY_API_KEY`                         | —                                           | Alchemy API key for preferred RPCs                                                                                                                                                                                                |
+| `USE_EIP1559`                             | `true`                                       | Enable EIP-1559 gas pricing                                                                                                                                                                                                       |
+| `BASE_FEE_MULTIPLIER`                     | `1.25`                                       | Base fee buffer multiplier                                                                                                                                                                                                        |
+| `BUNDLER_TIP_GWEI`                        | `0.5`                                        | Fallback priority fee (Gwei)                                                                                                                                                                                                      |
+| `MIN_PRIORITY_FEE_PER_GAS`                | `0`                                          | Minimum priority fee (wei)                                                                                                                                                                                                        |
+| `MIN_PROFIT_MARGIN_BPS`                   | `1000`                                       | Minimum margin (10%)                                                                                                                                                                                                              |
+| `MAX_PROFIT_MARGIN_BPS`                   | `15000`                                      | Maximum margin cap                                                                                                                                                                                                                |
+| `API_RATE_LIMIT_PER_MINUTE`               | `60`                                         | Rate limit per IP                                                                                                                                                                                                                 |
+| `RATE_LIMIT_ALLOWLIST`                    | —                                           | Comma-separated client IPs exempt from rate limiting (your own bot)                                                                                                                                                               |
+| `BALANCE_RESERVE_MULTIPLIER`              | `1`                                          | Balance reserve multiplier                                                                                                                                                                                                        |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | —                                           | **Set both in production.** Telegram alerts for every intervention-worthy state (stuck money, broadcast failures, treasury low, code errors) + 6h alive heartbeat. Unset = disabled (loud warning; `alerting` field in `/health`) |
+| `TREASURY_ALERT_THRESHOLD_WEI`            | `0.02 ETH`                                   | Treasury alert floor (auto-raised to the sponsor's dynamic fail-closed floor on native chains)                                                                                                                                    |
+| `TREASURY_ALERT_THRESHOLD_PATHUSD`        | `0.5`                                        | Tempo treasury alert floor (6-dec units)                                                                                                                                                                                          |
 
 ## Known Limitations
 
