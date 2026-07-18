@@ -14,6 +14,8 @@
 import type { Env } from "./types.ts";
 import { buildConfig } from "./config.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
+import { vaultActiveForChain } from "../shared/tempo.ts";
+import { chainSpecEnables } from "../shared/config/vault.ts";
 import { resolveChain } from "../shared/config/chain-registry.ts";
 import { createSimulator } from "../shared/simulation/index.ts";
 import {
@@ -22,7 +24,9 @@ import {
   deserializeMempoolEntry,
   type SerializedMempoolEntry,
 } from "../shared/mempool/index.ts";
-import type { SerializedReceipt } from "../shared/bundler/index.ts";
+import { deserializeReceipt, type SerializedReceipt } from "../shared/bundler/index.ts";
+import { makeEnqueueHook } from "./producer.ts";
+import { receiptToRpc, receiptToByHashRpc } from "../shared/rpc/receipt-format.ts";
 import { redactError } from "../shared/reliability/log.ts";
 import { RepeatedErrorEscalator } from "../shared/monitoring/escalation.ts";
 import { maybeSendAliveHeartbeat } from "../shared/monitoring/operational.ts";
@@ -30,11 +34,14 @@ import { AccountService } from "../shared/account/index.ts";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
-import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
+import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
-import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { resolveRpcUrl, getPublicClient, getFailoverPublicClient, trustedMoneyPathRpcs } from "../shared/utils/rpc-client.ts";
+import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
-import { metrics, logEvent } from "../shared/reliability/log.ts";
+import { metrics, logEvent, redactUrl } from "../shared/reliability/log.ts";
+import { relayerIndexForSender } from "../shared/queue/routing.ts";
+import { encodeFunctionData, decodeFunctionResult, parseAbi } from "viem";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
@@ -42,10 +49,12 @@ import {
   processRequest,
   jsonResponse,
   type RequestContext,
+  type JsonRpcResponse,
 } from "../shared/rpc/process.ts";
 import {
   parseError,
   invalidRequest,
+  invalidParams,
   internalError,
 } from "../shared/rpc/errors.ts";
 import { validateRpcUrl } from "../shared/utils/rpc-client.ts";
@@ -87,6 +96,9 @@ const STORAGE_KEY_LAST_HEARTBEAT = "lastHeartbeatAt";
  *  each write stays O(1). */
 const MEMPOOL_KEY_PREFIX = "mp:";
 const RECEIPT_KEY_PREFIX = "rc:";
+/** Dead-man watch registry (B6): a RelayerDO registers `rwatch:<index>` while it holds stranded
+ *  money-path state; the cron liveness probe fans out to each registered index's /ensure-alarm. */
+const RELAYER_WATCH_PREFIX = "rwatch:";
 
 /** DO storage flag: the alarm was stopped DELIBERATELY (chain fully idle / abandoned) —
  *  distinguishes "healthy idle" from "alarm chain broken" for the cron liveness probe. */
@@ -173,6 +185,12 @@ export class BundlerDO implements DurableObject {
   /** Consecutive fully-idle alarm cycles — see IDLE_STOP_CYCLES. Reset by any activity;
    *  an eviction resets it too (counting simply restarts — the safe direction). */
   private idleCycles = 0;
+  /** Wall-clock start of the alarm invocation currently running in this isolate, if any. An
+   *  ingress kick (setAlarm(now)) landing DURING a slow invocation makes getAlarm() read
+   *  past-due while the loop is demonstrably alive — this flag lets the liveness guards tell
+   *  "slow but running" (leave alone) from zombie/wedged (re-arm/alert). In-memory on purpose:
+   *  a process restart (the zombie scenario) must NOT inherit it. */
+  private alarmInFlightSince: number | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -226,6 +244,12 @@ export class BundlerDO implements DurableObject {
       return await this.handleEnsureAlarm();
     }
 
+    // Dead-man watch registry (B6): a RelayerDO PUTs/DELETEs its index here while it holds
+    // stranded money-path state. Storage-only, no init needed.
+    if (url.pathname === "/relayer-watch") {
+      return await this.handleRelayerWatch(url, request.method);
+    }
+
     if (chainId > 0) {
       if (url.pathname === "/health") {
         // Health is READ-ONLY. Do NOT force-init a brand-new/bogus chainId just because someone
@@ -271,6 +295,22 @@ export class BundlerDO implements DurableObject {
         return this.handleHealth(chainId);
       }
 
+      if (url.pathname === "/inspect" && request.method === "GET") {
+        return await this.handleInspect(url, chainId);
+      }
+
+      if (url.pathname === "/pool-balances" && request.method === "GET") {
+        return await this.handlePoolBalances(chainId);
+      }
+
+      // Treasury-serialized EOA top-up. A per-EOA RelayerDO whose pool EOA can't afford its
+      // outer gas calls this so ALL treasury sends go through the ONE chain DO's SponsorService
+      // (runTreasuryExclusive) — 100 RelayerDOs sending treasury txs directly would race its
+      // nonce. Internal (DO→DO) only. Fire-and-forget from the caller's view; returns the result.
+      if (url.pathname === "/fund-eoa" && request.method === "POST") {
+        return await this.handleFundEoa(url);
+      }
+
       return new Response("not found", { status: 404 });
     } catch (err) {
       console.error(`[BundlerDO:${this.chainId}] Error:`, err);
@@ -282,6 +322,15 @@ export class BundlerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    this.alarmInFlightSince = Date.now();
+    try {
+      await this.alarmBody();
+    } finally {
+      this.alarmInFlightSince = null;
+    }
+  }
+
+  private async alarmBody(): Promise<void> {
     // Re-arm FIRST — the reschedule must never depend on the body completing. Cloudflare's
     // automatic alarm retry budget is BOUNDED: an error thrown past the old end-of-body
     // setAlarm could exhaust it and end auto-bundling for this chain FOREVER, silently,
@@ -464,9 +513,6 @@ export class BundlerDO implements DurableObject {
       oldOperatorSecrets: this.config.oldOperatorSecrets,
     });
 
-    // Share the DO's alerter (one dedup map per chain isolate).
-    this.sponsorService = new SponsorService(this.config, this.alerter);
-
     // Resolve chain RPC + metadata (mirrors ChainRegistry.initChain)
     const resolved = await resolveChain(chainId, this.config.alchemyApiKey);
     const effectiveRpc = resolveRpcUrl({ rpcUrl: resolved.rpcUrl });
@@ -478,6 +524,10 @@ export class BundlerDO implements DurableObject {
       publicRpcs: resolved.publicRpcs,
       chainInfo: resolved.chain,
     };
+
+    // Share the DO's alerter (one dedup map per chain isolate). Built with the CHAIN config so the
+    // treasury top-up path has this chain's publicRpcs and can fail over off a rate-limited primary.
+    this.sponsorService = new SponsorService(chainConfig, this.alerter);
 
     const simulator = createSimulator(chainConfig);
     const mempool = new Mempool({
@@ -517,6 +567,28 @@ export class BundlerDO implements DurableObject {
     // interval (the alarm serializes with any in-progress run; ~10s saved per op matters
     // for 5-minute trading windows).
     bundler.setKickHook(() => this.state.storage.setAlarm(Date.now()));
+
+    // Immediate float refill: the INSTANT a bundle can't afford its outer gas (a fresh pool EOA
+    // that the sweep hasn't funded yet, or a drained fronting EOA), request a treasury→EOA
+    // top-up NOW instead of waiting for the next healthLoop tick. topUpFloatEOA is bounded +
+    // in-flight-deduped, so repeated flags collapse to one send; the op stays in the mempool and
+    // retries on the next alarm, by which time the funding tx has mined. Only on vault chains —
+    // on a legacy deposit chain the EOA balance is the USER's, never operator-topped.
+    bundler.setInsufficientFundsHook((eoa, shortfallWei) => {
+      if (!this.sponsorService || !this.chainServices) return;
+      if (!vaultActiveForChain(this.config?.settlementVaultChains, this.chainId)) return;
+      void this.sponsorService
+        .topUpFloatEOA(this.chainId, this.chainServices.rpcUrl, eoa, shortfallWei)
+        .then(() => this.state.storage.setAlarm(Date.now())) // re-bundle promptly once funded
+        .catch((err: unknown) => console.warn(`[BundlerDO:${this.chainId}] immediate float top-up failed: ${redactError(err)}`));
+    });
+
+    // Stage 4 producer: on chains where queue transport is active (QUEUE_TRANSPORT_ENABLED),
+    // acceptUserOp hands the validated op to this hook instead of the in-DO mempool — it
+    // enqueues to USEROP_QUEUE + writes the accepted-op KV marker. Wired unconditionally
+    // (harmless when the flag is off: acceptUserOp gates on queueModeActive, so it is never
+    // called); degrades to the mempool if USEROP_QUEUE is unbound at runtime.
+    bundler.setEnqueueHook(makeEnqueueHook(this.env, { chainId, entryPoint: chainConfig.entryPointAddress }));
 
     // Durably persist accepted-unbundled ops: a deploy/eviction used to wipe the in-memory
     // mempool, silently vanishing accepted ops (the wallet polls null forever — worse than
@@ -613,11 +685,13 @@ export class BundlerDO implements DurableObject {
       console.warn(`[BundlerDO] chain-registry registration failed: ${redactError(err)}`);
     }
 
-    // Schedule first alarm if none exists; an init means the chain is ACTIVE again, so any
-    // deliberate-idle flag is stale.
+    // Schedule first alarm unless a LIVE one exists (TIGHT grace); an init means the chain is
+    // ACTIVE again, so any deliberate-idle flag is stale. A non-null but past-due alarm is a
+    // zombie (armed but never delivered, e.g. orphaned across a dev reload) — replace it,
+    // don't trust it; a wrongly-replaced nearly-due alarm costs one duplicate latched cycle.
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     const existing = await this.state.storage.getAlarm();
-    if (!existing) {
+    if (!alarmIsLive(existing, this.alarmIntervalMs(), Date.now(), ALARM_TIGHT_GRACE_MS)) {
       await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
     }
   }
@@ -693,11 +767,70 @@ export class BundlerDO implements DurableObject {
           ? r.value
           : { jsonrpc: "2.0" as const, id: (body[i]?.id as number | string) ?? null, error: internalError("Internal error") },
       );
+      await this.fillQueueModeReceiptLookups(body, responses);
       return jsonResponse(responses, corsHeaders);
     }
 
     const response = await processRequest(body, this.config, this.chainAdapter, reqCtx);
+    await this.fillQueueModeReceiptLookups(body, response);
     return jsonResponse(response, corsHeaders);
+  }
+
+  /**
+   * Stage 4 receipt lookup for queue-mode ops. In queue transport, a UserOp never enters this
+   * chain DO's own mempool/receipts (the producer enqueued it to a RelayerDO), so the in-DO
+   * eth_getUserOperationReceipt / eth_getUserOperationByHash resolve to null. A RelayerDO
+   * publishes the TERMINAL receipt to USEROP_STATUS KV on confirmation; read it here and fill
+   * the response so the wallet's poll resolves without fanning out to 100 DOs. Only runs when
+   * queue mode is active for this chain AND the in-DO lookup already returned null — non-queue
+   * chains (and any op already answered in-DO) are byte-identical to before. An accepted-but-
+   * not-yet-mined op has a marker without a receipt → left null (still pending), as today.
+   */
+  private async fillQueueModeReceiptLookups(
+    body: unknown,
+    response: JsonRpcResponse | JsonRpcResponse[],
+  ): Promise<void> {
+    const kv = this.env.USEROP_STATUS;
+    if (!kv) return;
+    if (!this.chainServices || !this.chainServices.bundler.queueModeActive()) return;
+
+    const fill = async (req: unknown, resp: JsonRpcResponse): Promise<void> => {
+      if (!req || typeof req !== "object") return;
+      const method = (req as { method?: unknown }).method;
+      if (method !== "eth_getUserOperationReceipt" && method !== "eth_getUserOperationByHash") return;
+      if (resp.result !== null) return; // in-DO lookup already answered (or it's an error)
+      const params = (req as { params?: unknown }).params;
+      const hash = Array.isArray(params) ? params[0] : undefined;
+      if (typeof hash !== "string" || !hash.startsWith("0x")) return;
+      const filled = await this.readStatusReceipt(method, hash).catch(() => undefined);
+      if (filled !== undefined) resp.result = filled;
+    };
+
+    if (Array.isArray(body) && Array.isArray(response)) {
+      await Promise.all(body.map((b, i) => (response[i] ? fill(b, response[i]!) : Promise.resolve())));
+    } else if (!Array.isArray(body) && !Array.isArray(response)) {
+      await fill(body, response);
+    }
+  }
+
+  /** Read a terminal receipt from USEROP_STATUS KV and format it for the given method. Returns
+   *  undefined when there is no KV entry or the op is still pending (marker without a receipt). */
+  private async readStatusReceipt(method: string, userOpHash: string): Promise<unknown | undefined> {
+    const kv = this.env.USEROP_STATUS;
+    if (!kv) return undefined;
+    const raw = await kv.get(userOpHash);
+    if (!raw) return undefined;
+    let record: { receipt?: SerializedReceipt } | null;
+    try {
+      record = JSON.parse(raw) as { receipt?: SerializedReceipt };
+    } catch {
+      return undefined;
+    }
+    if (!record?.receipt) return undefined; // accepted/pending → leave result null
+    const receipt = deserializeReceipt(record.receipt);
+    return method === "eth_getUserOperationReceipt"
+      ? receiptToRpc(receipt)
+      : receiptToByHashRpc(receipt);
   }
 
   private async handleRest(request: Request, doUrl: URL, _chainId: number): Promise<Response> {
@@ -743,11 +876,71 @@ export class BundlerDO implements DurableObject {
    *   - no alarm otherwise (or idle flag but money in flight — inconsistent) → BROKEN:
    *     re-arm + alert. The armed alarm re-initializes the chain itself when it fires.
    */
+  /** Register/deregister a RelayerDO pool index in the dead-man watch list (B6). Storage-only. */
+  private async handleRelayerWatch(url: URL, method: string): Promise<Response> {
+    const index = parseInt(url.searchParams.get("index") ?? "-1");
+    if (!(index >= 0 && index < RELAYER_POOL_SIZE)) {
+      return Response.json({ error: "bad index" }, { status: 400 });
+    }
+    const key = RELAYER_WATCH_PREFIX + index;
+    if (method === "DELETE") {
+      await this.state.storage.delete(key);
+      return Response.json({ watching: false, index });
+    }
+    await this.state.storage.put(key, Date.now());
+    return Response.json({ watching: true, index });
+  }
+
+  /**
+   * Cron fan-out (B6): probe every RelayerDO pool index registered as holding stranded money-path
+   * state. Their own alarm is layer 1; this is the ONLY layer that catches a RelayerDO whose alarm
+   * chain itself died (queue transport puts the money-path state in the 100 RelayerDOs, not here).
+   * A probe that reports idle/unknown → the relayer drained (or its deregister was lost) → stop
+   * watching it. Bounded to the registered set (usually small), never throws.
+   */
+  private async probeRegisteredRelayers(): Promise<void> {
+    let watched: Map<string, number>;
+    try {
+      watched = await this.state.storage.list<number>({ prefix: RELAYER_WATCH_PREFIX });
+    } catch { return; }
+    if (watched.size === 0) return;
+    const knownChain = (await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID)) ?? this.chainId;
+    if (!(knownChain > 0) || !this.env.RELAYER) return;
+    await Promise.allSettled([...watched.keys()].map(async (key) => {
+      const index = parseInt(key.slice(RELAYER_WATCH_PREFIX.length));
+      if (!(index >= 0 && index < RELAYER_POOL_SIZE)) { await this.state.storage.delete(key); return; }
+      try {
+        const stub = this.env.RELAYER.get(this.env.RELAYER.idFromName(`chain-${knownChain}-eoa-${index}`));
+        const res = await stub.fetch(new Request("https://relayer-do/ensure-alarm"));
+        const body = await res.json().catch(() => null) as { rearmed?: boolean; idle?: boolean; unknown?: boolean } | null;
+        if (body?.rearmed) console.error(`[BundlerDO:${knownChain}] cron re-armed a BROKEN RelayerDO alarm for pool index ${index}`);
+        if (body?.idle || body?.unknown) await this.state.storage.delete(key); // drained → stop watching
+      } catch (err) {
+        console.error(`[BundlerDO:${knownChain}] relayer liveness probe failed for index ${index}: ${redactError(err)}`);
+      }
+    }));
+  }
+
   private async handleEnsureAlarm(): Promise<Response> {
+    // Always fan out to the registered RelayerDOs first — a relayer's alarm can be dead even when
+    // THIS chain DO's alarm is healthy (they are separate isolates), so this must not be gated on
+    // the chain DO's own alarm status below.
+    await this.probeRegisteredRelayers();
+
+    // An invocation demonstrably running in this isolate is alive no matter what getAlarm()
+    // reads (an ingress kick landing mid-run parks a past-due alarm behind the running body).
+    // Beyond the wedge limit it is NOT alive — fall through and page the operator.
+    if (this.alarmInFlightSince !== null && Date.now() - this.alarmInFlightSince < ALARM_IN_FLIGHT_WEDGE_MS) {
+      return Response.json({ rearmed: false, healthy: true, inFlight: true });
+    }
     const alarmAt = await this.state.storage.getAlarm();
-    if (alarmAt !== null) {
+    // A scheduled-in-the-past alarm is NOT healthy: the alarm body re-arms first thing, so a
+    // live loop always keeps this in the future. Past-due = dead delivery or a wedged in-flight
+    // invocation — fall through to the broken path.
+    if (alarmIsLive(alarmAt, this.alarmIntervalMs())) {
       return Response.json({ rearmed: false, healthy: true, nextAlarm: alarmAt });
     }
+    const stale = alarmAt !== null;
     const knownChain = await this.state.storage.get<number>(STORAGE_KEY_CHAIN_ID);
     if (knownChain === undefined) {
       return Response.json({ rearmed: false, unknown: true });
@@ -759,14 +952,15 @@ export class BundlerDO implements DurableObject {
     }
     await this.state.storage.delete(STORAGE_KEY_ALARM_IDLE);
     await this.state.storage.setAlarm(Date.now() + this.alarmIntervalMs());
-    console.error(`[BundlerDO:${knownChain}] alarm chain was BROKEN — re-armed by cron liveness check`);
+    const how = stale ? `ZOMBIE (armed for ${new Date(alarmAt).toISOString()} but never delivered)` : "BROKEN";
+    console.error(`[BundlerDO:${knownChain}] alarm chain was ${how} — re-armed by cron liveness check`);
     await this.alerter.send(
       `alarm-rearmed-${knownChain}`,
-      `🚑 Vela Bundler — chain ${knownChain}'s Worker alarm chain was BROKEN (auto-bundling had ` +
+      `🚑 Vela Bundler — chain ${knownChain}'s Worker alarm chain was ${how} (auto-bundling had ` +
         `stopped${hasInFlight ? " WITH in-flight state" : ""}) and has been re-armed by the cron ` +
         `liveness check. Investigate why it died (logs around this time).`,
     );
-    return Response.json({ rearmed: true, chainId: knownChain });
+    return Response.json({ rearmed: true, chainId: knownChain, stale });
   }
 
   /** True when durable storage holds money-path state that reconciliation must finish:
@@ -776,6 +970,179 @@ export class BundlerDO implements DurableObject {
     if (pending !== undefined && Array.isArray(pending) && pending.length > 0) return true;
     const ops = await this.state.storage.list({ prefix: MEMPOOL_KEY_PREFIX, limit: 1 });
     return ops.size > 0;
+  }
+
+  /** Top up ONE fronting/pool EOA from the treasury, serialized on the treasury nonce (all
+   *  callers funnel through this single chain-DO SponsorService). Called by a RelayerDO whose
+   *  pool EOA can't afford its bundle. Vault chains only — on a legacy deposit chain the EOA
+   *  balance is the USER's, never operator-topped. */
+  private async handleFundEoa(url: URL): Promise<Response> {
+    const address = url.searchParams.get("address");
+    if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      return Response.json({ error: "bad address" }, { status: 400 });
+    }
+    if (!this.sponsorService || !this.chainServices) {
+      return Response.json({ error: "not initialized" }, { status: 503 });
+    }
+    if (!vaultActiveForChain(this.config?.settlementVaultChains, this.chainId)) {
+      return Response.json({ error: "not a vault chain" }, { status: 409 });
+    }
+    let shortfallWei: bigint | undefined;
+    const raw = url.searchParams.get("shortfall");
+    if (raw) { try { shortfallWei = BigInt(raw); } catch { /* size to the static target */ } }
+    try {
+      const res = await this.sponsorService.topUpFloatEOA(
+        this.chainId, this.chainServices.rpcUrl, address.toLowerCase() as `0x${string}`, shortfallWei,
+      );
+      return Response.json(res);
+    } catch (err) {
+      console.error(`[BundlerDO:${this.chainId}] fund-eoa error for ${address}:`, redactError(err));
+      return Response.json({ toppedUp: false, reason: "internal_error" }, { status: 500 });
+    }
+  }
+
+  /** Read-only per-op lifecycle inspection for the /debug UI: the op's stage + where it lives, the
+   *  KV status marker, and the chain's live health/funding context. No mutation, no secrets. */
+  private async handleInspect(url: URL, chainId: number): Promise<Response> {
+    const hash = (url.searchParams.get("hash") ?? "").trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+      return Response.json({ error: "bad hash (expected 0x + 64 hex chars)" }, { status: 400, headers: CORS_HEADERS });
+    }
+    const cs = this.chainServices;
+    if (!cs) return Response.json({ error: "chain not initialized" }, { status: 503, headers: CORS_HEADERS });
+
+    let op = cs.bundler.inspectOp(hash);
+
+    // KV status marker (queue mode): 'accepted'/'pending' carry the pool INDEX (+ sender); terminal
+    // markers carry the receipt. Keep the parsed marker so we can (a) derive a terminal stage from
+    // the KV receipt when this chain DO doesn't hold it locally, and (b) fan out to the RelayerDO.
+    let kv: { present: boolean; status?: string; hasReceipt?: boolean; index?: number } | null = null;
+    let marker: { status?: string; receipt?: SerializedReceipt; index?: number; sender?: string } | null = null;
+    if (this.env.USEROP_STATUS) {
+      try {
+        const raw = await this.env.USEROP_STATUS.get(hash);
+        if (raw) {
+          marker = JSON.parse(raw) as { status?: string; receipt?: SerializedReceipt; index?: number; sender?: string };
+          kv = { present: true, status: marker.status, hasReceipt: marker.receipt !== undefined, index: typeof marker.index === "number" ? marker.index : undefined };
+        } else { kv = { present: false }; }
+      } catch { kv = null; marker = null; }
+    }
+    // Pool index for the RelayerDO fan-out: normally from the KV marker, but the pending marker
+    // expires after 900s — past that, a still-stranded op (e.g. behind a dead alarm loop) would
+    // be uninspectable AND untouchable, with no manual recovery vector. `?index=N` lets an
+    // operator aim the fan-out directly; the touch also rehydrates the RelayerDO, whose _init
+    // re-arms a zombie alarm and lets the next cycle TTL-evict the op to a terminal receipt.
+    let kvIndex = kv?.index;
+    if (kvIndex === undefined) {
+      const idxParam = parseInt(url.searchParams.get("index") ?? "");
+      if (Number.isInteger(idxParam) && idxParam >= 0 && idxParam < RELAYER_POOL_SIZE) kvIndex = idxParam;
+    }
+
+    // Resolve an 'unknown' local result via the KV (queue mode): prefer a terminal receipt in the
+    // KV (op landed; its receipt lives in the RelayerDO + KV, not here) → build the terminal stage;
+    // else fan out to the owning RelayerDO for its live mempool/in-flight body.
+    if (op.stage === "unknown" && marker?.receipt) {
+      const r = marker.receipt;
+      op = {
+        hash, stage: r.success ? "confirmed" : "failed",
+        detail: r.success ? "landed on-chain (terminal — receipt from KV)" : "terminal failure (receipt from KV) — the wallet should resubmit",
+        receipt: { success: r.success, txHash: r.receipt?.transactionHash, actualGasCost: r.actualGasCost, actualGasUsed: r.actualGasUsed },
+      };
+    } else if (op.stage === "unknown" && kvIndex !== undefined && this.env.RELAYER) {
+      try {
+        const stub = this.env.RELAYER.get(this.env.RELAYER.idFromName(`chain-${chainId}-eoa-${kvIndex}`));
+        const res = await stub.fetch(new Request(`https://relayer-do/inspect?hash=${hash}`));
+        const body = await res.json().catch(() => null) as { op?: typeof op } | null;
+        if (body?.op) op = body.op;
+      } catch (err) {
+        console.warn(`[BundlerDO:${chainId}] inspect fan-out to relayer #${kvIndex} failed: ${redactError(err)}`);
+      }
+    }
+
+    // WHO pays the gas (fronting EOA) + its native balance, and WHICH RPC the submit uses.
+    const eoa = await this.resolveFrontingEoa(cs, op, kvIndex, marker?.sender);
+    const submitRpc = redactUrl(op.mempool?.rpcUrlOverride ?? cs.rpcUrl);
+
+    const chain = {
+      chainId,
+      mempoolSize: cs.mempool.size,
+      pendingReceiptCount: cs.bundler.pendingReceiptCount,
+      lockedEOAs: cs.accountService.lockManager.getLockedEOAs().map((e) => e.address),
+      insufficientFundsEoa: cs.bundler.insufficientFundsEoa,
+      insufficientFundsWei: cs.bundler.insufficientFundsWei?.toString() ?? null,
+      lastSubmitError: cs.bundler.lastSubmitError,
+      oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
+    };
+
+    return Response.json({ op, kv, eoa, submitRpc, chain }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
+  }
+
+  /** Which EOA will (or did) front this op's gas, its role, and its native balance. In-flight →
+   *  the actual signer; queue mode → pool EOA #(hash(sender)%100); per-safe → deriveEOA(sender). */
+  private async resolveFrontingEoa(
+    cs: NonNullable<BundlerDO["chainServices"]>,
+    op: ReturnType<BundlerService["inspectOp"]>,
+    kvIndex: number | undefined,
+    kvSender: string | undefined,
+  ): Promise<{ address: string; role: string; balanceWei?: string } | null> {
+    const sender = op.mempool?.sender ?? kvSender;
+    let address: string | undefined;
+    let role = "";
+    if (op.inFlight?.eoaAddress) { address = op.inFlight.eoaAddress; role = "fronting EOA (in-flight)"; }
+    else if (kvIndex !== undefined) { address = (await cs.accountService.getPoolEOA(kvIndex)).address; role = `pool EOA #${kvIndex}`; }
+    else if (op.stage === "confirmed" || op.stage === "failed") { role = op.receipt?.txHash ? "see the tx from-address" : "terminal"; }
+    else if (sender) {
+      if (cs.bundler.queueModeActive()) {
+        const i = relayerIndexForSender(sender);
+        address = (await cs.accountService.getPoolEOA(i)).address; role = `pool EOA #${i} (queue-routed)`;
+      } else if (cs.bundler.poolActive) {
+        role = "a leased pool EOA (index assigned at bundle time)";
+      } else {
+        address = (await cs.accountService.deriveEOA(sender as `0x${string}`)).address; role = "per-safe EOA";
+      }
+    }
+    if (!address) return role ? { address: "", role } : null;
+    let balanceWei: string | undefined;
+    try { balanceWei = (await getPublicClient(cs.rpcUrl).getBalance({ address: address as `0x${string}` })).toString(); } catch { /* leave undefined */ }
+    return { address, role, balanceWei };
+  }
+
+  /** Fleet view: the treasury + all 100 pool EOAs' native balances on THIS chain (one Multicall3
+   *  read, so it's easy on the paid RPC). Powers the /debug balances panel. Read-only. */
+  private async handlePoolBalances(chainId: number): Promise<Response> {
+    const cs = this.chainServices;
+    if (!cs || !this.config) return Response.json({ error: "chain not initialized" }, { status: 503, headers: CORS_HEADERS });
+    const treasury = this.config.treasuryAddress;
+    const poolAddrs = await Promise.all(
+      Array.from({ length: RELAYER_POOL_SIZE }, (_, i) => cs.accountService.getPoolEOA(i).then((e) => e.address)),
+    );
+    const balances = await this.readNativeBalances(cs.rpcUrl, [treasury, ...poolAddrs]);
+    return Response.json({
+      chainId,
+      treasury: { address: treasury, balanceWei: balances[0]?.toString() ?? null },
+      pool: poolAddrs.map((address, i) => ({ index: i, address, balanceWei: balances[i + 1]?.toString() ?? null })),
+    }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
+  }
+
+  /** Batch native balances via Multicall3 (1 eth_call). Falls back to parallel getBalance on a
+   *  chain without Multicall3 or a decode error. */
+  private async readNativeBalances(rpcUrl: string, addresses: string[]): Promise<(bigint | null)[]> {
+    const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11" as const;
+    const client = getPublicClient(rpcUrl);
+    try {
+      const mc = parseAbi(["function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[] returnData)"]);
+      const bal = parseAbi(["function getEthBalance(address addr) view returns (uint256)"]);
+      const calls = addresses.map((a) => ({
+        target: MULTICALL3, allowFailure: true,
+        callData: encodeFunctionData({ abi: bal, functionName: "getEthBalance", args: [a as `0x${string}`] }),
+      }));
+      const res = await client.call({ to: MULTICALL3, data: encodeFunctionData({ abi: mc, functionName: "aggregate3", args: [calls] }) });
+      if (!res.data) throw new Error("no data");
+      const decoded = decodeFunctionResult({ abi: mc, functionName: "aggregate3", data: res.data }) as readonly { success: boolean; returnData: `0x${string}` }[];
+      return decoded.map((d) => (d.success && d.returnData && d.returnData !== "0x" ? BigInt(d.returnData) : null));
+    } catch {
+      return Promise.all(addresses.map((a) => client.getBalance({ address: a as `0x${string}` }).then((b) => b as bigint | null).catch(() => null)));
+    }
   }
 
   private handleHealth(requestedChainId: number = this.chainId): Response {
@@ -825,7 +1192,9 @@ export class BundlerDO implements DurableObject {
     try {
       const locked = this.chainServices.accountService.lockManager.getLockedEOAs();
       if (locked.length > 0) {
-        const client = getPublicClient(this.chainServices.rpcUrl);
+        // Fail over across the trusted RPC set: a rate-limited primary must not leave a locked
+        // EOA (funds stuck) unrecoverable cycle after cycle.
+        const client = getFailoverPublicClient(trustedMoneyPathRpcs(this.chainServices));
         let recovered = 0;
         for (const eoa of locked) {
           try {
@@ -855,7 +1224,7 @@ export class BundlerDO implements DurableObject {
           chainId: this.chainId,
           chainName: this.chainServices.chainInfo?.name ?? null,
           treasuryAddress: this.config.treasuryAddress,
-          client: getPublicClient(this.chainServices.rpcUrl),
+          client: getFailoverPublicClient(trustedMoneyPathRpcs(this.chainServices)),
           thresholdWei: this.config.treasuryAlertThresholdWei,
           thresholdPathUsd: this.config.treasuryAlertThresholdPathUsd,
           alerter: this.alerter,
@@ -864,6 +1233,52 @@ export class BundlerDO implements DurableObject {
       } catch (err) {
         console.error(`[BundlerDO:${this.chainId}] Treasury monitor error:`, err);
         await this.escalator.note("treasury-monitor", this.chainId, err);
+      }
+
+      // Pool relayer float top-up: keep the 100 pool EOAs at their float target from
+      // the treasury. Gated on the STAGE-3 flag, not vault mode — with vault on
+      // everywhere, funding the pool before anything uses it would just park treasury
+      // money in 100 idle EOAs per chain. Internally rate-limited to one sweep per
+      // minute; serialized against the treasury nonce inside the service.
+      if (
+        this.sponsorService &&
+        vaultActiveForChain(this.config.settlementVaultChains, this.chainId)
+      ) {
+        if (chainSpecEnables(this.config.poolEoaChains, this.chainId)) {
+        try {
+          await this.sponsorService.topUpPoolEOAs(
+            this.chainId,
+            this.chainServices.rpcUrl,
+            async (i) => (await this.chainServices!.accountService.getPoolEOA(i)).address,
+          );
+          this.escalator.ok("pool-topup", this.chainId);
+        } catch (err) {
+          console.error(`[BundlerDO:${this.chainId}] Pool top-up error:`, err);
+          await this.escalator.note("pool-topup", this.chainId, err);
+        }
+        }
+
+        // Fronting-EOA float refill: in vault mode the reimbursement goes to the
+        // treasury, so the per-safe EOA that fronts the outer gas is no longer
+        // self-healing. When the bundle loop flags one as unable to afford the outer
+        // tx, refill it from the treasury (bounded + serialized inside the service).
+        const lowEoa = this.chainServices.bundler.insufficientFundsEoa;
+        if (lowEoa) {
+          try {
+            await this.sponsorService.topUpFloatEOA(
+              this.chainId,
+              this.chainServices.rpcUrl,
+              lowEoa,
+              // Size the refill to the ACTUAL prefund that bounced (×1.5 headroom), not a
+              // static target — a multi-sender pool bundle can need many× poolFloatTargetWei.
+              this.chainServices.bundler.insufficientFundsWei ?? undefined,
+            );
+            this.escalator.ok("float-topup", this.chainId);
+          } catch (err) {
+            console.error(`[BundlerDO:${this.chainId}] Float top-up error:`, err);
+            await this.escalator.note("float-topup", this.chainId, err);
+          }
+        }
       }
 
       // Operational-health monitor: alert on any STUCK condition (mempool op / pending bundle /

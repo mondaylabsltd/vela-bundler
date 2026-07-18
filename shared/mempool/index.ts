@@ -19,6 +19,16 @@ import { ReputationManager } from "./reputation.ts";
 import { RPC_ERROR_CODES } from "../contracts/entrypoint.ts";
 import { UserOpValidationError } from "../userop/validate.ts";
 import { isEmptyHex } from "../utils/hex.ts";
+
+/** Message of the TRANSIENT capacity rejection thrown by add() when the mempool is at
+ *  maxMempoolSize. Unlike a one-op-per-sender / reputation rejection, this CLEARS as bundles
+ *  land — callers (the queue relayerSubmit) must retry it, NOT store a terminal failed receipt. */
+export const MEMPOOL_FULL_MESSAGE = "Mempool is full";
+
+/** True when `err` is the transient mempool-full rejection (safe to retry). */
+export function isMempoolFullError(err: unknown): boolean {
+  return err instanceof Error && err.message === MEMPOOL_FULL_MESSAGE;
+}
 import { calcUserOpMaxGas } from "../gas/profitability.ts";
 
 export { ReputationManager, type EntityStatus, type ReputationEntry } from "./reputation.ts";
@@ -142,7 +152,7 @@ export class Mempool {
     // Check mempool size
     if (this.entries.size >= this.config.maxMempoolSize) {
       throw new UserOpValidationError(
-        "Mempool is full",
+        MEMPOOL_FULL_MESSAGE,
         RPC_ERROR_CODES.INVALID_USEROPERATION,
       );
     }

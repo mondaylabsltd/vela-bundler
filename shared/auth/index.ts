@@ -20,8 +20,8 @@ let lastPruneAt = 0;
  *
  * Only two sources are trusted, both unspoofable by the client:
  *   1. CF-Connecting-IP — set by Cloudflare's edge (CF Worker deployments).
- *   2. peerAddr — the real TCP peer address, passed in by the Deno server from
- *      Deno.serve's connection info.
+ *   2. peerAddr — a real TCP peer address, if the host runtime supplies one (optional
+ *      fallback for non-Cloudflare hosts; Workers rely on CF-Connecting-IP above).
  *
  * Client-supplied `X-Forwarded-For` / `X-Real-IP` are NOT trusted: an attacker can rotate
  * them to mint a fresh rate-limit bucket per request (limit bypass), or set them all the

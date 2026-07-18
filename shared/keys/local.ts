@@ -7,7 +7,7 @@
 
 import { privateKeyToAccount } from "viem/accounts";
 import type { KeyManager, KeyDerivationParams, DerivedEOA } from "./types.ts";
-import { deriveEOAPrivateKey, validateOperatorSecret } from "./derive.ts";
+import { deriveEOAPrivateKey, derivePoolRelayerPrivateKey, validateOperatorSecret } from "./derive.ts";
 
 const validateSecret = validateOperatorSecret;
 
@@ -34,6 +34,15 @@ export class LocalKeyManager implements KeyManager {
       params.entryPoint,
       params.safeAddress,
     );
+    const account = privateKeyToAccount(privateKey);
+    return {
+      address: account.address.toLowerCase() as `0x${string}`,
+      privateKey,
+    };
+  }
+
+  async derivePoolEOA(index: number): Promise<DerivedEOA> {
+    const privateKey = await derivePoolRelayerPrivateKey(this.operatorSecret, index);
     const account = privateKeyToAccount(privateKey);
     return {
       address: account.address.toLowerCase() as `0x${string}`,

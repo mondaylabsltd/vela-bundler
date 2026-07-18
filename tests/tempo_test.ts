@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { it, expect } from "vitest";
 import {
   concat,
   encodeFunctionData,
@@ -10,6 +10,8 @@ import {
 import {
   isTempoChain,
   parseTempoReimbursement,
+  parseInBandReimbursement,
+  TRUSTED_MULTISEND,
   resolveFeeToken,
   tempoCostInFeeToken,
   tempoHandleOpsGasLimit,
@@ -63,55 +65,58 @@ function buildBatchOps(calls: { to: Hex; data: Hex; operation: number }[]): Hex 
 const transfer = (to: Hex, amount: bigint): Hex =>
   encodeFunctionData({ abi: erc20, functionName: "transfer", args: [to, amount] });
 
-Deno.test("isTempoChain", () => {
-  assertEquals(isTempoChain(4217), true);
-  assertEquals(isTempoChain(42431), true);
-  assertEquals(isTempoChain(1), false);
-  assertEquals(isTempoChain(137), false);
+it("isTempoChain", () => {
+  expect(isTempoChain(4217)).toEqual(true);
+  expect(isTempoChain(42431)).toEqual(true);
+  expect(isTempoChain(1)).toEqual(false);
+  expect(isTempoChain(137)).toEqual(false);
 });
 
-Deno.test("resolveFeeToken falls back to pathUSD, checksums input", () => {
-  assertEquals(resolveFeeToken(null), getAddress(TEMPO_DEFAULT_FEE_TOKEN));
-  assertEquals(resolveFeeToken(undefined), getAddress(TEMPO_DEFAULT_FEE_TOKEN));
-  assertEquals(
+it("resolveFeeToken falls back to pathUSD, checksums input", () => {
+  expect(resolveFeeToken(null)).toEqual(getAddress(TEMPO_DEFAULT_FEE_TOKEN));
+  expect(resolveFeeToken(undefined)).toEqual(getAddress(TEMPO_DEFAULT_FEE_TOKEN));
+  expect(
     resolveFeeToken("0x20c0000000000000000000000000000000000001"),
+  ).toEqual(
     getAddress("0x20c0000000000000000000000000000000000001"),
   );
 });
 
-Deno.test("tempoCostInFeeToken: 50k gas @ 20e9 atto = 1000 fee-token units ($0.001)", () => {
-  assertEquals(tempoCostInFeeToken(50_000n, 20_000_000_000n), 1000n);
+it("tempoCostInFeeToken: 50k gas @ 20e9 atto = 1000 fee-token units ($0.001)", () => {
+  expect(tempoCostInFeeToken(50_000n, 20_000_000_000n)).toEqual(1000n);
   // falls back to base fee when price is 0
-  assertEquals(tempoCostInFeeToken(50_000n, 0n), 1000n);
+  expect(tempoCostInFeeToken(50_000n, 0n)).toEqual(1000n);
 });
 
 const PATHUSD = getAddress("0x20c0000000000000000000000000000000000000");
 
-Deno.test("parseTempoReimbursement decodes the transfer that pays the bundler EOA in the feeToken", () => {
+it("parseTempoReimbursement decodes the transfer that pays the bundler EOA in the feeToken", () => {
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
   const recipient = getAddress("0x6007462A7A3409DD8E23EED2C81Cb439cD95F4d4");
   const callData = buildBatch([
     { to: PATHUSD, data: transfer(recipient, 10_000n) }, // the user's actual send
     { to: PATHUSD, data: transfer(eoa, 1234n) }, // the gas reimbursement (feeToken)
   ]);
-  assertEquals(parseTempoReimbursement(callData, eoa, PATHUSD), 1234n);
+  expect(parseTempoReimbursement(callData, eoa, PATHUSD)).toEqual(1234n);
 });
 
-Deno.test("parseTempoReimbursement ignores transfers to a NON-EOA recipient", () => {
+it("parseTempoReimbursement ignores transfers to a NON-EOA recipient", () => {
   const tokenB = getAddress("0x20c0000000000000000000000000000000000002");
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
-  assertEquals(
+  expect(
     parseTempoReimbursement(buildBatch([{ to: PATHUSD, data: transfer(tokenB, 9999n) }]), eoa, PATHUSD),
+  ).toEqual(
     0n,
   );
 });
 
-Deno.test("parseTempoReimbursement SECURITY: ignores reimbursement paid in a non-feeToken (anti fake-token drain)", () => {
+it("parseTempoReimbursement SECURITY: ignores reimbursement paid in a non-feeToken (anti fake-token drain)", () => {
   const fakeToken = getAddress("0x20c0000000000000000000000000000000000002"); // attacker's worthless token
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
   // A transfer to the EOA, but NOT in the trusted feeToken → must NOT count.
-  assertEquals(
+  expect(
     parseTempoReimbursement(buildBatch([{ to: fakeToken, data: transfer(eoa, 9_999_999n) }]), eoa, PATHUSD),
+  ).toEqual(
     0n,
   );
   // Mixed batch: only the feeToken leg counts; the fake-token leg is ignored.
@@ -119,22 +124,133 @@ Deno.test("parseTempoReimbursement SECURITY: ignores reimbursement paid in a non
     { to: fakeToken, data: transfer(eoa, 9_999_999n) },
     { to: PATHUSD, data: transfer(eoa, 1234n) },
   ]);
-  assertEquals(parseTempoReimbursement(mixed, eoa, PATHUSD), 1234n);
+  expect(parseTempoReimbursement(mixed, eoa, PATHUSD)).toEqual(1234n);
 });
 
-Deno.test("parseTempoReimbursement matches a LOWERCASE recipient (bundler passes eoa.address lowercased)", () => {
+it("parseTempoReimbursement matches a LOWERCASE recipient (bundler passes eoa.address lowercased)", () => {
   const eoa = getAddress("0xd2d4245d0444653adefaa8b12eae1a15bda0edac");
   const callData = buildBatch([{ to: PATHUSD, data: transfer(eoa, 1234n) }]);
   // the bundler passes eoa.address LOWERCASE — must still find the reimbursement
-  assertEquals(parseTempoReimbursement(callData, eoa.toLowerCase() as `0x${string}`, PATHUSD), 1234n);
+  expect(parseTempoReimbursement(callData, eoa.toLowerCase() as `0x${string}`, PATHUSD)).toEqual(1234n);
 });
 
-Deno.test("parseTempoReimbursement returns 0 for non-batch callData (no crash)", () => {
+it("parseTempoReimbursement returns 0 for non-batch callData (no crash)", () => {
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
-  assertEquals(parseTempoReimbursement("0xdeadbeef", eoa, PATHUSD), 0n);
+  expect(parseTempoReimbursement("0xdeadbeef", eoa, PATHUSD)).toEqual(0n);
 });
 
-Deno.test("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no-op-reimbursement drain)", () => {
+// ---------------------------------------------------------------------------
+// parseInBandReimbursement — the generalized (native + allowlisted-stablecoin) decoder.
+// ---------------------------------------------------------------------------
+
+/** Pack a MultiSend leg with explicit value + operation (the base helpers force value=0/op=0). */
+function packTxFull(to: Hex, value: bigint, data: Hex, operation: number): Hex {
+  const len = BigInt((data.length - 2) / 2);
+  return encodePacked(["uint8", "address", "uint256", "uint256", "bytes"], [operation, to, value, len, data]);
+}
+function buildBatchFull(calls: { to: Hex; value?: bigint; data?: Hex; operation?: number }[]): Hex {
+  const packed = concat(calls.map((c) => packTxFull(c.to, c.value ?? 0n, c.data ?? "0x", c.operation ?? 0)));
+  const msData = encodeFunctionData({ abi: multiSend, functionName: "multiSend", args: [packed] });
+  return encodeFunctionData({ abi: execUserOp, functionName: "executeUserOp", args: [MULTI_SEND, 0n, msData, 1] });
+}
+
+const EOA = getAddress("0x1111111111111111111111111111111111111111");
+const USDC = getAddress("0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48");
+const USDT = getAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+
+it("parseInBandReimbursement counts native value sent to the EOA", () => {
+  const r = parseInBandReimbursement(buildBatchFull([{ to: EOA, value: 5000n }]), EOA, [USDC]);
+  expect(r.native).toEqual(5000n);
+  expect(r.byToken).toEqual({});
+});
+
+it("parseInBandReimbursement counts an allowlisted stablecoin transfer to the EOA", () => {
+  const r = parseInBandReimbursement(buildBatchFull([{ to: USDC, data: transfer(EOA, 12345n) }]), EOA, [USDC, USDT]);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(12345n);
+  expect(r.native).toEqual(0n);
+});
+
+it("parseInBandReimbursement SECURITY: ignores a NON-allowlisted token (anti fake-token drain)", () => {
+  const fake = getAddress("0x000000000000000000000000000000000000dEaD");
+  const r = parseInBandReimbursement(buildBatchFull([{ to: fake, data: transfer(EOA, 9_999_999n) }]), EOA, [USDC]);
+  expect(r).toEqual({ native: 0n, byToken: {} });
+});
+
+it("parseInBandReimbursement SECURITY: ignores DELEGATECALL legs (move nothing to the EOA)", () => {
+  const r = parseInBandReimbursement(
+    buildBatchFull([
+      { to: USDC, data: transfer(EOA, 5000n), operation: 1 },
+      { to: EOA, value: 5000n, operation: 1 },
+    ]),
+    EOA,
+    [USDC],
+  );
+  expect(r).toEqual({ native: 0n, byToken: {} });
+});
+
+it("parseInBandReimbursement splits native + stablecoin and ignores the user's own send", () => {
+  const other = getAddress("0x2222222222222222222222222222222222222222");
+  const r = parseInBandReimbursement(
+    buildBatchFull([
+      { to: USDC, data: transfer(other, 50_000n) }, // user's actual send — not to the EOA
+      { to: USDC, data: transfer(EOA, 700n) }, // stablecoin gas reimbursement
+      { to: EOA, value: 300n }, // native gas reimbursement
+    ]),
+    EOA,
+    [USDC],
+  );
+  expect(r.native).toEqual(300n);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(700n);
+});
+
+// Build executeUserOp with an EXPLICIT outer target + operation (to test the phantom-batch guard).
+function buildExecCustom(
+  outerTo: Hex,
+  outerOp: number,
+  legs: { to: Hex; value?: bigint; data?: Hex; operation?: number }[],
+): Hex {
+  const packed = concat(legs.map((c) => packTxFull(c.to, c.value ?? 0n, c.data ?? "0x", c.operation ?? 0)));
+  const msData = encodeFunctionData({ abi: multiSend, functionName: "multiSend", args: [packed] });
+  return encodeFunctionData({ abi: execUserOp, functionName: "executeUserOp", args: [outerTo, 0n, msData, outerOp] });
+}
+const CODELESS = "0x000000000000000000000000000000000000dEaD" as Hex;
+
+it("SECURITY: rejects a phantom CALL batch — not delegatecalling MultiSend (the drain fix)", () => {
+  // executeUserOp(to=code-less, op=CALL): on-chain this moves NOTHING, so a batch-shaped `data`
+  // must NOT be credited as a reimbursement (would let a zero-balance op drain the bundler).
+  const cd = buildExecCustom(CODELESS, 0, [{ to: EOA, value: 5000n }, { to: USDC, data: transfer(EOA, 9000n) }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+  // Same guard protects the live Tempo path.
+  const cdTempo = buildExecCustom(CODELESS, 0, [{ to: PATHUSD, data: transfer(EOA, 9999n) }]);
+  expect(parseTempoReimbursement(cdTempo, EOA, PATHUSD)).toEqual(0n);
+});
+
+it("SECURITY: rejects delegatecall to a NON-MultiSend target", () => {
+  const cd = buildExecCustom(CODELESS, 1, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+});
+
+it("SECURITY: rejects a CALL (op=0) even to the real MultiSend", () => {
+  const cd = buildExecCustom(TRUSTED_MULTISEND, 0, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC])).toEqual({ native: 0n, byToken: {} });
+});
+
+it("credits a proper DELEGATECALL to the trusted MultiSend", () => {
+  const cd = buildExecCustom(TRUSTED_MULTISEND, 1, [{ to: EOA, value: 5000n }]);
+  expect(parseInBandReimbursement(cd, EOA, [USDC]).native).toEqual(5000n);
+});
+
+it("parseInBandReimbursement matches a LOWERCASE recipient", () => {
+  const r = parseInBandReimbursement(
+    buildBatchFull([{ to: EOA, value: 42n }, { to: USDC, data: transfer(EOA, 8n) }]),
+    EOA.toLowerCase() as `0x${string}`,
+    [USDC],
+  );
+  expect(r.native).toEqual(42n);
+  expect(r.byToken[USDC.toLowerCase()]).toEqual(8n);
+});
+
+it("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no-op-reimbursement drain)", () => {
   const eoa = getAddress("0x1111111111111111111111111111111111111111");
   // A DELEGATECALL (operation=1) to the feeToken with transfer(EOA, amt) calldata runs the
   // token's code against the SAFE's storage — it does NOT move any feeToken to the bundler —
@@ -142,46 +258,14 @@ Deno.test("parseTempoReimbursement SECURITY: ignores a DELEGATECALL leg (anti no
   const delegatecallOnly = buildBatchOps([
     { to: PATHUSD, data: transfer(eoa, 9_999_999n), operation: 1 },
   ]);
-  assertEquals(parseTempoReimbursement(delegatecallOnly, eoa, PATHUSD), 0n);
+  expect(parseTempoReimbursement(delegatecallOnly, eoa, PATHUSD)).toEqual(0n);
 
   // Mixed batch: only the real CALL leg counts; the delegatecall leg is ignored.
   const mixed = buildBatchOps([
     { to: PATHUSD, data: transfer(eoa, 9_999_999n), operation: 1 }, // fake (delegatecall)
     { to: PATHUSD, data: transfer(eoa, 1234n), operation: 0 }, // real (call)
   ]);
-  assertEquals(parseTempoReimbursement(mixed, eoa, PATHUSD), 1234n);
-});
-
-Deno.test("parseTempoReimbursement SECURITY: rejects a phantom batch not delegatecalling MultiSend (drain fix)", () => {
-  const eoa = getAddress("0x1111111111111111111111111111111111111111");
-  const msData = encodeFunctionData({
-    abi: multiSend,
-    functionName: "multiSend",
-    args: [packTx(PATHUSD, transfer(eoa, 9_999_999n))],
-  });
-  // executeUserOp(to = code-less addr, operation = 0 CALL): the on-chain CALL succeeds moving
-  // NOTHING (the bytes are never run as a MultiSend batch), so it must NOT be credited — else a
-  // zero-balance UserOp drains the bundler's gas float.
-  const phantomCall = encodeFunctionData({
-    abi: execUserOp,
-    functionName: "executeUserOp",
-    args: ["0x000000000000000000000000000000000000dEaD", 0n, msData, 0],
-  });
-  assertEquals(parseTempoReimbursement(phantomCall, eoa, PATHUSD), 0n);
-
-  // DELEGATECALL (operation = 1) to a NON-MultiSend target → also rejected.
-  const wrongTarget = encodeFunctionData({
-    abi: execUserOp,
-    functionName: "executeUserOp",
-    args: ["0x000000000000000000000000000000000000dEaD", 0n, msData, 1],
-  });
-  assertEquals(parseTempoReimbursement(wrongTarget, eoa, PATHUSD), 0n);
-
-  // The legit encoding (delegatecall to the real MultiSend) still credits the reimbursement.
-  assertEquals(
-    parseTempoReimbursement(buildBatch([{ to: PATHUSD, data: transfer(eoa, 1234n) }]), eoa, PATHUSD),
-    1234n,
-  );
+  expect(parseTempoReimbursement(mixed, eoa, PATHUSD)).toEqual(1234n);
 });
 
 // --- tempoHandleOpsGasLimit: the outer-0x76 gas must cover declared op limits ---
@@ -203,20 +287,20 @@ function mkOp(vGL: bigint, cGL: bigint, pvg: bigint): PackedUserOperation {
   };
 }
 
-Deno.test("tempoHandleOpsGasLimit: covers a deployed op's declared limits + overhead", () => {
+it("tempoHandleOpsGasLimit: covers a deployed op's declared limits + overhead", () => {
   // Real deployed-Safe shape from the production trace: vGL≈300k, cGL=760k, pVG≈121k.
   const op = mkOp(300_000n, 760_000n, 121_000n);
   const declared = 300_000n + 760_000n + 121_000n;
   const expected = (declared * 64n) / 63n + 50_000n + 60_000n;
-  assertEquals(tempoHandleOpsGasLimit([op]), expected);
+  expect(tempoHandleOpsGasLimit([op])).toEqual(expected);
   // The bug we fixed: outer gas was BELOW the declared total, starving execution.
-  assertEquals(tempoHandleOpsGasLimit([op]) > declared, true);
+  expect(tempoHandleOpsGasLimit([op]) > declared).toEqual(true);
 });
 
-Deno.test("tempoHandleOpsGasLimit: sums every op + scales overhead per op", () => {
+it("tempoHandleOpsGasLimit: sums every op + scales overhead per op", () => {
   const a = mkOp(300_000n, 400_000n, 100_000n);
   const b = mkOp(6_000_000n, 380_000n, 120_000n);
   const declared = 300_000n + 400_000n + 100_000n + 6_000_000n + 380_000n + 120_000n;
   const expected = (declared * 64n) / 63n + 2n * 50_000n + 60_000n;
-  assertEquals(tempoHandleOpsGasLimit([a, b]), expected);
+  expect(tempoHandleOpsGasLimit([a, b])).toEqual(expected);
 });

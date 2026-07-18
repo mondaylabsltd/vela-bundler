@@ -1,0 +1,82 @@
+{
+  // ---------------------------------------------------------------------------
+  // LOCAL-DEV ONLY config — runs the FULL Stage-4 queue transport + per-EOA
+  // RelayerDO path under `wrangler dev` (miniflare emulates Queues + KV + DOs
+  // locally, so the "queue must exist" restriction that keeps these bindings
+  // commented in wrangler.jsonc does NOT apply here). Never `wrangler deploy`
+  // with this file — see docs/local-queue-dev.md.
+  //
+  //   wrangler dev -c wrangler.dev.jsonc
+  //
+  // The stage flags below are turned ON for chain 31337 (a local anvil/hardhat
+  // devnet) so ingress → producer enqueue → queue consumer → RelayerDO /submit
+  // exercises end-to-end. Point OPERATOR_SECRET at a throwaway key via .dev.vars.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "vela-bundler-dev",
+  "main": "worker/index.ts",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "BUNDLER", "class_name": "BundlerDO" },
+      { "name": "RELAYER", "class_name": "RelayerDO" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_classes": ["BundlerDO"] },
+    { "tag": "v2", "new_classes": ["RelayerDO"] }
+  ],
+
+  // Queue transport — LIVE locally (miniflare emulates the queue; no remote create needed).
+  "queues": {
+    "producers": [
+      { "binding": "USEROP_QUEUE", "queue": "vela-userops" }
+    ],
+    "consumers": [
+      {
+        "queue": "vela-userops",
+        "max_retries": 3,
+        "max_batch_size": 10,
+        "max_batch_timeout": 2,
+        "dead_letter_queue": "vela-userops-dlq"
+      },
+      {
+        // Dead-letter consumer (B5) — write a terminal failed receipt + alert, then ack.
+        "queue": "vela-userops-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 1
+      }
+    ]
+  },
+
+  // Local KV for the accepted-op status / receipt index. The id is a local-only
+  // placeholder — `wrangler dev` keeps KV in a local store, it is never read remotely.
+  "kv_namespaces": [
+    { "binding": "USEROP_STATUS", "id": "local-userop-status" }
+  ],
+
+  // Turn the WHOLE rework on for every chain so local dev exercises the new pool-EOA +
+  // queue path end-to-end (miniflare emulates the queue locally). With these on, bundling
+  // switches from the per-safe EOA to a LEASED POOL EOA (#hash(sender)%100), and the op
+  // flows ingress → producer enqueue → queue consumer → RelayerDO → pool-EOA bundle.
+  // PREREQUISITE: the pool EOA that serves a given sender must hold native gas — the chain
+  // DO's healthLoop funds pool EOAs from the treasury (topUpPoolEOAs), so the treasury must
+  // have native balance on the chain under test, or the pool bundle DEFERS ("insufficient
+  // funds"). poolModeActive excludes Tempo automatically. Set a chainId CSV instead of "all"
+  // to scope it (e.g. "1,42161").
+  "vars": {
+    "INBAND_ENABLED": "all",
+    "SETTLEMENT_VAULT_ENABLED": "all",
+    "POOL_EOA_ENABLED": "all",
+    "QUEUE_TRANSPORT_ENABLED": "all"
+  },
+
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": true }
+  }
+}

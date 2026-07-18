@@ -7,7 +7,7 @@
  * is tested via integration tests with a live Anvil node.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import {
   decodeErrorResult,
   encodeErrorResult,
@@ -93,86 +93,86 @@ function encodeValidationResultError(opts: {
 
 // ---- parseValidationData tests ----
 
-Deno.test("parseValidationData - zero data means valid forever, no aggregator", () => {
+it("parseValidationData - zero data means valid forever, no aggregator", () => {
   const result = parseValidationData(0n);
-  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000000");
-  assertEquals(result.validAfter, 0);
-  assertEquals(result.validUntil, 0xffffffffffff); // 0 means no expiry
+  expect(result.aggregator).toEqual("0x0000000000000000000000000000000000000000");
+  expect(result.validAfter).toEqual(0);
+  expect(result.validUntil).toEqual(0xffffffffffff); // 0 means no expiry
 });
 
-Deno.test("parseValidationData - sig failure aggregator == address(1)", () => {
+it("parseValidationData - sig failure aggregator == address(1)", () => {
   // Canonical ERC-4337 v0.7: aggregator occupies the LOW 160 bits; SIG_VALIDATION_FAILED == 1.
   const sigFail = 1n;
   const result = parseValidationData(sigFail);
-  assertEquals(result.aggregator, "0x0000000000000000000000000000000000000001");
+  expect(result.aggregator).toEqual("0x0000000000000000000000000000000000000001");
 });
 
-Deno.test("parseValidationData - encodes validAfter and validUntil correctly", () => {
+it("parseValidationData - encodes validAfter and validUntil correctly", () => {
   // Canonical packing: validUntil << 160, validAfter << 208.
   const validUntil = 1700000000n;
   const validAfter = 1600000000n;
   const data = (validUntil << 160n) | (validAfter << 208n);
   const result = parseValidationData(data);
-  assertEquals(result.validAfter, 1600000000);
-  assertEquals(result.validUntil, 1700000000);
+  expect(result.validAfter).toEqual(1600000000);
+  expect(result.validUntil).toEqual(1700000000);
 });
 
-Deno.test("parseValidationData - combined aggregator + time range", () => {
+it("parseValidationData - combined aggregator + time range", () => {
   // Canonical: aggregator(low 160) | validUntil<<160 | validAfter<<208.
   const aggregator = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefn;
   const validUntil = 2000000000n;
   const validAfter = 1000000000n;
   const data = aggregator | (validUntil << 160n) | (validAfter << 208n);
   const result = parseValidationData(data);
-  assertEquals(result.aggregator, "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-  assertEquals(result.validAfter, 1000000000);
-  assertEquals(result.validUntil, 2000000000);
+  expect(result.aggregator).toEqual("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+  expect(result.validAfter).toEqual(1000000000);
+  expect(result.validUntil).toEqual(2000000000);
 });
 
 // ---- isValidTimeRange tests ----
 
-Deno.test("isValidTimeRange - zero validUntil means no expiry", () => {
-  assert(isValidTimeRange(0, 0));
+it("isValidTimeRange - zero validUntil means no expiry", () => {
+  expect(isValidTimeRange(0, 0)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - future validAfter returns false", () => {
+it("isValidTimeRange - future validAfter returns false", () => {
   const farFuture = Math.floor(Date.now() / 1000) + 100_000;
-  assert(!isValidTimeRange(farFuture, 0));
+  expect(!isValidTimeRange(farFuture, 0)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - past validUntil returns false (expired)", () => {
+it("isValidTimeRange - past validUntil returns false (expired)", () => {
   const past = Math.floor(Date.now() / 1000) - 100;
-  assert(!isValidTimeRange(0, past));
+  expect(!isValidTimeRange(0, past)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - valid range passes", () => {
+it("isValidTimeRange - valid range passes", () => {
   const now = Math.floor(Date.now() / 1000);
-  assert(isValidTimeRange(now - 100, now + 100));
+  expect(isValidTimeRange(now - 100, now + 100)).toBeTruthy();
 });
 
-Deno.test("isValidTimeRange - safety margin is respected", () => {
+it("isValidTimeRange - safety margin is respected", () => {
   const now = Math.floor(Date.now() / 1000);
   // validUntil is now + 5 seconds, but with 30s margin it should fail
-  assert(!isValidTimeRange(0, now + 5, 30));
+  expect(!isValidTimeRange(0, now + 5, 30)).toBeTruthy();
   // With 3s margin it should pass
-  assert(isValidTimeRange(0, now + 5, 3));
+  expect(isValidTimeRange(0, now + 5, 3)).toBeTruthy();
 });
 
 // ---- ExecutionResult error encoding/decoding roundtrip ----
 
-Deno.test("ExecutionResult error - can encode and decode targetSuccess=true", () => {
+it("ExecutionResult error - can encode and decode targetSuccess=true", () => {
   const encoded = encodeExecutionResultError({ targetSuccess: true, paid: 42n });
   const decoded = decodeErrorResult({
     abi: ENTRYPOINT_V07_ABI,
     data: encoded,
   });
-  assertEquals(decoded.errorName, "ExecutionResult");
+  expect(decoded.errorName).toEqual("ExecutionResult");
   const args = decoded.args as unknown as [bigint, bigint, bigint, bigint, boolean, `0x${string}`];
-  assertEquals(args[4], true); // targetSuccess
-  assertEquals(args[1], 42n); // paid
+  expect(args[4]).toEqual(true); // targetSuccess
+  expect(args[1]).toEqual(42n); // paid
 });
 
-Deno.test("ExecutionResult error - can encode and decode targetSuccess=false", () => {
+it("ExecutionResult error - can encode and decode targetSuccess=false", () => {
   const encoded = encodeExecutionResultError({
     targetSuccess: false,
     targetResult: "0xacfdb444", // ExecutionFailed() selector
@@ -182,42 +182,42 @@ Deno.test("ExecutionResult error - can encode and decode targetSuccess=false", (
     abi: ENTRYPOINT_V07_ABI,
     data: encoded,
   });
-  assertEquals(decoded.errorName, "ExecutionResult");
+  expect(decoded.errorName).toEqual("ExecutionResult");
   const args = decoded.args as unknown as [bigint, bigint, bigint, bigint, boolean, `0x${string}`];
-  assertEquals(args[4], false); // targetSuccess
-  assert(args[5].startsWith("0xacfdb444"));
+  expect(args[4]).toEqual(false); // targetSuccess
+  expect(args[5].startsWith("0xacfdb444")).toBeTruthy();
 });
 
 // ---- FailedOp error encoding/decoding roundtrip ----
 
-Deno.test("FailedOp error - roundtrip encoding and decoding", () => {
+it("FailedOp error - roundtrip encoding and decoding", () => {
   const encoded = encodeFailedOp(0n, "AA21 didn't pay prefund");
   const decoded = decodeErrorResult({
     abi: ENTRYPOINT_V07_ABI,
     data: encoded,
   });
-  assertEquals(decoded.errorName, "FailedOp");
+  expect(decoded.errorName).toEqual("FailedOp");
   const [opIndex, reason] = decoded.args as unknown as [bigint, string];
-  assertEquals(opIndex, 0n);
-  assertEquals(reason, "AA21 didn't pay prefund");
+  expect(opIndex).toEqual(0n);
+  expect(reason).toEqual("AA21 didn't pay prefund");
 });
 
-Deno.test("FailedOpWithRevert error - roundtrip encoding and decoding", () => {
+it("FailedOpWithRevert error - roundtrip encoding and decoding", () => {
   const encoded = encodeFailedOpWithRevert(1n, "AA23 reverted", "0xdeadbeef");
   const decoded = decodeErrorResult({
     abi: ENTRYPOINT_V07_ABI,
     data: encoded,
   });
-  assertEquals(decoded.errorName, "FailedOpWithRevert");
+  expect(decoded.errorName).toEqual("FailedOpWithRevert");
   const [opIndex, reason, inner] = decoded.args as unknown as [bigint, string, `0x${string}`];
-  assertEquals(opIndex, 1n);
-  assertEquals(reason, "AA23 reverted");
-  assert(inner.startsWith("0xdeadbeef"));
+  expect(opIndex).toEqual(1n);
+  expect(reason).toEqual("AA23 reverted");
+  expect(inner.startsWith("0xdeadbeef")).toBeTruthy();
 });
 
 // ---- ValidationResult error encoding/decoding roundtrip ----
 
-Deno.test("ValidationResult error - roundtrip with valid data", () => {
+it("ValidationResult error - roundtrip with valid data", () => {
   const encoded = encodeValidationResultError({
     preOpGas: 150_000n,
     prefund: 300_000n,
@@ -228,10 +228,10 @@ Deno.test("ValidationResult error - roundtrip with valid data", () => {
     abi: ENTRYPOINT_V07_ABI,
     data: encoded,
   });
-  assertEquals(decoded.errorName, "ValidationResult");
+  expect(decoded.errorName).toEqual("ValidationResult");
 });
 
-Deno.test("ValidationResult error - sig failure aggregator is detectable", () => {
+it("ValidationResult error - sig failure aggregator is detectable", () => {
   // accountValidationData with aggregator=0x01 (sig fail) — canonical low-bit encoding.
   const sigFail = 1n;
   const encoded = encodeValidationResultError({
@@ -246,12 +246,12 @@ Deno.test("ValidationResult error - sig failure aggregator is detectable", () =>
     unknown, unknown, unknown,
   ];
   const vd = parseValidationData(args[0].accountValidationData);
-  assertEquals(vd.aggregator, "0x0000000000000000000000000000000000000001");
+  expect(vd.aggregator).toEqual("0x0000000000000000000000000000000000000001");
 });
 
 // ---- simulateHandleOp ABI encoding test ----
 
-Deno.test("simulateHandleOp ABI - can encode function data", () => {
+it("simulateHandleOp ABI - can encode function data", () => {
   const packed = {
     sender: "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`,
     nonce: 0n,
@@ -272,67 +272,67 @@ Deno.test("simulateHandleOp ABI - can encode function data", () => {
       "0x",
     ],
   });
-  assert(calldata.startsWith("0x"));
-  assert(calldata.length > 10); // Has data beyond the selector
+  expect(calldata.startsWith("0x")).toBeTruthy();
+  expect(calldata.length > 10).toBeTruthy(); // Has data beyond the selector
 });
 
-Deno.test("simulateHandleOp ABI - outputs include targetSuccess field", () => {
+it("simulateHandleOp ABI - outputs include targetSuccess field", () => {
   // Verify the ABI has outputs defined (we fixed this)
   const simulateHandleOp = ENTRYPOINT_V07_ABI.find(
     (entry) => entry.type === "function" && entry.name === "simulateHandleOp",
   );
-  assert(simulateHandleOp);
-  assert("outputs" in simulateHandleOp);
+  expect(simulateHandleOp).toBeTruthy();
+  expect("outputs" in simulateHandleOp).toBeTruthy();
   const outputs = (simulateHandleOp as unknown as { outputs: readonly unknown[] }).outputs;
-  assert(outputs.length > 0, "simulateHandleOp should have outputs defined");
+  expect(outputs.length > 0, "simulateHandleOp should have outputs defined").toBeTruthy();
   // The output is a tuple with targetSuccess
   const outputTuple = outputs[0] as { components: { name: string }[] };
   const fieldNames = outputTuple.components.map((c) => c.name);
-  assert(fieldNames.includes("targetSuccess"), "outputs must include targetSuccess");
-  assert(fieldNames.includes("targetResult"), "outputs must include targetResult");
-  assert(fieldNames.includes("paid"), "outputs must include paid");
+  expect(fieldNames.includes("targetSuccess"), "outputs must include targetSuccess").toBeTruthy();
+  expect(fieldNames.includes("targetResult"), "outputs must include targetResult").toBeTruthy();
+  expect(fieldNames.includes("paid"), "outputs must include paid").toBeTruthy();
 });
 
 // ---- isExecutionRevertError: provider/transport vs. genuine revert ----
 
-Deno.test("isExecutionRevertError - dRPC 'can't route' (code 12) is transient, not a revert", () => {
+it("isExecutionRevertError - dRPC 'can't route' (code 12) is transient, not a revert", () => {
   // The exact Gnosis production failure: dRPC couldn't route the state-override eth_call.
-  assert(!isExecutionRevertError({
+  expect(!isExecutionRevertError({
     code: 12,
     message: "Can't route your request to suitable provider, if you specified certain providers revise the list",
-  }));
+  })).toBeTruthy();
 });
 
-Deno.test("isExecutionRevertError - rate limit / capacity errors are transient", () => {
-  assert(!isExecutionRevertError({ code: -32005, message: "rate limit exceeded" }));
-  assert(!isExecutionRevertError({ code: -32000, message: "exceeded capacity, try again" }));
-  assert(!isExecutionRevertError({ message: "429 Too Many Requests" }));
+it("isExecutionRevertError - rate limit / capacity errors are transient", () => {
+  expect(!isExecutionRevertError({ code: -32005, message: "rate limit exceeded" })).toBeTruthy();
+  expect(!isExecutionRevertError({ code: -32000, message: "exceeded capacity, try again" })).toBeTruthy();
+  expect(!isExecutionRevertError({ message: "429 Too Many Requests" })).toBeTruthy();
 });
 
-Deno.test("isExecutionRevertError - unsupported method / state override is transient", () => {
-  assert(!isExecutionRevertError({ code: -32601, message: "the method eth_call is not supported" }));
-  assert(!isExecutionRevertError({ message: "missing trie node" }));
-  assert(!isExecutionRevertError({ message: "header not found" }));
+it("isExecutionRevertError - unsupported method / state override is transient", () => {
+  expect(!isExecutionRevertError({ code: -32601, message: "the method eth_call is not supported" })).toBeTruthy();
+  expect(!isExecutionRevertError({ message: "missing trie node" })).toBeTruthy();
+  expect(!isExecutionRevertError({ message: "header not found" })).toBeTruthy();
 });
 
-Deno.test("isExecutionRevertError - genuine execution revert IS definitive", () => {
-  assert(isExecutionRevertError({ code: 3, message: "execution reverted" }));
-  assert(isExecutionRevertError({ message: "execution reverted: AA24 signature error" }));
-  assert(isExecutionRevertError({ message: "err: intrinsic gas too low; out of gas" }));
+it("isExecutionRevertError - genuine execution revert IS definitive", () => {
+  expect(isExecutionRevertError({ code: 3, message: "execution reverted" })).toBeTruthy();
+  expect(isExecutionRevertError({ message: "execution reverted: AA24 signature error" })).toBeTruthy();
+  expect(isExecutionRevertError({ message: "err: intrinsic gas too low; out of gas" })).toBeTruthy();
 });
 
-Deno.test("isExecutionRevertError - genuine revert whose text contains a transient word is still definitive", () => {
+it("isExecutionRevertError - genuine revert whose text contains a transient word is still definitive", () => {
   // Ordering guard: the definitive AAxx/'reverted' signal must win over broad transient
   // keywords, so a real rejection is never mis-flagged retryable.
-  assert(isExecutionRevertError({ message: "AA23 reverted: paymaster temporarily unavailable" }));
-  assert(isExecutionRevertError({ message: "execution reverted: rate limit on target contract" }));
+  expect(isExecutionRevertError({ message: "AA23 reverted: paymaster temporarily unavailable" })).toBeTruthy();
+  expect(isExecutionRevertError({ message: "execution reverted: rate limit on target contract" })).toBeTruthy();
 });
 
-Deno.test("isExecutionRevertError - empty / unknown no-data error defaults to transient", () => {
-  assert(!isExecutionRevertError(undefined));
-  assert(!isExecutionRevertError(null));
-  assert(!isExecutionRevertError({ message: "" }));
-  assert(!isExecutionRevertError({ code: 99, message: "something weird happened" }));
+it("isExecutionRevertError - empty / unknown no-data error defaults to transient", () => {
+  expect(!isExecutionRevertError(undefined)).toBeTruthy();
+  expect(!isExecutionRevertError(null)).toBeTruthy();
+  expect(!isExecutionRevertError({ message: "" })).toBeTruthy();
+  expect(!isExecutionRevertError({ code: 99, message: "something weird happened" })).toBeTruthy();
 });
 
 // ---- RPC selection policy: prefer Alchemy, custom-override wins, no dRPC fallthrough ----
@@ -351,52 +351,52 @@ function cfg(rpcUrl: string, publicRpcs: string[]): BundlerConfig {
   return { rpcUrl, publicRpcs } as unknown as BundlerConfig;
 }
 
-Deno.test("isManagedRpcUrl - detects Alchemy, rejects public/dRPC", () => {
-  assert(isManagedRpcUrl(ALCHEMY_GNOSIS));
-  assert(isManagedRpcUrl("https://eth-mainnet.g.alchemy.com/v2/x"));
-  assert(!isManagedRpcUrl("https://gnosis.drpc.org"));
-  assert(!isManagedRpcUrl("https://rpc.gnosischain.com"));
-  assert(!isManagedRpcUrl(undefined));
-  assert(!isManagedRpcUrl("not a url"));
+it("isManagedRpcUrl - detects Alchemy, rejects public/dRPC", () => {
+  expect(isManagedRpcUrl(ALCHEMY_GNOSIS)).toBeTruthy();
+  expect(isManagedRpcUrl("https://eth-mainnet.g.alchemy.com/v2/x")).toBeTruthy();
+  expect(!isManagedRpcUrl("https://gnosis.drpc.org")).toBeTruthy();
+  expect(!isManagedRpcUrl("https://rpc.gnosischain.com")).toBeTruthy();
+  expect(!isManagedRpcUrl(undefined)).toBeTruthy();
+  expect(!isManagedRpcUrl("not a url")).toBeTruthy();
 });
 
-Deno.test("buildSimulationRpcList - Alchemy primary → NO public fallthrough (dRPC excluded)", () => {
+it("buildSimulationRpcList - Alchemy primary → NO public fallthrough (dRPC excluded)", () => {
   const list = buildSimulationRpcList(cfg(ALCHEMY_GNOSIS, GNOSIS_PUBLIC));
-  assertEquals(list, [ALCHEMY_GNOSIS]);
-  assert(!list.some((u) => u.includes("drpc.org")), "dRPC must never be in the Alchemy list");
+  expect(list).toEqual([ALCHEMY_GNOSIS]);
+  expect(!list.some((u) => u.includes("drpc.org")), "dRPC must never be in the Alchemy list").toBeTruthy();
 });
 
-Deno.test("buildSimulationRpcList - client X-Rpc-Url wins, Alchemy backs it, still no public", () => {
+it("buildSimulationRpcList - client X-Rpc-Url wins, Alchemy backs it, still no public", () => {
   const custom = "https://my-own-node.example/rpc";
   const list = buildSimulationRpcList(cfg(ALCHEMY_GNOSIS, GNOSIS_PUBLIC), custom);
-  assertEquals(list, [custom, ALCHEMY_GNOSIS]);
-  assert(!list.some((u) => u.includes("drpc.org")));
+  expect(list).toEqual([custom, ALCHEMY_GNOSIS]);
+  expect(!list.some((u) => u.includes("drpc.org"))).toBeTruthy();
 });
 
-Deno.test("buildSimulationRpcList - no Alchemy (public primary) → keeps capped public fallback", () => {
+it("buildSimulationRpcList - no Alchemy (public primary) → keeps capped public fallback", () => {
   // Chain with no Alchemy support: primary is a public node, fallbacks retained for resilience.
   const list = buildSimulationRpcList(cfg(PUBLICNODE, GNOSIS_PUBLIC));
-  assertEquals(list[0], PUBLICNODE);
-  assert(list.length > 1, "public-only chains still get fallbacks");
-  assert(list.length <= 1 + 2, "public fallbacks are capped at MAX_PUBLIC_FALLBACKS");
+  expect(list[0]).toEqual(PUBLICNODE);
+  expect(list.length > 1, "public-only chains still get fallbacks").toBeTruthy();
+  expect(list.length <= 1 + 2, "public fallbacks are capped at MAX_PUBLIC_FALLBACKS").toBeTruthy();
 });
 
-Deno.test("buildSimulationRpcList - custom Alchemy override also suppresses public fallthrough", () => {
+it("buildSimulationRpcList - custom Alchemy override also suppresses public fallthrough", () => {
   const customAlchemy = "https://gnosis-mainnet.g.alchemy.com/v2/otherkey";
   const list = buildSimulationRpcList(cfg(PUBLICNODE, GNOSIS_PUBLIC), customAlchemy);
-  assertEquals(list, [customAlchemy, PUBLICNODE]);
+  expect(list).toEqual([customAlchemy, PUBLICNODE]);
 });
 
 // ---- RPC error codes ----
 
-Deno.test("RPC_ERROR_CODES - has all required ERC-4337 error codes", () => {
-  assertEquals(RPC_ERROR_CODES.INVALID_USEROPERATION, -32602);
-  assertEquals(RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED, -32500);
-  assertEquals(RPC_ERROR_CODES.PAYMASTER_REJECTED, -32501);
-  assertEquals(RPC_ERROR_CODES.OPCODE_VIOLATION, -32502);
-  assertEquals(RPC_ERROR_CODES.OUT_OF_TIME_RANGE, -32503);
-  assertEquals(RPC_ERROR_CODES.THROTTLED_OR_BANNED, -32504);
-  assertEquals(RPC_ERROR_CODES.STAKE_TOO_LOW, -32505);
-  assertEquals(RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED, -32507);
-  assertEquals(RPC_ERROR_CODES.PAYMASTER_BALANCE_INSUFFICIENT, -32508);
+it("RPC_ERROR_CODES - has all required ERC-4337 error codes", () => {
+  expect(RPC_ERROR_CODES.INVALID_USEROPERATION).toEqual(-32602);
+  expect(RPC_ERROR_CODES.ENTRYPOINT_SIMULATION_REJECTED).toEqual(-32500);
+  expect(RPC_ERROR_CODES.PAYMASTER_REJECTED).toEqual(-32501);
+  expect(RPC_ERROR_CODES.OPCODE_VIOLATION).toEqual(-32502);
+  expect(RPC_ERROR_CODES.OUT_OF_TIME_RANGE).toEqual(-32503);
+  expect(RPC_ERROR_CODES.THROTTLED_OR_BANNED).toEqual(-32504);
+  expect(RPC_ERROR_CODES.STAKE_TOO_LOW).toEqual(-32505);
+  expect(RPC_ERROR_CODES.SIGNATURE_VALIDATION_FAILED).toEqual(-32507);
+  expect(RPC_ERROR_CODES.PAYMASTER_BALANCE_INSUFFICIENT).toEqual(-32508);
 });

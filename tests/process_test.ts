@@ -2,7 +2,7 @@
  * Tests for shared/rpc/process.ts — JSON-RPC request processing and response serialization.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { processRequest, jsonResponse, type RequestContext } from "../shared/rpc/process.ts";
 
 // Mock a minimal ChainRegistryLike
@@ -51,41 +51,41 @@ const mockConfig = {
 
 const reqCtx: RequestContext = { chainId: 1 };
 
-Deno.test("processRequest — rejects null body", async () => {
+it("processRequest — rejects null body", async () => {
   const result = await processRequest(null, mockConfig, mockChainRegistry, reqCtx);
-  assertEquals(result.jsonrpc, "2.0");
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32600);
+  expect(result.jsonrpc).toEqual("2.0");
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32600);
 });
 
-Deno.test("processRequest — rejects non-object body", async () => {
+it("processRequest — rejects non-object body", async () => {
   const result = await processRequest("invalid", mockConfig, mockChainRegistry, reqCtx);
-  assert(result.error !== undefined);
+  expect(result.error !== undefined).toBeTruthy();
 });
 
-Deno.test("processRequest — rejects missing jsonrpc field", async () => {
+it("processRequest — rejects missing jsonrpc field", async () => {
   const result = await processRequest(
     { method: "eth_chainId", id: 1, params: [] },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.message, "jsonrpc must be '2.0'");
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.message).toEqual("jsonrpc must be '2.0'");
 });
 
-Deno.test("processRequest — rejects non-string method", async () => {
+it("processRequest — rejects non-string method", async () => {
   const result = await processRequest(
     { jsonrpc: "2.0", method: 123, id: 1 },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.message, "method must be a string");
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.message).toEqual("method must be a string");
 });
 
-Deno.test("processRequest — returns eth_supportedEntryPoints", async () => {
+it("processRequest — returns eth_supportedEntryPoints", async () => {
   // This method doesn't need chain services
   const result = await processRequest(
     { jsonrpc: "2.0", method: "eth_supportedEntryPoints", id: 1, params: [] },
@@ -93,79 +93,79 @@ Deno.test("processRequest — returns eth_supportedEntryPoints", async () => {
     mockChainRegistry,
     reqCtx,
   );
-  assertEquals(result.jsonrpc, "2.0");
-  assertEquals(result.id, 1);
-  assert(Array.isArray(result.result));
-  assertEquals((result.result as string[])[0], mockConfig.entryPointAddress);
+  expect(result.jsonrpc).toEqual("2.0");
+  expect(result.id).toEqual(1);
+  expect(Array.isArray(result.result)).toBeTruthy();
+  expect((result.result as string[])[0]).toEqual(mockConfig.entryPointAddress);
 });
 
-Deno.test("processRequest — returns eth_chainId", async () => {
+it("processRequest — returns eth_chainId", async () => {
   const result = await processRequest(
     { jsonrpc: "2.0", method: "eth_chainId", id: 2, params: [] },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assertEquals(result.id, 2);
-  assertEquals(result.result, "0x1");
+  expect(result.id).toEqual(2);
+  expect(result.result).toEqual("0x1");
 });
 
-Deno.test("processRequest — returns error for unknown method", async () => {
+it("processRequest — returns error for unknown method", async () => {
   const result = await processRequest(
     { jsonrpc: "2.0", method: "eth_unknownMethod", id: 3, params: [] },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32601); // Method not found
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32601); // Method not found
 });
 
-Deno.test("processRequest — preserves request id", async () => {
+it("processRequest — preserves request id", async () => {
   const result = await processRequest(
     { jsonrpc: "2.0", method: "eth_chainId", id: "abc-123", params: [] },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assertEquals(result.id, "abc-123");
+  expect(result.id).toEqual("abc-123");
 });
 
-Deno.test("processRequest — null id when missing", async () => {
+it("processRequest — null id when missing", async () => {
   const result = await processRequest(
     { jsonrpc: "2.0", method: "eth_chainId", params: [] },
     mockConfig,
     mockChainRegistry,
     reqCtx,
   );
-  assertEquals(result.id, null);
+  expect(result.id).toEqual(null);
 });
 
 // ---------------------------------------------------------------------------
 // jsonResponse
 // ---------------------------------------------------------------------------
 
-Deno.test("jsonResponse — serializes bigint as hex", async () => {
+it("jsonResponse — serializes bigint as hex", async () => {
   const res = jsonResponse({ value: 255n });
   const body = await res.json();
-  assertEquals(body.value, "0xff");
+  expect(body.value).toEqual("0xff");
 });
 
-Deno.test("jsonResponse — preserves normal values", async () => {
+it("jsonResponse — preserves normal values", async () => {
   const res = jsonResponse({ str: "hello", num: 42, bool: true });
   const body = await res.json();
-  assertEquals(body.str, "hello");
-  assertEquals(body.num, 42);
-  assertEquals(body.bool, true);
+  expect(body.str).toEqual("hello");
+  expect(body.num).toEqual(42);
+  expect(body.bool).toEqual(true);
 });
 
-Deno.test("jsonResponse — includes extra headers", () => {
+it("jsonResponse — includes extra headers", () => {
   const res = jsonResponse({}, { "X-Custom": "test" });
-  assertEquals(res.headers.get("X-Custom"), "test");
-  assertEquals(res.headers.get("Content-Type"), "application/json");
+  expect(res.headers.get("X-Custom")).toEqual("test");
+  expect(res.headers.get("Content-Type")).toEqual("application/json");
 });
 
-Deno.test("jsonResponse — status is 200", () => {
+it("jsonResponse — status is 200", () => {
   const res = jsonResponse({});
-  assertEquals(res.status, 200);
+  expect(res.status).toEqual(200);
 });

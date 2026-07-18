@@ -26,6 +26,7 @@ import {
   slice,
   size,
   hexToNumber,
+  hexToBigInt,
   type Chain,
   type Hex,
   type PublicClient,
@@ -36,6 +37,7 @@ import { tempoActions } from "viem/tempo";
 import type { PackedUserOperation } from "./userop/types.ts";
 import { encodeHandleOps } from "./userop/encode.ts";
 import { ceilDiv } from "./gas/fee-model.ts";
+import { settlementVaultEnabledFor } from "./config/vault.ts";
 
 /** Tempo mainnet (4217) → its viem chain; Moderato testnet (42431) for dev. */
 const TEMPO_CHAINS: Record<number, Chain> = {
@@ -45,6 +47,57 @@ const TEMPO_CHAINS: Record<number, Chain> = {
 
 export function isTempoChain(chainId: number): boolean {
   return chainId in TEMPO_CHAINS;
+}
+
+// ---------------------------------------------------------------------------
+// In-band settlement predicates (see docs/inband-gas-settlement.md).
+//
+// The Tempo path — bundler EOA fronts the gas, the UserOp repays it IN-BAND, EntryPoint fee=0 —
+// is generalized to any EVM chain. Two ORTHOGONAL axes, deliberately kept separate:
+//   - chainSupportsInBand(): the SETTLEMENT model (beneficiary=EOA, reimbursed>=cost gate, no
+//     reservation). Always on for Tempo; opt-in elsewhere via config.inBandEnabled as chains
+//     migrate off the legacy native-self-pay/splitter route.
+//   - isTempoChain(): the tx ENVELOPE only (0x76 fee-token tx vs native EIP-1559), the float asset,
+//     trusted-RPC forcing, and the raised verification-gas ceiling. Stays chain-id gated.
+// Tempo = inBand + Tempo envelope. Generic in-band = inBand + native envelope.
+// ---------------------------------------------------------------------------
+
+/** A UserOp opts into in-band settlement by declaring a zero EntryPoint fee (native
+ *  prefund/refund becomes a no-op); it is instead repaid by an in-band transfer to the EOA. */
+export function opIsInBand(userOp: { maxFeePerGas: bigint }): boolean {
+  return userOp.maxFeePerGas === 0n;
+}
+
+/** Whether a chain runs the in-band settlement model. Always true on Tempo (no native coin);
+ *  elsewhere opt-in via config.inBandEnabled (default off) until the chain is migrated. */
+export function chainSupportsInBand(chainId: number, inBandEnabled = false): boolean {
+  return isTempoChain(chainId) || inBandEnabled;
+}
+
+/** Vault-mode resolution for a chain — the settlementVaultChains spec. Tempo is included:
+ *  its pathUSD fronting float is refilled by SponsorService.topUpTempoFloat (treasury
+ *  pathUSD via a self-paying 0x76), so fees can flow to the treasury there too. Every
+ *  vault consumer (bundle gate, quote, /v1/account, healthLoop top-ups) MUST resolve
+ *  through this one helper so the recipient sites can never disagree.
+ *  See docs/pool-queue-architecture.md Stage 2. */
+export function vaultActiveForChain(spec: string | undefined, chainId: number): boolean {
+  return settlementVaultEnabledFor(spec, chainId);
+}
+
+/** Whether in-band settlement is active for a chain, combining every enable source:
+ *  Tempo (always), a per-chain config's inBandEnabled boolean (tests / future
+ *  registry-driven configs), and the INBAND_ENABLED env spec (the operator's
+ *  per-chain canary — the only environment-controlled path). All in-band consumers
+ *  MUST resolve through this one helper: the ingress gate, the bundle gate, and the
+ *  quote endpoint disagreeing on "is this chain in-band" strands ops. */
+export function inBandActiveForChain(
+  config: { inBandEnabled?: boolean; inBandChains?: string },
+  chainId: number,
+): boolean {
+  return chainSupportsInBand(
+    chainId,
+    (config.inBandEnabled ?? false) || settlementVaultEnabledFor(config.inBandChains, chainId),
+  );
 }
 
 /** Protocol-default fee token (pathUSD), used when a UserOp doesn't specify one. */
@@ -61,6 +114,23 @@ export const TEMPO_BASE_FEE_ATTO = 20_000_000_000n;
  * accept a reimbursement below its real on-chain outlay.
  */
 export const TEMPO_COST_BUFFER_GAS = 80_000n;
+
+/** In-band QUOTE markup: the wallet is told to transfer this multiple of the estimated gas
+ *  cost (see docs/inband-gas-settlement.md). 3× covers base-fee spikes + revenue. */
+export const IN_BAND_MARKUP_X = 3n;
+
+/** In-band GATE markup: at submit the bundler only requires this multiple of its REAL
+ *  (re-simulated) cost. Deliberately BELOW the 3× quote: the wallet signs exactly the
+ *  displayed 3×-quote amount and never re-quotes at send, so the 1.5× band between quote
+ *  and gate absorbs gas drift between display and submit instead of stranding the op.
+ *  The $0.01-per-stablecoin floor still applies on top. */
+export const IN_BAND_GATE_MARKUP_X = 2n;
+
+/** Cost-basis buffer for the generic native EIP-1559 in-band envelope: the outer tx's intrinsic
+ *  21k + calldata-byte gas that an eth_simulateV1 of the handleOps CALL does not report. The
+ *  bundler must never accept a reimbursement below its real on-chain outlay. (Calibration is an
+ *  open item — see docs/inband-gas-settlement.md; conservative constant for now.) */
+export const EIP1559_COST_BUFFER_GAS = 60_000n;
 
 /** Resolve & checksum the fee token, falling back to pathUSD. */
 export function resolveFeeToken(feeToken?: string | null): `0x${string}` {
@@ -146,13 +216,64 @@ export async function sponsorTempoPathUsd(params: {
  * risk (same token in, same token out). Trust-minimised: reads the signed calldata, not a
  * wallet-supplied amount.
  */
+/** One decoded leg of the Safe's MultiSend batch. `to`/`value`/`data` are the raw sub-call. */
+interface MultiSendEntry {
+  operation: number; // 0 = CALL, 1 = DELEGATECALL
+  to: Hex;
+  value: bigint;
+  data: Hex;
+}
+
 /**
- * The ONLY target a reimbursement is credited from. A reimbursing UserOp must be
- * `executeUserOp(TRUSTED_MULTISEND, _, batch, operation=DELEGATECALL)` — only a delegatecall to
- * this exact canonical Safe MultiSend runs the decoded legs against the Safe and actually pays the
- * bundler EOA. Same deterministic address on every chain.
+ * Decode the UserOp callData (executeUserOp → multiSend) into its packed sub-call legs. Returns
+ * null when it isn't that shape. The packed layout per leg is op(1) to(20) value(32) len(32)
+ * data(len). This is the single, security-critical decoder shared by both reimbursement parsers.
+ */
+/**
+ * The ONLY target the bundler will credit an in-band reimbursement from. A valid reimbursing UserOp
+ * is `executeUserOp(TRUSTED_MULTISEND, _, batch, operation=DELEGATECALL)` — only a DELEGATECALL to
+ * this exact canonical Safe MultiSend runs the decoded legs against the Safe and actually moves
+ * funds to the bundler EOA. Deployed deterministically at the same address on every chain.
+ *
+ * SECURITY (critical): without this binding, a UserOp could `CALL` a code-less address (operation=0)
+ * with batch-shaped bytes — the on-chain call succeeds and moves NOTHING, yet the bytes still decode
+ * as transfers here, so the bundler would credit a phantom reimbursement and burn gas for zero pay.
  */
 export const TRUSTED_MULTISEND = getAddress("0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526");
+
+function decodeMultiSendEntries(callData: Hex): MultiSendEntry[] | null {
+  try {
+    const exec = decodeFunctionData({ abi: EXECUTE_USER_OP_ABI, data: callData });
+    // Bind the decoded batch to what ACTUALLY executes (see TRUSTED_MULTISEND): must DELEGATECALL
+    // (operation=1) the canonical MultiSend, else the legs never run against the Safe.
+    if (Number(exec.args[3]) !== 1) return null;
+    let outerTo: `0x${string}`;
+    try {
+      outerTo = getAddress(exec.args[0] as string);
+    } catch {
+      return null;
+    }
+    if (outerTo !== TRUSTED_MULTISEND) return null;
+    const innerData = exec.args[2] as Hex; // bytes -> the multiSend(bytes) call
+    const ms = decodeFunctionData({ abi: MULTISEND_ABI, data: innerData });
+    const txs = ms.args[0] as Hex;
+    const total = size(txs);
+    const entries: MultiSendEntry[] = [];
+    let off = 0;
+    while (off < total) {
+      const operation = hexToNumber(slice(txs, off, off + 1));
+      const to = slice(txs, off + 1, off + 21);
+      const value = hexToBigInt(slice(txs, off + 21, off + 53));
+      const dataLen = hexToNumber(slice(txs, off + 53, off + 85));
+      const data = dataLen > 0 ? slice(txs, off + 85, off + 85 + dataLen) : "0x";
+      off += 85 + dataLen;
+      entries.push({ operation, to, value, data });
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
 
 export function parseTempoReimbursement(
   callData: Hex,
@@ -169,60 +290,104 @@ export function parseTempoReimbursement(
   } catch {
     return 0n;
   }
-  try {
-    const exec = decodeFunctionData({ abi: EXECUTE_USER_OP_ABI, data: callData });
-    // SECURITY (critical): bind the decoded batch to what ACTUALLY executes on-chain. The UserOp
-    // must DELEGATECALL (operation=1) the canonical MultiSend — only then do the inner legs run
-    // against the Safe and truly transfer the feeToken to the bundler. A CALL (operation=0) to a
-    // code-less address, or a call to any non-MultiSend target, executes NOTHING interpretable as
-    // this batch, yet the bytes still decode as transfers below — so a zero-balance UserOp could
-    // be credited a PHANTOM reimbursement, pass the gate, and drain the bundler's gas float for
-    // free. Reject anything that is not a delegatecall to the trusted MultiSend.
-    if (Number(exec.args[3]) !== 1) return 0n;
+  const entries = decodeMultiSendEntries(callData);
+  if (!entries) return 0n;
+  let sum = 0n;
+  for (const e of entries) {
+    // SECURITY: only a plain CALL actually moves feeToken. A DELEGATECALL (operation=1) to the
+    // token address runs the token's code against the SAFE's storage — it moves nothing to the
+    // bundler — yet its face value would otherwise count as reimbursement, letting a crafted op
+    // pass the gate while paying the bundler nothing (a gas drain). Count CALL entries only.
+    if (e.operation !== 0) continue;
+    // Only the trusted feeToken counts — else an attacker repays in a worthless self-deployed
+    // token at face value and drains real gas.
+    let tokenTrusted = false;
     try {
-      if (getAddress(exec.args[0] as string) !== TRUSTED_MULTISEND) return 0n;
+      tokenTrusted = getAddress(e.to) === trustedToken;
     } catch {
-      return 0n;
+      tokenTrusted = false;
     }
-    const innerData = exec.args[2] as Hex; // bytes -> the multiSend(bytes) call
-    const ms = decodeFunctionData({ abi: MULTISEND_ABI, data: innerData });
-    const txs = ms.args[0] as Hex; // packed: op(1) to(20) value(32) len(32) data(len)
-    const total = size(txs);
-    let off = 0;
-    let sum = 0n;
-    while (off < total) {
-      const operation = hexToNumber(slice(txs, off, off + 1)); // 0 = CALL, 1 = DELEGATECALL
-      const callTo = slice(txs, off + 1, off + 21); // sub-call target = the token contract
-      const dataLen = hexToNumber(slice(txs, off + 53, off + 85));
-      const innerCall = slice(txs, off + 85, off + 85 + dataLen);
-      off += 85 + dataLen;
-      // SECURITY: only a plain CALL actually moves feeToken. A DELEGATECALL (operation=1) to
-      // the token address with `transfer(EOA, amt)` calldata runs the token's code against the
-      // SAFE's storage — it does NOT transfer any feeToken to the bundler — yet its face value
-      // would otherwise be counted as reimbursement, letting a crafted op pass the gate while
-      // paying the bundler nothing (a Tempo gas drain). Count CALL entries only.
-      if (operation !== 0) continue;
-      // Only the trusted feeToken counts — see SECURITY note above.
-      let tokenTrusted = false;
-      try {
-        tokenTrusted = getAddress(callTo) === trustedToken;
-      } catch {
-        tokenTrusted = false;
+    if (!tokenTrusted) continue;
+    try {
+      const t = decodeFunctionData({ abi: ERC20_ABI, data: e.data });
+      if (t.functionName === "transfer" && getAddress(t.args[0] as string) === target) {
+        sum += t.args[1] as bigint;
       }
-      if (!tokenTrusted) continue;
+    } catch {
+      // not a transfer call — ignore
+    }
+  }
+  return sum;
+}
+
+/** In-band reimbursement decoded from a UserOp, split by asset: native wei sent to the EOA, plus
+ *  each allowlisted stablecoin's summed transfer amount to the EOA (lowercased addr → raw units). */
+export interface InBandReimbursement {
+  native: bigint;
+  byToken: Record<string, bigint>;
+}
+
+/**
+ * Generalized in-band reimbursement decoder (all EVM chains — see docs/inband-gas-settlement.md).
+ * Walks the Safe's MultiSend batch and, counting ONLY plain CALLs (never a DELEGATECALL, which
+ * moves nothing), sums:
+ *   - native `value` sent directly to `recipient` (the bundler EOA), and
+ *   - `transfer(recipient, amount)` calls whose target token is in `allowedTokens` (the per-chain
+ *     stablecoin allowlist — an un-allowlisted token is ignored so nobody can repay in a worthless
+ *     self-deployed token at face value and drain real gas).
+ * Reads the SIGNED calldata, never a wallet-supplied number. Valuation (native vs token, the rate,
+ * the $0.01 floor) is the caller's job — this only extracts trusted amounts.
+ */
+export function parseInBandReimbursement(
+  callData: Hex,
+  recipient: `0x${string}`,
+  allowedTokens: Iterable<`0x${string}`>,
+): InBandReimbursement {
+  const empty: InBandReimbursement = { native: 0n, byToken: {} };
+  let target: `0x${string}`;
+  try {
+    target = getAddress(recipient);
+  } catch {
+    return empty;
+  }
+  const allow = new Set<string>();
+  for (const t of allowedTokens) {
+    try {
+      allow.add(getAddress(t));
+    } catch {
+      // skip a malformed allowlist entry rather than trust it
+    }
+  }
+  const entries = decodeMultiSendEntries(callData);
+  if (!entries) return empty;
+
+  let native = 0n;
+  const byToken: Record<string, bigint> = {};
+  for (const e of entries) {
+    if (e.operation !== 0) continue; // CALL only — a DELEGATECALL transfers nothing to the EOA
+    let toAddr: `0x${string}` | null = null;
+    try {
+      toAddr = getAddress(e.to);
+    } catch {
+      toAddr = null;
+    }
+    if (!toAddr) continue;
+    // (a) native value transferred straight to the EOA
+    if (toAddr === target && e.value > 0n) native += e.value;
+    // (b) an allowlisted-stablecoin transfer to the EOA
+    if (allow.has(toAddr)) {
       try {
-        const t = decodeFunctionData({ abi: ERC20_ABI, data: innerCall });
+        const t = decodeFunctionData({ abi: ERC20_ABI, data: e.data });
         if (t.functionName === "transfer" && getAddress(t.args[0] as string) === target) {
-          sum += t.args[1] as bigint;
+          const key = toAddr.toLowerCase();
+          byToken[key] = (byToken[key] ?? 0n) + (t.args[1] as bigint);
         }
       } catch {
         // not a transfer call — ignore
       }
     }
-    return sum;
-  } catch {
-    return 0n;
   }
+  return { native, byToken };
 }
 
 /**

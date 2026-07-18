@@ -36,6 +36,10 @@ import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas
 /** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
 const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
 
+/** Public RPCs tried (single attempt each) for the basic gas-price reads after the managed
+ *  primary fails — bounds failure-path latency while still surviving a single-provider outage. */
+const MAX_GAS_PRICE_FALLBACK_RPCS = 3;
+
 /**
  * Total wall-time budget for a multi-RPC simulation fan-out. Bounds the worst case
  * where the primary RPC is down and we walk the fallback list — without this, a
@@ -104,6 +108,10 @@ export function createSimulator(config: BundlerConfig) {
     deadline?: Deadline,
   ): Promise<SimulationResult> {
     const packed = packUserOp(userOp);
+    // HOP 2 evidence: what the bundler RECEIVED (factory) vs what it PUTS ON-CHAIN (initCode).
+    // An empty packed.initCode here for an undeployed sender is the AA20 cause — and it tells us
+    // whether the wallet sent no factory (received factory null) or the bundler dropped it.
+    console.log(`[Simulator] simulateValidation IN: sender=${userOp.sender} receivedFactory=${userOp.factory ?? "(none)"} receivedFactoryDataLen=${userOp.factoryData?.length ?? 0} packedInitCodeLen=${packed.initCode.length} packedInitCodeHead=${packed.initCode.slice(0, 46)}`);
     const calldata = encodeFunctionData({
       abi: ENTRYPOINT_V07_ABI,
       functionName: "simulateValidation",
@@ -198,7 +206,7 @@ export function createSimulator(config: BundlerConfig) {
         }
       }
 
-      console.log(`[Simulator] simulateValidation revert: data=${revertData?.slice(0, 20) ?? "none"}... raw=${JSON.stringify(json.error).slice(0, 200)}`);
+      console.log(`[Simulator] simulateValidation revert: data=${revertData ?? "none"} decoded=${revertData ? JSON.stringify(parseRevertData(revertData)) : "n/a"} raw=${JSON.stringify(json.error).slice(0, 400)}`);
 
       if (!revertData) {
         // No decodable revert data. An EntryPoint verdict ALWAYS carries ABI revert
@@ -622,6 +630,12 @@ export function createSimulator(config: BundlerConfig) {
     from?: `0x${string}`,
     rpcUrlOverride?: string,
     deadline?: Deadline,
+    /** Skip the step-2 eth_call verification. Set by callers (the in-band path) that run a
+     *  separate full-execution check (simulateExecutionSuccess/eth_simulateV1) right after — that
+     *  proves per-op execution success AND returns real gasUsed, so the eth_call here (documented
+     *  as "a final safety net already caught by simulateExecution per-op") is a redundant heavy
+     *  round-trip on the hot path. eth_estimateGas (step 1, kept) still provides gas + FailedOp. */
+    skipCallVerification?: boolean,
   ): Promise<BundleSimulationResult> {
     // `beneficiary` is only the encoded handleOps arg; `from` is the actual outer-tx sender
     // (the bundler EOA / tx.origin). They differ once the beneficiary is the splitter — the
@@ -670,8 +684,9 @@ export function createSimulator(config: BundlerConfig) {
 
     // Step 2: eth_call to detect individual UserOp execution failures
     // (EntryPoint handleOps doesn't revert on individual op failures — it emits
-    // UserOperationEvent with success=false and UserOperationRevertReason)
-    try {
+    // UserOperationEvent with success=false and UserOperationRevertReason).
+    // Skipped on the in-band path, which runs eth_simulateV1 next (proves the same thing).
+    if (!skipCallVerification) try {
       const callJson = await rpcCall(
         rpcUrl,
         {
@@ -838,54 +853,85 @@ export function createSimulator(config: BundlerConfig) {
     /** eth_gasPrice — used as floor to prevent nodes rejecting txs with too-low gas price. */
     chainGasPrice: bigint;
   }> {
-    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const primary = resolveRpcUrl(config, rpcUrlOverride);
 
-    // Route through the unified wrapper: per-call timeout + circuit breaker + structured
-    // classification. Single attempt (the allSettled fan-out already tolerates partial
-    // failure by falling back to defaults), so no request amplification.
-    const call = (id: number, method: string) =>
-      rpcCall(rpcUrl, { jsonrpc: "2.0", id, method, params: method === "eth_getBlockByNumber" ? ["latest", false] : [] },
-        { dependency: "rpc", operation: method, timeoutMs: RPC_TIMEOUT_MS, maxAttempts: 1, deadline });
+    // Basic gas reads (eth_getBlockByNumber / eth_gasPrice / eth_maxPriorityFeePerGas) are served
+    // by EVERY node, so when the primary is a PUBLIC/user RPC we walk a capped set of the resolved
+    // public RPCs before degrading — a single flaky endpoint won't take pricing offline.
+    // BUT when the primary is the operator's paid, managed RPC (Alchemy) it is the highest-priority
+    // and most reliable source: DO NOT fall back to public RPCs (they can be flaky or return a
+    // different price the user then signs). Trust Alchemy alone — retry it, or degrade (retryable)
+    // if it's genuinely down. Mirrors buildSimulationRpcList's managed-primary gating.
+    const fallbacks = isManagedRpcUrl(primary)
+      ? []
+      : (config.publicRpcs ?? []).filter((u) => u && u !== primary).slice(0, MAX_GAS_PRICE_FALLBACK_RPCS);
+    const urls = [primary, ...fallbacks];
+    // Bound the whole walk even when the caller passes no deadline (the background fee-bump /
+    // cancellation callers) — otherwise each URL mints a fresh per-call timeout and a full-outage
+    // walk could run ~4× a single call's budget before returning.
+    const dl = deadline ?? createDeadline(SIMULATION_TIMEOUT_MS);
+    let lastReason: unknown = new Error("gas price unavailable");
 
-    // Fetch baseFee, priority fee, and gasPrice in parallel
-    const [blockRes, tipRes, gpRes] = await Promise.allSettled([
-      call(1, "eth_getBlockByNumber"),
-      call(2, "eth_maxPriorityFeePerGas"),
-      call(3, "eth_gasPrice"),
-    ]);
+    for (const rpcUrl of urls) {
+      // Route through the unified wrapper: per-call timeout + circuit breaker + structured
+      // classification. Single attempt per URL (the URL walk is the retry), no amplification.
+      const call = (id: number, method: string) =>
+        rpcCall(rpcUrl, { jsonrpc: "2.0", id, method, params: method === "eth_getBlockByNumber" ? ["latest", false] : [] },
+          { dependency: "rpc", operation: method, timeoutMs: RPC_TIMEOUT_MS, maxAttempts: 1, deadline: dl });
 
-    // ALL THREE reads failed → the RPC is unreachable, not "gas is free". Rethrow (the
-    // reason is already classified by rpcCall) so callers surface a retryable degraded
-    // error instead of quoting maxFeePerGas=0x0 to the wallet — a zero quote gets SIGNED
-    // by the user and then rejected/stuck at submission. Rejection-count only, no zero-value
-    // check: Tempo (maxFee=0 by design) and other legitimately-zero chains are unaffected.
-    if (blockRes.status === "rejected" && tipRes.status === "rejected" && gpRes.status === "rejected") {
-      throw blockRes.reason;
+      const [blockRes, tipRes, gpRes] = await Promise.allSettled([
+        call(1, "eth_getBlockByNumber"),
+        call(2, "eth_maxPriorityFeePerGas"),
+        call(3, "eth_gasPrice"),
+      ]);
+
+      // ALL THREE reads failed → this RPC is unreachable, not "gas is free". Record the reason
+      // and try the next URL; only the final throw surfaces a retryable degraded error to the
+      // caller (never a maxFeePerGas=0x0 quote, which the user would SIGN and then get stuck).
+      if (blockRes.status === "rejected" && tipRes.status === "rejected" && gpRes.status === "rejected") {
+        lastReason = blockRes.reason;
+        continue;
+      }
+
+      // A FAILED base-fee read (block rejected) is NOT a legitimately-zero base fee: on a 1559
+      // chain baseFee is usually the dominant term, and returning 0 would quote a tip-only,
+      // grossly-underpriced op that stalls. eth_gasPrice (chainGasPrice) is the caller's floor
+      // and on 1559 chains ≈ base+tip, so it rescues us — but if BOTH the block read AND
+      // eth_gasPrice failed while only the tip succeeded, we have no reliable price: skip to the
+      // next URL, degrading only if none works. A block read that SUCCEEDED with no baseFeePerGas
+      // (Tempo / non-1559) keeps baseFee=0 correctly and is unaffected.
+      const baseFeeReadFailed = blockRes.status === "rejected";
+
+      let baseFee = 0n;
+      const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
+      if (blockResult?.baseFeePerGas) {
+        baseFee = BigInt(blockResult.baseFeePerGas);
+      }
+
+      let chainGasPrice = 0n;
+      const gpResult = gpRes.status === "fulfilled" ? (gpRes.value?.result as string | undefined) : undefined;
+      if (gpResult) {
+        chainGasPrice = BigInt(gpResult);
+      }
+
+      let suggestedMaxPriorityFeePerGas = 0n;
+      const tipResult = tipRes.status === "fulfilled" ? (tipRes.value?.result as string | undefined) : undefined;
+      if (tipResult) {
+        suggestedMaxPriorityFeePerGas = BigInt(tipResult);
+      } else {
+        // Fallback: derive tip from gasPrice - baseFee
+        suggestedMaxPriorityFeePerGas = chainGasPrice > baseFee ? chainGasPrice - baseFee : chainGasPrice;
+      }
+
+      if (baseFeeReadFailed && chainGasPrice === 0n && suggestedMaxPriorityFeePerGas > 0n) {
+        lastReason = blockRes.reason;
+        continue; // tip-only, no base-fee and no gasPrice floor → unreliable, try next URL
+      }
+
+      return { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice };
     }
 
-    let baseFee = 0n;
-    const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
-    if (blockResult?.baseFeePerGas) {
-      baseFee = BigInt(blockResult.baseFeePerGas);
-    }
-
-    // eth_gasPrice — always fetched, used as floor on non-EIP-1559 chains
-    let chainGasPrice = 0n;
-    const gpResult = gpRes.status === "fulfilled" ? (gpRes.value?.result as string | undefined) : undefined;
-    if (gpResult) {
-      chainGasPrice = BigInt(gpResult);
-    }
-
-    let suggestedMaxPriorityFeePerGas = 0n;
-    const tipResult = tipRes.status === "fulfilled" ? (tipRes.value?.result as string | undefined) : undefined;
-    if (tipResult) {
-      suggestedMaxPriorityFeePerGas = BigInt(tipResult);
-    } else {
-      // Fallback: derive tip from gasPrice - baseFee
-      suggestedMaxPriorityFeePerGas = chainGasPrice > baseFee ? chainGasPrice - baseFee : chainGasPrice;
-    }
-
-    return { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice };
+    throw lastReason;
   }
 
   /**
@@ -907,80 +953,186 @@ export function createSimulator(config: BundlerConfig) {
     from?: `0x${string}`,
     rpcUrlOverride?: string,
     deadline?: Deadline,
-  ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint }> {
+  ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint; transient?: boolean }> {
     // See simulateBundle: `from` is the real tx sender (EOA); differs from a splitter beneficiary.
     const caller = from ?? beneficiary;
     const calldata = encodeHandleOps(packedOps, beneficiary);
-    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const dl = deadline ?? createDeadline(SIMULATION_TOTAL_DEADLINE_MS);
+    // WALK the trusted RPC list (like simulateValidation / simulateExecution) rather than a single
+    // primary: eth_simulateV1 is NOT universally available (a free-tier node returns "method not
+    // available on freetier"), and this chain's primary may be the incapable one while a fallback
+    // (Alchemy) supports it. Crucial classification: a per-op execution VERDICT only ever appears
+    // inside a 200 `json.result`; a top-level `json.error` or a transport failure means the node
+    // could not RUN the method (a CAPABILITY failure) — NEVER that the op reverted. So we advance
+    // to the next RPC on capability failures and only return on a genuine verdict. Misreading a
+    // capability error as "execution would revert" is what silently killed every op on a free-RPC
+    // chain (fronting the wallet a bogus terminal failure).
+    const rpcsToTry = buildSimulationRpcList(config, rpcUrlOverride);
     type SimV1 = {
       result?: Array<{ calls?: Array<{ status?: string; gasUsed?: string; logs?: unknown[]; error?: { message?: string } }> }>;
-      error?: { message: string };
+      error?: { message?: string; code?: number };
     };
-    let json: SimV1;
-    try {
-      json = (await rpcCall(
-        rpcUrl,
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_simulateV1",
-          params: [
-            {
-              blockStateCalls: [
-                { calls: [{ from: caller, to: config.entryPointAddress, data: calldata }] },
-              ],
-              validation: false,
-              traceTransfers: false,
-            },
-            "latest",
-          ],
-        },
-        { dependency: "rpc", operation: "eth_simulateV1", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline },
-      )) as SimV1;
-    } catch (err) {
-      // Fails CLOSED: any transport failure ⇒ we can't prove execution succeeds ⇒ no submit.
-      return { success: false, errorMessage: `eth_simulateV1 failed: ${getClassification(err).reason}` };
-    }
-
-    if (json.error) {
-      return { success: false, errorMessage: `eth_simulateV1 error: ${json.error.message}` };
-    }
-    const call = json.result?.[0]?.calls?.[0];
-    if (!call) {
-      return { success: false, errorMessage: "eth_simulateV1 returned no call result" };
-    }
-    // handleOps itself reverted (e.g. validation FailedOp) — whole bundle is invalid.
-    if (call.status !== undefined && BigInt(call.status) === 0n) {
-      return { success: false, errorMessage: `handleOps reverted in simulation: ${call.error?.message ?? "unknown"}` };
-    }
-
-    const events = parseEventLogs({
-      abi: ENTRYPOINT_V07_ABI,
-      // deno-lint-ignore no-explicit-any
-      logs: (call.logs ?? []) as any,
-      eventName: "UserOperationEvent",
-    });
-    // EntryPoint emits one UserOperationEvent per op, in submission order.
-    for (let i = 0; i < events.length; i++) {
-      // deno-lint-ignore no-explicit-any
-      if ((events[i] as any).args?.success === false) {
-        return { success: false, failedOpIndex: i, errorMessage: `UserOp ${i} execution would revert on-chain` };
+    let lastCapability = "no trusted RPC available";
+    for (let i = 0; i < rpcsToTry.length; i++) {
+      if (dl.expired()) break;
+      const rpcUrl = rpcsToTry[i]!;
+      let json: SimV1;
+      try {
+        json = (await rpcCall(
+          rpcUrl,
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_simulateV1",
+            params: [
+              {
+                blockStateCalls: [
+                  { calls: [{ from: caller, to: config.entryPointAddress, data: calldata }] },
+                ],
+                validation: false,
+                traceTransfers: false,
+              },
+              "latest",
+            ],
+          },
+          { dependency: "rpc", operation: "eth_simulateV1", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline: dl },
+        )) as SimV1;
+      } catch (err) {
+        // Transport failure: the node couldn't serve the call — CAPABILITY, not a verdict.
+        lastCapability = `eth_simulateV1 transport ${getClassification(err).reason}`;
+        console.warn(`[Simulator] ${lastCapability} on ${redactUrl(rpcUrl).slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
+        continue;
       }
+      if (json.error) {
+        // A top-level JSON-RPC error means eth_simulateV1 itself could not run (unsupported /
+        // freetier / rate-limited / routing) — an inner op revert lives in json.result, never here.
+        // Treat as capability and advance; do NOT misclassify as "execution would revert".
+        lastCapability = `eth_simulateV1 error: ${json.error.message ?? "unknown"}`;
+        console.warn(`[Simulator] ${lastCapability} on ${redactUrl(rpcUrl).slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
+        continue;
+      }
+      const call = json.result?.[0]?.calls?.[0];
+      if (!call) {
+        lastCapability = "eth_simulateV1 returned no call result";
+        console.warn(`[Simulator] ${lastCapability} on ${redactUrl(rpcUrl).slice(0, 50)}... (${i + 1}/${rpcsToTry.length}), trying next RPC...`);
+        continue;
+      }
+      // Everything below is a genuine on-chain VERDICT derived from json.result.
+      // handleOps itself reverted (e.g. validation FailedOp) — whole bundle is invalid.
+      if (call.status !== undefined && BigInt(call.status) === 0n) {
+        return { success: false, errorMessage: `handleOps reverted in simulation: ${call.error?.message ?? "unknown"}` };
+      }
+      const events = parseEventLogs({
+        abi: ENTRYPOINT_V07_ABI,
+        // deno-lint-ignore no-explicit-any
+        logs: (call.logs ?? []) as any,
+        eventName: "UserOperationEvent",
+      });
+      // EntryPoint emits one UserOperationEvent per op, in submission order.
+      for (let k = 0; k < events.length; k++) {
+        // deno-lint-ignore no-explicit-any
+        if ((events[k] as any).args?.success === false) {
+          return { success: false, failedOpIndex: k, errorMessage: `UserOp ${k} execution would revert on-chain` };
+        }
+      }
+      if (events.length < packedOps.length) {
+        return {
+          success: false,
+          errorMessage: `only ${events.length}/${packedOps.length} ops emitted a UserOperationEvent (op reverted before execution)`,
+        };
+      }
+      // gasUsed = the REAL gas handleOps burns (execution actually run), unlike
+      // eth_estimateGas which reserves the full padded callGasLimit. Used to price the
+      // bundler's cost accurately on Tempo.
+      let gasUsed: bigint | undefined;
+      try {
+        if (call.gasUsed) gasUsed = BigInt(call.gasUsed);
+      } catch { /* leave undefined */ }
+      return { success: true, gasUsed };
     }
-    if (events.length < packedOps.length) {
-      return {
-        success: false,
-        errorMessage: `only ${events.length}/${packedOps.length} ops emitted a UserOperationEvent (op reverted before execution)`,
-      };
+
+    // No RPC could RUN eth_simulateV1 — fall back to a universal plain-eth_call execution probe so
+    // a chain whose RPC lacks eth_simulateV1 is not permanently un-sendable.
+    console.warn(`[Simulator] eth_simulateV1 unavailable on all ${rpcsToTry.length} RPC(s) (${lastCapability}) — falling back to eth_call execution probe`);
+    return await simulateExecutionViaEthCall(packedOps, rpcsToTry, dl, lastCapability);
+  }
+
+  /**
+   * Universal execution-success probe for RPCs that do NOT support eth_simulateV1.
+   *
+   * handleOps SWALLOWS an inner UserOp revert (the reimbursement transfer batched inside the op is
+   * then rolled back while handleOps still succeeds), so a plain eth_call / eth_estimateGas of
+   * handleOps cannot see it. Instead we eth_call the account's execution DIRECTLY — from the
+   * EntryPoint, to the sender, with the op's callData — UNWRAPPED by handleOps, so an inner revert
+   * (incl. the reimbursement leg reverting for insufficient balance) surfaces as an eth_call revert.
+   * Correct for in-band ops: maxFee=0 ⇒ prefund 0 ⇒ validation has no balance side-effect, so
+   * execution isolated from validation reproduces the balance state the reimbursement leg reads.
+   *
+   * Fail-closed guards (a false "OK" here = the operator fronts gas unpaid):
+   *  - length must be 1: per-op eth_call runs each op against the SAME pre-bundle state, so it
+   *    cannot reproduce op[i] seeing op[<i]'s effects — a sequential drain across a multi-op bundle
+   *    would be a money hole. A multi-op bundle DEFERS (transient) so the queue reassembles it as
+   *    single-op bundles, or the operator points the chain at an eth_simulateV1-capable RPC.
+   *  - a deploy op (non-empty initCode) DEFERS: at 'latest' the sender has no code, so the eth_call
+   *    can't test execution — passing it would be blind.
+   *  - gas is pinned to the op's declared callGasLimit so an OOG-at-limit reverts in the safe
+   *    direction. (A node that ignores the eth_call gas field leaves a residual OOG false-negative —
+   *    the documented price of running a chain on a plain-eth_call RPC; use a capable RPC to close it.)
+   */
+  async function simulateExecutionViaEthCall(
+    packedOps: PackedUserOperation[],
+    rpcsToTry: string[],
+    dl: Deadline,
+    capabilityReason: string,
+  ): Promise<{ success: boolean; failedOpIndex?: number; errorMessage?: string; gasUsed?: bigint; transient?: boolean }> {
+    if (packedOps.length !== 1) {
+      return { success: false, transient: true, errorMessage: `eth_simulateV1 unavailable (${capabilityReason}) and a ${packedOps.length}-op bundle can't be execution-verified via eth_call — deferring; point this chain at an eth_simulateV1-capable RPC` };
     }
-    // gasUsed = the REAL gas handleOps burns (execution actually run), unlike
-    // eth_estimateGas which reserves the full padded callGasLimit. Used to price the
-    // bundler's cost accurately on Tempo.
-    let gasUsed: bigint | undefined;
-    try {
-      if (call.gasUsed) gasUsed = BigInt(call.gasUsed);
-    } catch { /* leave undefined */ }
-    return { success: true, gasUsed };
+    const op = packedOps[0]!;
+    if (op.initCode && op.initCode !== "0x") {
+      return { success: false, transient: true, errorMessage: `eth_simulateV1 unavailable (${capabilityReason}) and the account is undeployed (initCode present) — execution can't be verified via eth_call; deferring, needs a capable RPC` };
+    }
+    // callGasLimit = low 16 bytes of accountGasLimits (bytes32: verificationGasLimit | callGasLimit).
+    const callGasLimit = BigInt("0x" + op.accountGasLimits.slice(2).padStart(64, "0").slice(32, 64));
+    const gasHex = `0x${callGasLimit.toString(16)}`;
+    let lastTransient = capabilityReason;
+    for (let i = 0; i < rpcsToTry.length; i++) {
+      if (dl.expired()) break;
+      const rpcUrl = rpcsToTry[i]!;
+      let json: RpcEnvelope;
+      try {
+        json = await rpcCall(
+          rpcUrl,
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_call",
+            // from = EntryPoint (Safe4337Module.executeUserOp requires msg.sender == EntryPoint);
+            // to = sender; data = the op's callData (exactly what the EntryPoint calls, unwrapped).
+            params: [{ from: config.entryPointAddress, to: op.sender, data: op.callData, gas: gasHex }, "latest"],
+          },
+          { dependency: "rpc", operation: "eth_call_exec_probe", timeoutMs: SIMULATION_TIMEOUT_MS, maxAttempts: 1, deadline: dl },
+        );
+      } catch (err) {
+        lastTransient = `eth_call probe transport ${getClassification(err).reason}`;
+        continue;
+      }
+      if (typeof json.result === "string") {
+        // Execution ran without reverting ⇒ the batched reimbursement leg would also execute.
+        return { success: true };
+      }
+      if (json.error) {
+        if (isExecutionRevertError(json.error)) {
+          // Genuine execution revert ⇒ the whole atomic UserOp (incl. reimbursement) rolls back.
+          return { success: false, failedOpIndex: 0, errorMessage: `execution would revert on-chain (eth_call probe): ${json.error.message ?? "reverted"}` };
+        }
+        lastTransient = `eth_call probe error: ${json.error.message ?? "unknown"}`;
+        continue; // capability / transport — try next RPC
+      }
+      lastTransient = "eth_call probe returned no result";
+    }
+    // Couldn't get a definitive answer from any RPC — fail closed as transient (defer, no penalty).
+    return { success: false, transient: true, errorMessage: `execution unverifiable via eth_call on all RPCs (${lastTransient})` };
   }
 
   return {
@@ -1039,7 +1191,7 @@ export function buildSimulationRpcList(cfg: BundlerConfig, rpcUrlOverride?: stri
   const primaryIsManaged = isManagedRpcUrl(rpcUrlOverride) || isManagedRpcUrl(cfg.rpcUrl);
   if (!primaryIsManaged) {
     let publicAdded = 0;
-    for (const r of cfg.publicRpcs) {
+    for (const r of (cfg.publicRpcs ?? [])) {
       if (publicAdded >= MAX_PUBLIC_FALLBACKS) break;
       if (!seen.has(r)) { add(r); publicAdded++; }
     }

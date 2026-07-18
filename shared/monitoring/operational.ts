@@ -49,6 +49,10 @@ export const SUBMIT_FAILURE_ALERT_STREAK = 3;
 export interface OperationalSnapshot {
   chainId: number;
   chainName: string | null;
+  /** Pool-EOA index when this snapshot is a per-index RelayerDO (queue transport). Namespaces the
+   *  alert dedup keys + label so the 100 relayers on a chain don't collapse into one alert.
+   *  Omitted for a chain BundlerDO snapshot (unchanged behaviour). */
+  poolIndex?: number;
   oldestMempoolAgeMs: number;
   lockedEoaCount: number;
   oldestLockedAgeMs: number;
@@ -87,11 +91,15 @@ export async function checkOperationalHealth(
   thresholds: OperationalThresholds,
   alerter: Alerter,
 ): Promise<void> {
-  const label = snap.chainName ? `${snap.chainName} (${snap.chainId})` : `chain ${snap.chainId}`;
+  // Per-index suffix so a RelayerDO's alerts (queue transport) don't dedup-collide with the chain
+  // DO's or with the other 99 relayers. Empty for a chain BundlerDO snapshot (unchanged).
+  const sfx = snap.poolIndex !== undefined ? `-eoa${snap.poolIndex}` : "";
+  const label = (snap.chainName ? `${snap.chainName} (${snap.chainId})` : `chain ${snap.chainId}`) +
+    (snap.poolIndex !== undefined ? ` pool EOA #${snap.poolIndex}` : "");
 
   if (snap.oldestMempoolAgeMs > thresholds.mempoolAgeMs) {
     await alerter.send(
-      `stuck-mempool-${snap.chainId}`,
+      `stuck-mempool-${snap.chainId}${sfx}`,
       `🚨 Vela Bundler — UserOp STUCK in mempool on ${label} for ${fmtDuration(snap.oldestMempoolAgeMs)}.\n` +
         `A user's tx was accepted but is not being submitted. Likely: RPC unavailable, pricing gate ` +
         `(unprofitable / margin), or the dedicated EOA lacks balance. Developer/ops attention needed.`,
@@ -101,7 +109,7 @@ export async function checkOperationalHealth(
 
   if (snap.oldestPendingReceiptAgeMs > thresholds.pendingReceiptAgeMs) {
     await alerter.send(
-      `stuck-pending-${snap.chainId}`,
+      `stuck-pending-${snap.chainId}${sfx}`,
       `🚨 Vela Bundler — submitted bundle UNCONFIRMED on ${label} for ${fmtDuration(snap.oldestPendingReceiptAgeMs)} ` +
         `(${snap.pendingReceiptCount} pending). Broadcast but not mined/reconciled — likely underpriced or ` +
         `dropped. The user's tx status is unresolved. Check gas pricing / RPC.`,
@@ -111,7 +119,7 @@ export async function checkOperationalHealth(
 
   if (snap.lockedEoaCount > 0 && snap.oldestLockedAgeMs > thresholds.lockedEoaAgeMs) {
     await alerter.send(
-      `stuck-eoa-${snap.chainId}`,
+      `stuck-eoa-${snap.chainId}${sfx}`,
       `🚨 Vela Bundler — ${snap.lockedEoaCount} dedicated EOA(s) STUCK (LOCKED_PENDING_UNKNOWN) on ${label}, ` +
         `oldest ${fmtDuration(snap.oldestLockedAgeMs)}. The health loop can't confirm the in-flight nonce, so ` +
         `that user's EOA can't submit new bundles — money can't move. Often an RPC without reliable "pending" ` +
@@ -126,7 +134,7 @@ export async function checkOperationalHealth(
   // throttle, txpool policy, chronic underfunding). The streak resets on any successful submit.
   if (snap.submitFailureStreak >= SUBMIT_FAILURE_ALERT_STREAK) {
     await alerter.send(
-      `submit-failing-${snap.chainId}`,
+      `submit-failing-${snap.chainId}${sfx}`,
       `🚨 Vela Bundler — bundle BROADCAST failing on ${label} (${snap.submitFailureStreak} consecutive ` +
         `failures). Users' ops are being rejected at the RPC and returned as failed receipts.\n` +
         `Last error: ${snap.lastSubmitError ?? "unknown"}\n` +
@@ -140,16 +148,18 @@ export async function checkOperationalHealth(
   if (snap.insufficientFundsEoa) {
     await alerter.send(
       `eoa-underfunded-${snap.chainId}-${snap.insufficientFundsEoa}`,
-      `💸 Vela Bundler — dedicated EOA ${snap.insufficientFundsEoa} on ${label} cannot afford its ` +
-        `bundle (insufficient funds at broadcast). The user's ops will keep failing until the EOA is ` +
-        `topped up (user deposit) or gas falls.\nLast error: ${snap.lastSubmitError ?? "unknown"}`,
+      `💸 Vela Bundler — fronting EOA ${snap.insufficientFundsEoa} on ${label} cannot afford its ` +
+        `bundle (insufficient funds at broadcast). Ops keep failing until it is topped up or gas ` +
+        `falls. On in-band/vault chains this is an OPERATOR float — raise poolFloatTargetWei / fund ` +
+        `the treasury (the refill loop sizes to the shortfall); on legacy chains it is the user's ` +
+        `deposit.\nLast error: ${snap.lastSubmitError ?? "unknown"}`,
       { cooldownMs: STUCK_COOLDOWN_MS },
     );
   }
 
   if (snap.reputationBannedSenders > 0) {
     await alerter.send(
-      `reputation-blocked-${snap.chainId}`,
+      `reputation-blocked-${snap.chainId}${sfx}`,
       `⚠️ Vela Bundler — ${snap.reputationBannedSenders} sender Safe(s) on ${label} are in a penalized ` +
         `reputation status (their ops keep failing re-validation). They are NOT blocked from submitting, ` +
         `but repeated failures usually mean the op reverts on-chain (e.g. market moved) or a config issue. ` +

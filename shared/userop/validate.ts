@@ -28,12 +28,17 @@ export const MAX_UINT128 = (1n << 128n) - 1n;
 /**
  * Validate field-level constraints on a UserOperation before simulation.
  *
- * @param tempo  Tempo chain: maxFeePerGas = 0 is REQUIRED (no native coin — EntryPoint's
- *   native accounting must be a no-op; the bundler's outer 0x76 pays gas in a stablecoin),
- *   and the verification-gas ceiling is raised for the expensive Safe deploy. See
- *   shared/tempo.ts.
+ * @param allowZeroFee  In-band settlement chains allow (and expect) maxFeePerGas = 0 — the
+ *   EntryPoint's native prefund is a no-op and the bundler is repaid in-band. True on Tempo and on
+ *   any chain with inBandEnabled (chainSupportsInBand). See docs/inband-gas-settlement.md.
+ * @param raiseVerifCeiling  Raise the verification-gas ceiling for the expensive Safe deploy —
+ *   the Tempo ENVELOPE only (isTempoChain), orthogonal to the settlement model.
  */
-export function validateUserOpFields(userOp: UserOperation, tempo = false): void {
+export function validateUserOpFields(
+  userOp: UserOperation,
+  allowZeroFee = false,
+  raiseVerifCeiling = false,
+): void {
   // sender must be a valid address
   if (!userOp.sender || !/^0x[0-9a-fA-F]{40}$/.test(userOp.sender)) {
     throw new UserOpValidationError("invalid sender address");
@@ -61,7 +66,7 @@ export function validateUserOpFields(userOp: UserOperation, tempo = false): void
   }
 
   // MAX_VERIFICATION_GAS enforcement (raised on Tempo for the costly Safe deploy)
-  const maxVerificationGas = tempo ? TEMPO_MAX_VERIFICATION_GAS : MAX_VERIFICATION_GAS;
+  const maxVerificationGas = raiseVerifCeiling ? TEMPO_MAX_VERIFICATION_GAS : MAX_VERIFICATION_GAS;
   if (userOp.verificationGasLimit > maxVerificationGas) {
     throw new UserOpValidationError(
       `verificationGasLimit exceeds max (${maxVerificationGas})`,
@@ -69,7 +74,7 @@ export function validateUserOpFields(userOp: UserOperation, tempo = false): void
   }
 
   // Fee fields
-  if (!tempo && userOp.maxFeePerGas <= 0n) {
+  if (!allowZeroFee && userOp.maxFeePerGas <= 0n) {
     throw new UserOpValidationError("maxFeePerGas must be > 0");
   }
   if (userOp.maxPriorityFeePerGas < 0n) {

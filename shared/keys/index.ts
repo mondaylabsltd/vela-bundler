@@ -9,4 +9,10 @@
 
 export { type KeyManager, type DerivedEOA, type KeyDerivationParams } from "./types.ts";
 export { LocalKeyManager } from "./local.ts";
-export { deriveEOAPrivateKey, deriveEOAAddress } from "./derive.ts";
+export {
+  deriveEOAPrivateKey,
+  deriveEOAAddress,
+  derivePoolRelayerPrivateKey,
+  derivePoolRelayerAddress,
+  RELAYER_POOL_SIZE,
+} from "./derive.ts";

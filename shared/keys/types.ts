@@ -26,6 +26,13 @@ export interface KeyManager {
   deriveEOA(params: KeyDerivationParams): Promise<DerivedEOA>;
 
   /**
+   * Derive pool relayer EOA #index (0..RELAYER_POOL_SIZE-1). Chain-independent:
+   * the same index yields the same address on every chain. Not consumed yet —
+   * Stage 0 of docs/pool-queue-architecture.md.
+   */
+  derivePoolEOA(index: number): Promise<DerivedEOA>;
+
+  /**
    * Get all old operator secrets (for sweeping draining EOAs).
    * Returns secret strings — never log or expose.
    */

@@ -113,7 +113,7 @@ is a money property (5-min trading windows).** Each fix has a regression test
   in-memory (Worker persists them + mempool + terminal receipts to DO storage). Mitigated
   (nonce-proof recovery + stuck-eoa alert + boot ping makes restarts visible), but for heavy
   Deno production use add a file-backed `setPersistPendingHook`. **Production target is
-  Cloudflare Workers, where reconciliation, mempool and receipts are all durable.**
+  Cloudflare Workers, where reconciliation, mempool and receipts are all durable.** (Resolved/N-A after 2026-07-16 Deno removal.)
 - **Tempo ambiguous submit** (sync-submit timeout): no pre-computed 0x76 hash (viem's Tempo
   extension owns the serialization), so the ops are removed with NO receipt (honest unknown,
   never a fabricated failure). The outer nonce IS pinned pre-submit, so the EOA locks with
@@ -185,7 +185,7 @@ is a money property (5-min trading windows).** Each fix has a regression test
 - **Fix recipe:** stop rescheduling when `mempool + pendingReceipts + lockedEOAs` are all empty; re-arm on the next request.
 - **Acceptance:** an idle DO stops its alarm and consumes no periodic cost.
 
-### O-4 [P2] Deno runtime: no durability, no graceful shutdown
+### O-4 [P2] Deno runtime: no durability, no graceful shutdown (Resolved/N-A after 2026-07-16 Deno removal.)
 - **Evidence:** [deno/main.ts](../../deno/main.ts) wires no `setPersistPendingHook` and no SIGTERM/SIGINT handler; `flushPendingReceipts` is a no-op in Deno.
 - **Fix recipe:** add a SIGTERM handler that stops timers and awaits in-flight `processReceipt`; optionally a file/KV persistence backend via `setPersistPendingHook`, mirroring the Worker.
 - **Control if not fixed:** accept receipt-visibility gaps on restart (no fund loss — nonce monotonicity). Prefer rolling restarts during low traffic.
@@ -221,7 +221,7 @@ is a money property (5-min trading windows).** Each fix has a regression test
 ### O-10 [P2] No persistence of confirmed receipts / accepted mempool ops
 - Confirmed `UserOperationReceipt`s and accepted-but-unbundled ops are in-memory only; lost on eviction/restart with no on-chain fallback for the receipt lookup. Clients must re-derive from chain. Fix: persist recent receipts (Worker DO storage) or document the client's fallback contract.
 
-### O-11 [P2] Rate-limit bypass on directly-bound Deno via spoofable `CF-Connecting-IP`
+### O-11 [P2] Rate-limit bypass on directly-bound Deno via spoofable `CF-Connecting-IP` (Resolved/N-A after 2026-07-16 Deno removal.)
 - **Evidence:** Deno keys the limiter off the real TCP peer (`info.remoteAddr`) — good — but if the Deno server is ever placed behind a proxy that forwards `CF-Connecting-IP`/`X-Forwarded-For` and code is changed to trust it, spoofing returns. Keep trusting only the TCP peer on directly-bound deployments; only trust forwarded headers behind a proxy you control.
 
 ### O-12 [P2] Doc/behavior drift (mostly fixed this pass)
@@ -240,7 +240,7 @@ is a money property (5-min trading windows).** Each fix has a regression test
 - **O-18** Broadcast omits an explicit `nonce`/pinned `gas` (re-estimates, N+1) — minor latency/cost.
 - **O-19** Tempo cost buffer is a flat 80k gas regardless of bundle size — heavy bundles/deploys can be accepted slightly under-reimbursed. Scale the buffer with op count.
 - **O-20** Unbounded gas/fee fields can make `packUint128` throw inside `simulateValidation`, surfacing as a generic internal error — validate ranges for a clean rejection.
-- **O-21** Deploy writes the operator secret as base64 in the ssh command argv → visible in process listings on both hosts during deploy. Pipe via stdin instead.
+- **O-21** Deploy writes the operator secret as base64 in the ssh command argv → visible in process listings on both hosts during deploy. Pipe via stdin instead. (Resolved/N-A after 2026-07-16 Deno removal — secrets now set via `npx wrangler secret put`.)
 - **O-22** `/health` returns HTTP 200 even when degraded; the deploy health-gate only matches literal `"ok"`. Consider a non-2xx on degraded, or alert on the JSON field.
 
 ---
@@ -250,4 +250,4 @@ is a money property (5-min trading windows).** Each fix has a regression test
 2. O-2 splitter-deployment guarded or made a hard deploy precondition with a check.
 3. O-8 treasury-balance monitoring in place (metric or external).
 4. O-3/O-3b Worker health reachable + DO alarm idles (if Workers is the launch target).
-5. O-4 Deno graceful shutdown (if Deno is the launch target and receipt-visibility across restarts matters).
+5. O-4 Deno graceful shutdown (if Deno is the launch target and receipt-visibility across restarts matters). (Resolved/N-A after 2026-07-16 Deno removal.)

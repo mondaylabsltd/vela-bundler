@@ -7,27 +7,27 @@
  * so any new client header works without editing a list. These tests lock that in.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { CORS_HEADERS, corsPreflight } from "../shared/rpc/cors.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
 import type { RateLimitConfig } from "../shared/auth/index.ts";
 
-Deno.test("CORS_HEADERS - fully permissive (origin *, headers *, methods, max-age)", () => {
-  assertEquals(CORS_HEADERS["Access-Control-Allow-Origin"], "*");
-  assertEquals(CORS_HEADERS["Access-Control-Allow-Headers"], "*");
-  assert(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("POST"));
-  assert(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("OPTIONS"));
-  assert(Number(CORS_HEADERS["Access-Control-Max-Age"]) > 0, "preflight should be cacheable");
+it("CORS_HEADERS - fully permissive (origin *, headers *, methods, max-age)", () => {
+  expect(CORS_HEADERS["Access-Control-Allow-Origin"]).toEqual("*");
+  expect(CORS_HEADERS["Access-Control-Allow-Headers"]).toEqual("*");
+  expect(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("POST")).toBeTruthy();
+  expect(CORS_HEADERS["Access-Control-Allow-Methods"]!.includes("OPTIONS")).toBeTruthy();
+  expect(Number(CORS_HEADERS["Access-Control-Max-Age"]) > 0, "preflight should be cacheable").toBeTruthy();
 });
 
-Deno.test("corsPreflight - 204 with permissive headers", () => {
+it("corsPreflight - 204 with permissive headers", () => {
   const res = corsPreflight();
-  assertEquals(res.status, 204);
-  assertEquals(res.headers.get("Access-Control-Allow-Origin"), "*");
-  assertEquals(res.headers.get("Access-Control-Allow-Headers"), "*");
+  expect(res.status).toEqual(204);
+  expect(res.headers.get("Access-Control-Allow-Origin")).toEqual("*");
+  expect(res.headers.get("Access-Control-Allow-Headers")).toEqual("*");
 });
 
-Deno.test("handleRestApi - OPTIONS preflight for /v1/sponsor allows an arbitrary header (Idempotency-Key)", async () => {
+it("handleRestApi - OPTIONS preflight for /v1/sponsor allows an arbitrary header (Idempotency-Key)", async () => {
   // Mirrors the browser preflight that was being blocked. The registry is never touched on
   // the OPTIONS path, so a stub is fine.
   const stubRegistry = { getChain: () => Promise.reject(new Error("unused")), getAll: () => [] };
@@ -50,9 +50,9 @@ Deno.test("handleRestApi - OPTIONS preflight for /v1/sponsor allows an arbitrary
     {} as any,
     rl,
   );
-  assert(res !== null, "OPTIONS on /v1/ must be handled");
-  assertEquals(res!.status, 204);
+  expect(res !== null, "OPTIONS on /v1/ must be handled").toBeTruthy();
+  expect(res!.status).toEqual(204);
   // `*` allows the idempotency-key header (and any future header) without a list edit.
-  assertEquals(res!.headers.get("Access-Control-Allow-Headers"), "*");
-  assertEquals(res!.headers.get("Access-Control-Allow-Origin"), "*");
+  expect(res!.headers.get("Access-Control-Allow-Headers")).toEqual("*");
+  expect(res!.headers.get("Access-Control-Allow-Origin")).toEqual("*");
 });

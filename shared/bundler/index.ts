@@ -6,6 +6,10 @@
  * On native chains the handleOps beneficiary is the VelaGasSettlementSplitter
  * (splits the gas settlement 50/50 between the EOA and the treasury); on Tempo
  * it stays the EOA (repaid in-band by a feeToken transfer).
+ *
+ * Stage 3 pool mode (POOL_EOA_ENABLED + in-band + vault, docs/pool-queue-architecture.md):
+ * bundles are MULTI-SENDER, signed by a leased pool relayer EOA, with the treasury as
+ * beneficiary/reimbursement recipient — see poolModeActive/tryPoolBundle.
  */
 
 import {
@@ -20,7 +24,13 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
-import { getPublicClient, RPC_REDIRECT_MODE } from "../utils/rpc-client.ts";
+import {
+  getPublicClient,
+  getFailoverPublicClient,
+  buildFallbackTransport,
+  trustedMoneyPathRpcs,
+  RPC_REDIRECT_MODE,
+} from "../utils/rpc-client.ts";
 import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
 import { metrics, redactError } from "../reliability/log.ts";
 import { getClassification } from "../reliability/errors.ts";
@@ -28,25 +38,37 @@ import { createDeadline } from "../reliability/retry.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import type { Simulator } from "../simulation/index.ts";
 import { Mempool } from "../mempool/index.ts";
-import type { AccountService } from "../account/index.ts";
+import type { AccountService, PoolEOALease } from "../account/index.ts";
 import type {
   MempoolEntry,
+  UserOperation,
   UserOperationReceipt,
 } from "../userop/types.ts";
 import { encodeHandleOps } from "../userop/encode.ts";
+import { packUserOp } from "../userop/pack.ts";
+import { getUserOpHash } from "../userop/hash.ts";
 import {
   calcUserOpGasPrice,
+  calcOuterTxGasPrice,
   checkBundleProfitability,
 } from "../gas/profitability.ts";
+import { quoteNativeToStable, stableDecimals, stableFloorUnits, nativeFloorWei } from "../gas/stable-rate.ts";
 import { computeOuterGas, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
+import { chainSpecEnables } from "../config/vault.ts";
+import { RELAYER_POOL_SIZE } from "../keys/derive.ts";
 import {
   isTempoChain,
+  inBandActiveForChain,
+  vaultActiveForChain,
   resolveFeeToken,
   tempoCostInFeeToken,
   parseTempoReimbursement,
+  parseInBandReimbursement,
   submitTempoBundle,
   TEMPO_COST_BUFFER_GAS,
+  EIP1559_COST_BUFFER_GAS,
+  IN_BAND_GATE_MARKUP_X,
 } from "../tempo.ts";
 
 export interface BundleResult {
@@ -54,6 +76,19 @@ export interface BundleResult {
   transactionHash?: `0x${string}`;
   userOpHashes: `0x${string}`[];
   error?: string;
+}
+
+/**
+ * A validated ingress op handed to the Stage 4 queue-transport producer hook. The worker
+ * layer (BundlerDO) wires the hook via setEnqueueHook; it enqueues a UserOpQueueMessage +
+ * writes the accepted-op KV status marker and returns true, or returns false to signal
+ * "enqueue unavailable — fall back to the mempool" (never drop the op).
+ */
+export interface EnqueueRequest {
+  userOp: UserOperation;
+  userOpHash: `0x${string}`;
+  prefund: bigint;
+  rpcUrlOverride?: string;
 }
 
 /**
@@ -93,11 +128,22 @@ export function classifyBroadcastError(err: unknown): "definitive" | "ambiguous"
 }
 
 /** True when a broadcast error is the node's prefund check failing — a "needs top-up" state
- *  the operator (or user) must act on, surfaced via the eoa-underfunded alert. */
+ *  the operator (or user) must act on, surfaced via the eoa-underfunded alert.
+ *
+ *  Providers phrase a from-account that can't cover gas very differently. geth/Nethermind say
+ *  "insufficient funds"; Alchemy/geth's eth_estimateGas binary search reports it as
+ *  "gas required exceeds allowance (N)", where N is the balance-affordable gas (0 when the EOA
+ *  is empty). For our fronting-EOA submits (value=0, ~200k gas) an "exceeds allowance" is
+ *  always a prefund/top-up signal, not a genuinely too-big bundle — missing it left a
+ *  stablecoin-fee EOA (which never gets native reimbursement) drained to 0 and mis-deferred
+ *  forever without ever firing the top-up (the chain-1 "根本上不了链" stall). */
 export function isInsufficientFundsError(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return msg.includes("insufficient funds") || msg.includes("insufficient balance") ||
-    msg.includes("total cost exceeds balance");
+    msg.includes("total cost exceeds balance") ||
+    msg.includes("gas required exceeds allowance") ||
+    msg.includes("sender doesn't have enough funds") ||
+    msg.includes("not enough funds");
 }
 
 /** Receipt TTL — 24 hours. */
@@ -145,10 +191,37 @@ const MAX_FEE_BUMPS = 2;
  *  documented inclusion-first stance, see O-1) — 2× caps that loss at ≤1× revenue. */
 const FEE_BUMP_REVENUE_CAP_MULTIPLE = 2n;
 
+/** Gas for the cancellation self-transfer (0 value, no data). 21k intrinsic on L1; padded to
+ *  cover L2s that fold an L1-data component into the gas limit (Arbitrum/OP), so the pre-execution
+ *  intrinsic-gas check can't reject it. Still a trivial recovery cost. */
+const CANCELLATION_GAS = 100_000n;
+/** Fire a same-nonce cancellation once fee-bumps are exhausted AND the tx has been stuck this
+ *  long; ALSO the min interval between cancellation retries (lastCancelAt cooldown) — recovers a
+ *  pinned pool EOA in minutes instead of the ~1h abandonment timeout, and a failed cancellation is
+ *  retried (with a recomputed fee) rather than latched off. */
+const CANCELLATION_AFTER_MS = 120_000;
+
+/** Hard cancellation escape hatch: once a tx has been stuck this long WITHOUT a successful
+ *  fee-bump (bumpCount never reached MAX_FEE_BUMPS because every bump was refused — over the
+ *  revenue ceiling, or the EOA couldn't afford it), cancel anyway so the pinned pool EOA is
+ *  unbricked in minutes instead of sitting until the ~1h abandonment. Without this a tx that
+ *  can neither land nor be bumped deadlocks: bumpCount stays 0, so the normal
+ *  `bumpCount >= MAX_FEE_BUMPS` cancellation gate never opens. The trading window is long gone
+ *  by here, so replacing it with a 0-value self-transfer (exactly one of {original, cancel}
+ *  mines — never a double execution) is the correct recovery. */
+const CANCELLATION_HARD_MS = 180_000;
+
 /** Consecutive "nonce consumed but no receipt" observations required before a tx is
  *  declared replaced/dropped. Closes the race where the receipt read transiently errors
  *  in the same cycle the nonce read sees `latest` advance. */
 const NONCE_CONSUMED_CONFIRMATIONS = 3;
+
+/** Max drop-resim-reassemble rounds per pool bundle (the 4337 gotcha, see
+ *  docs/pool-queue-architecture.md): handleOps reverts the ENTIRE tx if ANY op fails the
+ *  validation phase, and each full-bundle simulation names only the FIRST failure — so a
+ *  multi-sender bundle iterates drop → re-simulate → reassemble, bounded to keep one
+ *  pathological batch from monopolizing the cycle. Survivors past the bound defer. */
+const POOL_ASSEMBLY_MAX_ROUNDS = 3;
 
 /**
  * Lean projection of a submitted op, kept for receipt reconciliation. Only the fields
@@ -191,6 +264,31 @@ interface PendingReceipt {
   /** Revenue cap per gas (what the user's signed price refunds) — bounds the bump ceiling. */
   revenueCapPerGas?: bigint;
   bumpCount?: number;
+  /** Epoch ms of the last same-nonce CANCELLATION attempt (0-value self-transfer) — used to
+   *  COOLDOWN cancellation retries (not latch them): a cancellation whose broadcast fails without
+   *  consuming the nonce (e.g. base fee spiked past its fee again) is retried after the cooldown
+   *  with a recomputed fee, instead of permanently disabling recovery. Fires once fee-bumps are
+   *  exhausted so a dropped-and-unbumpable tx can't brick a pinned pool EOA forever. */
+  lastCancelAt?: number;
+  /** Pool relayer index (Stage 3, POOL_EOA_ENABLED): set when the outer tx was signed by a
+   *  leased POOL EOA instead of the per-safe one, so fee-bump/reconciliation re-derive the
+   *  pool key — the per-safe derivation from a multi-sender bundle's first entry would
+   *  produce the wrong signer. Absent (legacy receipts) → per-safe derivation as before. */
+  poolIndex?: number;
+}
+
+/** Read-only lifecycle snapshot for a single op (the /debug observability UI). All bigints are
+ *  stringified so it serialises straight to JSON. */
+export interface OpInspection {
+  hash: string;
+  stage: "mempool" | "in-flight" | "confirmed" | "failed" | "unknown";
+  detail: string;
+  mempool?: { sender: string; nonce: string; prefund: string; firstSeenAtMs: number; ageMs: number; rpcUrlOverride?: string };
+  inFlight?: {
+    txHash: string; txNonce?: number; eoaAddress: string; checkCount: number; bumpCount: number;
+    lastCancelAt?: number; submittedAtMs: number; ageMs: number; priorTxHashes: string[]; maxFeePerGas?: string;
+  };
+  receipt?: { success: boolean; txHash?: string; actualGasCost?: string; actualGasUsed?: string };
 }
 
 /** JSON-safe form of a UserOperationReceipt (bigints → decimal strings) for DO storage. */
@@ -286,13 +384,31 @@ interface SerializedPendingReceipt {
   maxPriorityFeePerGas?: string;
   revenueCapPerGas?: string;
   bumpCount?: number;
+  lastCancelAt?: number;
   /** Original lock time of the EOA — keeps the stuck-eoa age clock honest across evictions. */
   lockedSince?: number;
+  /** Pool relayer index (Stage 3) — optional so pre-pool persisted state restores unchanged. */
+  poolIndex?: number;
+}
+
+/** Thrown by acceptUserOp when a queue enqueue failed AMBIGUOUSLY (the message may or may not
+ *  have landed). The RPC layer maps it to a retryable degraded error so the wallet re-sends —
+ *  the RelayerDO dedups by userOpHash if the first send did land. Never fall through to the
+ *  in-DO mempool on this (would double-bundle the op). */
+export class EnqueueAmbiguousError extends Error {
+  constructor() {
+    super("UserOp enqueue outcome ambiguous — retry");
+    this.name = "EnqueueAmbiguousError";
+  }
 }
 
 export class BundlerService {
   private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
+  /** Ordered, deduped TRUSTED RPC set (primary + registry public RPCs) for money-path reads and
+   *  broadcast. NEVER a user X-Rpc-Url override — see trustedMoneyPathRpcs. Rate-limit / degraded
+   *  failover walks this list so a single throttled endpoint can't strand a bundle at "submitted". */
+  private readonly moneyPathRpcs: string[];
   private autoBundleTimer?: ReturnType<typeof setInterval>;
   private receiptCleanupTimer?: ReturnType<typeof setInterval>;
   private currentBundlingMode: "auto" | "manual";
@@ -317,24 +433,82 @@ export class BundlerService {
   lastSubmitError: string | null = null;
   /** EOA whose last broadcast failed the node's prefund check ("needs top-up"). */
   insufficientFundsEoa: `0x${string}` | null = null;
+  /** The outer-tx prefund (wei) the underfunded EOA could not afford — lets the float
+   *  refill size the top-up to the ACTUAL shortfall. A multi-sender pool bundle's prefund
+   *  can be many× poolFloatTargetWei, so a static target would refill-yet-still-bounce
+   *  forever. null when no shortfall this cycle. */
+  insufficientFundsWei: bigint | null = null;
+  /** Fired the INSTANT a bundle can't afford its outer gas — the worker wires it to an
+   *  immediate treasury→EOA top-up so the refill doesn't wait for the next healthLoop tick
+   *  (up to an alarm interval away). Fire-and-forget + deduped by the caller; sizing comes
+   *  from insufficientFundsWei. */
+  private insufficientFundsHook?: (eoa: `0x${string}`, shortfallWei: bigint) => void;
+
+  setInsufficientFundsHook(hook: (eoa: `0x${string}`, shortfallWei: bigint) => void): void {
+    this.insufficientFundsHook = hook;
+  }
+
+  /** Record an underfunded EOA AND request an immediate top-up. Single choke point so every
+   *  "needs top-up" site both surfaces the alert state and kicks the refill without delay. */
+  private flagInsufficientFunds(eoa: `0x${string}`, shortfallWei: bigint): void {
+    this.insufficientFundsEoa = eoa;
+    this.insufficientFundsWei = shortfallWei;
+    this._cycleSawInsufficientFunds = true;
+    try {
+      this.insufficientFundsHook?.(eoa, shortfallWei);
+    } catch { /* the healthLoop refill is the backstop */ }
+  }
+
+  /** Provider-agnostic underfunded check: does the EOA's LIVE native balance fall short of the
+   *  bundle's required outer-tx cost? Backs up isInsufficientFundsError on the estimate/prepare
+   *  path — different RPCs phrase a prefund shortfall differently ("insufficient funds", "gas
+   *  required exceeds allowance (0)", …), and a string miss there mis-defers the op forever
+   *  without ever firing the top-up. A read failure returns false (fall back to string
+   *  classification — never manufacture a false top-up request). */
+  private async eoaBelowCost(address: `0x${string}`, expectedCost: bigint): Promise<boolean> {
+    try {
+      const balance = await this.publicClient.getBalance({ address });
+      return balance < expectedCost;
+    } catch {
+      return false;
+    }
+  }
   /**
    * Durable-storage hook. In CF Worker mode the DO wires this to persist the in-flight
    * pending-receipt list to DO storage, so reconciliation survives eviction/crash. No-op
    * in Deno mode (which keeps state in-memory by design).
    */
   private persistPendingHook?: (state: SerializedPendingReceipt[]) => Promise<void>;
+  /**
+   * Stage 4 producer hook (worker-only): when set AND queueModeActive, acceptUserOp hands the
+   * validated op to the queue transport instead of the in-DO mempool. The RelayerDO consumer
+   * path deliberately does NOT wire one (it uses the mempool directly), so this is null there.
+   */
+  private enqueueHook?: (req: EnqueueRequest) => Promise<boolean>;
+  /**
+   * Stage 4: pin this bundler to POOL EOA #fixedPoolIndex instead of leasing the first free one.
+   * Set on a per-EOA RelayerDO's BundlerService — its /submit input gate already serializes, so
+   * tryPoolBundle bundles with getPoolEOA(fixedPoolIndex) under that EOA's bundle lock. undefined
+   * everywhere else → the Stage-3 leaseFreePoolEOA path, unchanged.
+   */
+  private readonly fixedPoolIndex?: number;
 
   constructor(
     private readonly config: BundlerConfig,
     private readonly mempool: Mempool,
     private readonly simulator: Simulator,
     private readonly accountService: AccountService,
-    options?: { disableTimers?: boolean },
+    options?: { disableTimers?: boolean; fixedPoolIndex?: number },
   ) {
     this.currentBundlingMode = config.bundlingMode;
     this.disableTimers = options?.disableTimers ?? false;
-    // Tuned, cached read client (explicit timeout + bounded retry — see rpc-client.ts).
-    this.publicClient = getPublicClient(config.rpcUrl);
+    this.fixedPoolIndex = options?.fixedPoolIndex;
+    // Trusted RPC set for the money path (broadcast + nonce + receipt reconciliation).
+    this.moneyPathRpcs = trustedMoneyPathRpcs(config);
+    // Tuned, cached read client that FAILS OVER across the trusted set: a rate-limited / degraded
+    // primary must not stall nonce reads or receipt reconciliation (which strands an accepted op at
+    // "submitted" — the wallet polls forever). viem uses the primary alone while it is healthy.
+    this.publicClient = getFailoverPublicClient(this.moneyPathRpcs);
     // A TTL-evicted op must not vanish silently: store a terminal success=false receipt so the
     // wallet gets a definitive "dropped, resubmit" instead of polling eth_getUserOperationReceipt
     // → null forever (which is indistinguishable from "never seen").
@@ -395,7 +569,7 @@ export class BundlerService {
       do {
         this._kickPending = false;
         if (this.mempool.size > 0) await this.tryBundle();
-        else this.insufficientFundsEoa = null; // nothing pending → nothing underfunded
+        else { this.insufficientFundsEoa = null; this.insufficientFundsWei = null; } // nothing pending → nothing underfunded
       } while (this._kickPending);
     } finally {
       this._bundling = false;
@@ -427,6 +601,76 @@ export class BundlerService {
     this.kickHook = hook;
   }
 
+  /** Wire the Stage 4 producer enqueue hook (BundlerDO → USEROP_QUEUE.send + KV marker). */
+  setEnqueueHook(hook: (req: EnqueueRequest) => Promise<boolean>): void {
+    this.enqueueHook = hook;
+  }
+
+  /**
+   * Stage 4 queue-transport predicate (docs/pool-queue-architecture.md): mirrors
+   * poolModeActive and additionally requires QUEUE_TRANSPORT_ENABLED for this chain. When true
+   * (and a worker enqueue hook is wired), a validated ingress op is handed to the per-EOA
+   * RelayerDO queue transport instead of the in-DO mempool. It reuses ALL of pool mode's
+   * prerequisites (in-band + vault + non-Tempo + POOL_EOA_ENABLED) because the RelayerDO
+   * assembles the SAME multi-sender pool bundle — queue transport only moves WHERE it happens.
+   * Default (QUEUE_TRANSPORT_ENABLED unset) → false → the Stage-3/mempool path is unchanged.
+   */
+  queueModeActive(): boolean {
+    return chainSpecEnables(this.config.queueTransportChains, this.config.chainId) && this.poolModeActive();
+  }
+
+  /** Public read of pool-mode status (for the /debug inspector's fronting-EOA resolution). */
+  get poolActive(): boolean {
+    return this.poolModeActive();
+  }
+
+  /**
+   * Single acceptance choke point for a validated ingress op (called by
+   * handleSendUserOperation after validate+simulate). Default: mempool.add + ingress bundle
+   * kick — byte-identical to the pre-Stage-4 accept. When queue mode is active AND a worker
+   * enqueue hook is wired, the op is instead handed to the queue transport; ANY enqueue
+   * failure (USEROP_QUEUE unbound at runtime, transient error) falls through to the mempool so
+   * an accepted op is NEVER dropped.
+   */
+  async acceptUserOp(userOp: UserOperation, prefund: bigint, rpcUrlOverride?: string): Promise<`0x${string}`> {
+    if (this.enqueueHook && this.queueModeActive()) {
+      const userOpHash = this.computeUserOpHash(userOp);
+      // The hook returns FALSE only when it PROVABLY did not enqueue (USEROP_QUEUE unbound —
+      // nothing was sent), which is safe to fall through to the in-DO mempool. A THROW from the
+      // hook means the queue.send() outcome is AMBIGUOUS (timeout / 429 / transport blip): the
+      // message may already be durably enqueued. Falling through would then bundle the SAME op
+      // twice — once by the RelayerDO consuming the message, once by this chain DO's mempool
+      // (different pool EOAs, different nonces) → the second handleOps reverts AA25, burning
+      // un-reimbursed gas and failing every co-bundled op. So on ambiguity we do NOT fall
+      // through: surface a retryable error and let the wallet re-send (the RelayerDO dedups by
+      // userOpHash if the first send did land). Mirrors classifyBroadcastError's ambiguous rule.
+      let enqueued: boolean;
+      try {
+        enqueued = await this.enqueueHook({ userOp, userOpHash, prefund, rpcUrlOverride });
+      } catch (err) {
+        console.warn(`[Bundler] enqueue ambiguous for ${userOpHash} — NOT falling back (avoids double-bundle): ${redactError(err)}`);
+        throw new EnqueueAmbiguousError();
+      }
+      if (enqueued) return userOpHash;
+      // enqueued === false: queue unbound (definitively not sent) → in-DO mempool is safe.
+    }
+    const userOpHash = this.mempool.add(userOp, prefund, rpcUrlOverride);
+    this.requestBundleKick();
+    return userOpHash;
+  }
+
+  /** The canonical userOpHash for an op (EntryPoint v0.7), used to key the queue message /
+   *  KV marker before the op is added to any mempool. */
+  private computeUserOpHash(userOp: UserOperation): `0x${string}` {
+    return getUserOpHash(packUserOp(userOp), this.config.entryPointAddress, this.config.chainId);
+  }
+
+  /** True when an op with this hash is already in an in-flight bundle (pending receipt) — used
+   *  by the RelayerDO /submit dedup (queues are at-least-once). */
+  hasPending(userOpHash: string): boolean {
+    return this.pendingReceipts.some((p) => p.entries.some((e) => e.userOpHash === userOpHash));
+  }
+
   cleanExpiredReceipts(): void {
     const now = Date.now();
     for (const [hash, entry] of this.receiptStore) {
@@ -440,6 +684,21 @@ export class BundlerService {
    * removed op with no receipt leaves the wallet polling null forever, indistinguishable
    * from "never seen" (the same silent loss the TTL hook already closes).
    */
+  /**
+   * Store a TERMINAL failed receipt for an op that was ACCEPTED at ingress (the wallet already
+   * holds its hash and is polling) but then definitively rejected at mempool admission in a
+   * RelayerDO — mempool full, reputation, or the one-op-per-sender guard. Without this the
+   * wallet's eth_getUserOperationReceipt poll never resolves (queue mode hid the admission
+   * error from the ingress caller). The receipt fires the persist hook → USEROP_STATUS KV, so
+   * the chain endpoint's queue-mode fallback answers the poll. Public because the RelayerDO's
+   * standalone relayerSubmit needs it. NOT for transient/broadcast failures (a failed receipt
+   * there is a lie that makes the wallet re-place) — admission rejection is definitive.
+   */
+  rejectAccepted(userOpHash: `0x${string}`, sender: `0x${string}`, nonce: bigint, reason: string): void {
+    console.warn(`[Bundler] accepted-then-rejected UserOp ${userOpHash}: ${reason}`);
+    this.storeFailedReceipts([{ userOpHash, userOp: { sender, nonce } }], ZERO_HASH, sender);
+  }
+
   private dropWithReceipt(entry: { userOpHash: `0x${string}`; userOp: { sender: `0x${string}`; nonce?: bigint } }, reason: string): void {
     console.warn(`[Bundler] UserOp ${entry.userOpHash} dropped: ${reason}`);
     this.mempool.remove(entry.userOpHash);
@@ -489,6 +748,23 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "Empty mempool" };
     }
 
+    // Stage 3 pool mode (POOL_EOA_ENABLED, docs/pool-queue-architecture.md): one
+    // MULTI-SENDER bundle over a leased pool EOA replaces the per-safe grouping below.
+    // Same cycle-scoped underfunded-flag contract as the per-safe loop, and the same
+    // isolation rule: a throw defers the ops (they stay in the mempool), never a drop.
+    if (this.shouldPoolBundle()) {
+      this._cycleSawInsufficientFunds = false;
+      let result: BundleResult;
+      try {
+        result = await this.tryPoolBundle(entries);
+      } catch (err) {
+        console.error(`[Bundler] pool bundle threw (ops stay in the mempool for the next cycle): ${redactError(err)}`);
+        result = { submitted: false, userOpHashes: entries.map((e) => e.userOpHash), error: redactError(err) };
+      }
+      if (!this._cycleSawInsufficientFunds) { this.insufficientFundsEoa = null; this.insufficientFundsWei = null; }
+      return result;
+    }
+
     // Group by sender (safeAddress)
     const bySender = new Map<string, MempoolEntry[]>();
     for (const entry of entries) {
@@ -524,11 +800,182 @@ export class BundlerService {
     // The needs-top-up flag reflects the CURRENT cycle: if no sender hit an
     // insufficient-funds condition this pass, the earlier condition resolved (top-up,
     // TTL-expiry, gas fell) and the eoa-underfunded alert must stop re-firing.
-    if (!this._cycleSawInsufficientFunds) this.insufficientFundsEoa = null;
+    if (!this._cycleSawInsufficientFunds) { this.insufficientFundsEoa = null; this.insufficientFundsWei = null; }
 
     return lastResult;
   }
   private _cycleSawInsufficientFunds = false;
+
+  /** Warned-once latch for a misconfigured pool flag (flag on, prerequisites off). */
+  private _poolModeWarned = false;
+
+  /**
+   * Stage 3 pool-mode predicate (docs/pool-queue-architecture.md): multi-sender bundles
+   * signed by leased pool EOAs. Only sound when settlement is in-band AND the reimbursement
+   * recipient is the treasury (vault) — pool EOAs front native gas that ONLY the
+   * treasury→pool float machinery repays; with either prerequisite off, the reimbursement
+   * would credit a per-safe recipient while a pool EOA paid, silently draining the pool.
+   * Flag on without them → warn once, keep the existing per-safe path.
+   */
+  /**
+   * Whether THIS instance should assemble a leased-pool-EOA bundle right now. Distinct from
+   * poolModeActive (the chain-level pool prerequisites): in queue-transport mode the 100 pool EOAs
+   * are owned one-each by the per-index RelayerDOs (fixedPoolIndex), so the CHAIN DO (no
+   * fixedPoolIndex) must NOT lease a shared pool EOA for fallback ops — an enqueue that fell
+   * through to its mempool during a queue bind/unbind transition. A second signer on a pool EOA
+   * with independent in-isolate nonce/lock state causes same-nonce/AA25 collisions that revert the
+   * whole multi-sender tx (the single-owner-per-EOA invariant the pool model depends on). The chain
+   * DO routes those fallback ops to the per-safe path (disjoint dedicated EOAs, refilled by the same
+   * topUpFloatEOA machinery); the RelayerDO (fixedPoolIndex set) still bundles with its OWN pinned EOA.
+   */
+  private shouldPoolBundle(): boolean {
+    if (!this.poolModeActive()) return false;
+    if (this.fixedPoolIndex === undefined && this.queueModeActive()) return false;
+    return true;
+  }
+
+  private poolModeActive(): boolean {
+    const chainId = this.config.chainId;
+    if (!chainSpecEnables(this.config.poolEoaChains, chainId)) return false;
+    // Tempo is excluded: pool EOAs there would need a pathUSD float, but topUpPoolEOAs is
+    // native-only (skips Tempo). Tempo keeps per-safe bundling under vault (its per-safe
+    // float refills via topUpTempoFloat). Pool pathUSD funding is future work.
+    if (isTempoChain(chainId)) return false;
+    const inBand = inBandActiveForChain(this.config, chainId);
+    const vault = inBand && vaultActiveForChain(this.config.settlementVaultChains, chainId);
+    if (!vault) {
+      if (!this._poolModeWarned) {
+        this._poolModeWarned = true;
+        console.warn(
+          `[Bundler] POOL_EOA_ENABLED covers chain ${chainId} but ` +
+            `${inBand ? "vault settlement" : "in-band settlement"} is off — pool bundling ` +
+            `requires both (the reimbursement must reach the treasury); using the per-safe path.`,
+        );
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Stage 3: build and submit ONE multi-sender bundle signed by a leased pool EOA.
+   *
+   * - Selection takes up to maxBundleSize ops ACROSS senders (the per-safe grouping does
+   *   not apply; the pool EOA is not bound to any safe).
+   * - A fully busy pool DEFERS (ops stay in the mempool for the next cycle) — a lease
+   *   shortage must never drop a valid op.
+   * - Iterative drop-resim-reassemble (the 4337 gotcha): each round re-runs the full
+   *   pipeline (per-op re-validation + full-bundle simulations) on the survivors. A round
+   *   that dropped ops — they left the mempool with terminal receipts + reputation
+   *   penalties via the pipeline's existing drop sites — reassembles and retries; a round
+   *   that dropped nothing is final (submitted, or deferred to the next cycle).
+   */
+  private async tryPoolBundle(entries: MempoolEntry[]): Promise<BundleResult> {
+    // Exclude any sender that already has a bundle IN FLIGHT (a pending receipt). Pool mode
+    // locks only the pool EOA, not the per-safe EOA, so the per-safe ingress lock + the
+    // mempool's one-op-per-sender guard no longer serialize a sender's ops. Without this,
+    // a resubmitted (sender, nonce) — e.g. a wallet retry during a slow first broadcast —
+    // would go in flight from a SECOND pool EOA; whichever handleOps mines second reverts
+    // the ENTIRE multi-sender tx (AA25), so the pool EOA eats unreimbursed gas and every
+    // innocent co-bundled op fails. Defer such ops to the next cycle (they stay in mempool).
+    const inFlightSenders = new Set(
+      this.pendingReceipts.flatMap((p) => p.entries.map((e) => e.userOp.sender.toLowerCase())),
+    );
+    const selected = entries
+      .filter((e) => !inFlightSenders.has(e.userOp.sender.toLowerCase()))
+      .slice(0, this.config.maxBundleSize);
+    const userOpHashes = selected.map((e) => e.userOpHash);
+    if (selected.length === 0) {
+      return { submitted: false, userOpHashes: [], error: "all mempool senders have a bundle in flight — deferred" };
+    }
+
+    // Stage 4 (fixedPoolIndex): a per-EOA RelayerDO bundles with its OWN pool EOA #i (its
+    // /submit input gate serializes, so there is no free EOA to lease). Stage 3: lease the
+    // first free pool EOA. Either way a busy EOA / exhausted pool DEFERS (ops stay in the
+    // mempool) — never a drop.
+    let lease: PoolEOALease | null;
+    if (this.fixedPoolIndex !== undefined) {
+      lease = await this.acquireFixedPoolLease(this.fixedPoolIndex);
+      if (!lease) {
+        console.warn(`[Bundler] pool EOA #${this.fixedPoolIndex} busy (in-flight tx) — deferring ${selected.length} op(s)`);
+        return { submitted: false, userOpHashes, error: "pool EOA busy — deferred" };
+      }
+    } else {
+      lease = await this.accountService.leaseFreePoolEOA(
+        this.publicClient as PublicClient<Transport, Chain>,
+      );
+      if (!lease) {
+        console.warn(`[Bundler] pool exhausted (all ${RELAYER_POOL_SIZE} EOAs busy) — deferring ${selected.length} op(s)`);
+        return { submitted: false, userOpHashes, error: "pool EOAs exhausted — deferred" };
+      }
+    }
+    if (!lease.eoa.privateKey) {
+      lease.release();
+      return { submitted: false, userOpHashes, error: "Cannot access private key for pool EOA" };
+    }
+
+    try {
+      let survivors = selected;
+      let last: BundleResult = { submitted: false, userOpHashes, error: "pool bundle not attempted" };
+      for (let round = 1; round <= POOL_ASSEMBLY_MAX_ROUNDS; round++) {
+        last = await this.executeSenderBundle(lease.eoa.address, lease.eoa, survivors, { index: lease.index });
+        if (last.submitted) return last;
+        // The pipeline's drop sites remove definitively-failed ops from the mempool —
+        // whatever is still there survived this round and can be reassembled.
+        const remaining = survivors.filter((e) => this.mempool.get(e.userOpHash) !== undefined);
+        if (remaining.length === 0) {
+          return { submitted: false, userOpHashes, error: last.error ?? "all ops dropped during pool assembly" };
+        }
+        // Nothing dropped → no progress to be made by looping (a defer: transient RPC,
+        // reimbursement too low, needs top-up, …) — let the next cycle retry.
+        if (remaining.length === survivors.length) return last;
+        survivors = remaining;
+      }
+      return last;
+    } finally {
+      // Lease-scoped and idempotent: after a broadcast, finalizeSubmitted has already
+      // transitioned the EOA via lockEOA(LOCKED_PENDING_UNKNOWN, nonce); release() then
+      // only clears the bundle lock — the in-flight tracking survives untouched.
+      lease.release();
+    }
+  }
+
+  /**
+   * Stage 4: acquire an exclusive bundle lock on the FIXED pool EOA #index (the per-EOA
+   * RelayerDO owns exactly one). Its /submit input gate already serializes work, but the
+   * bundle lock is still taken so the broadcast → lockEOA(LOCKED_PENDING_UNKNOWN) transition
+   * (and its proof-based recovery) behaves identically to the leased path. Returns null when
+   * the EOA is not ACTIVE (a prior bundle's tx still in flight) → the caller defers. Mirrors
+   * leaseFreePoolEOA: seeds the lock state on first sight and hands back a lease-scoped,
+   * idempotent release() that clears only the bundle lock.
+   */
+  private async acquireFixedPoolLease(index: number): Promise<PoolEOALease | null> {
+    const eoa = await this.accountService.getPoolEOA(index);
+    // First sight of this EOA in this isolate — seed its lock state from chain (a stale/absent
+    // state would make acquireBundleLock refuse). A read failure leaves the state absent and
+    // acquireBundleLock returns false → defer, which is the safe direction.
+    if (!this.accountService.lockManager.getState(eoa.address)) {
+      try {
+        await this.accountService.lockManager.initEOA(
+          eoa.address,
+          this.publicClient as PublicClient<Transport, Chain>,
+        );
+      } catch {
+        // proceed — acquireBundleLock refuses an absent/non-ACTIVE state
+      }
+    }
+    if (!this.accountService.lockManager.acquireBundleLock(eoa.address)) return null;
+    let released = false;
+    return {
+      index,
+      eoa,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.accountService.lockManager.releaseBundleLock(eoa.address);
+      },
+    };
+  }
 
   /**
    * Build and submit a bundle for a single safeAddress.
@@ -583,12 +1030,18 @@ export class BundlerService {
     safeAddress: `0x${string}`,
     eoa: { address: `0x${string}`; privateKey?: `0x${string}` },
     entries: MempoolEntry[],
+    /** Stage 3 pool context: set when `eoa` is a LEASED POOL EOA and `entries` may span
+     *  multiple senders — relaxes the sender-binding check and keys the pending receipt
+     *  to the pool index. `safeAddress` is then only a log label (the pool address). */
+    pool?: { index: number },
   ): Promise<BundleResult> {
     // Use user-provided RPC if any entry has one (all ops for same sender share the same RPC).
     // Tempo's public RPCs (rpc.tempo.xyz) are flaky and time out on getTransactionCount,
     // breaking nonce/state management and blocking submission — use the bundler's own
     // configured (Alchemy) RPC there instead of the wallet-supplied one.
-    const rpcOverride = isTempoChain(this.config.chainId)
+    // Pool mode reads via the trusted RPC only: a multi-sender bundle has no single user
+    // RPC to honour, and one sender's flaky override must not gate another sender's op.
+    const rpcOverride = isTempoChain(this.config.chainId) || pool
       ? undefined
       : entries.find((e) => e.rpcUrlOverride)?.rpcUrlOverride;
 
@@ -628,7 +1081,7 @@ export class BundlerService {
     const userOpEffective = revenueCap; // revenue basis used by the profitability gate below
     const intendedGasPrice = reverseMarkup(revenueCap, markupBps);
     const chainTip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
-    const outerGas = computeOuterGas({
+    let outerGas = computeOuterGas({
       revenueCapPerGas: revenueCap,
       baseFee,
       intendedGasPrice,
@@ -636,10 +1089,11 @@ export class BundlerService {
       minPriorityFee: this.config.minPriorityFeePerGas,
     });
 
-    // Enforce binding: every UserOp.sender must be the bound safeAddress
+    // Enforce binding: every UserOp.sender must be the bound safeAddress. Pool mode is
+    // deliberately MULTI-SENDER (the pool EOA is bound to no safe) — skip the check.
     const validEntries: MempoolEntry[] = [];
     for (const entry of entries) {
-      if (entry.userOp.sender.toLowerCase() !== safeAddress.toLowerCase()) {
+      if (!pool && entry.userOp.sender.toLowerCase() !== safeAddress.toLowerCase()) {
         console.warn(
           `[Bundler] UserOp ${entry.userOpHash} sender mismatch: ` +
           `${entry.userOp.sender} != ${safeAddress}. Removing.`,
@@ -716,18 +1170,63 @@ export class BundlerService {
       return { submitted: false, userOpHashes: [], error: "All ops failed re-validation" };
     }
 
-    // Beneficiary: on native chains the EntryPoint pays the VelaGasSettlementSplitter, whose
-    // receive() splits the gas settlement 50/50 between the bundler EOA (tx.origin) and the
-    // treasury. On Tempo the EntryPoint refund is 0 (maxFee=0) and the bundler is repaid by an
-    // in-band feeToken transfer to the EOA, so the beneficiary MUST stay the EOA there.
-    const tempo = isTempoChain(this.config.chainId);
-    const beneficiary = tempo ? eoa.address : this.config.splitterAddress;
+    // Two orthogonal axes (see docs/inband-gas-settlement.md):
+    //  - inBand = SETTLEMENT model: beneficiary=EOA, in-band reimbursement gate, no reservation.
+    //    On native (route-A) chains the EntryPoint instead pays the VelaGasSettlementSplitter,
+    //    which splits 50/50 EOA/treasury. inBand is always on for Tempo, opt-in elsewhere.
+    //  - tempoEnvelope = tx ENVELOPE only (0x76 fee-token tx vs native EIP-1559) + trusted RPC.
+    //  Until a chain sets inBandEnabled, inBand === tempoEnvelope === isTempoChain (no change).
+    const tempoEnvelope = isTempoChain(this.config.chainId);
+    const inBand = inBandActiveForChain(this.config, this.config.chainId);
+    // Stage 2 vault mode (docs/pool-queue-architecture.md): the in-band reimbursement
+    // recipient — and with it the handleOps beneficiary — moves from the per-safe EOA to
+    // the treasury. The EOA keeps fronting the outer gas (pool EOAs land in Stage 3); its
+    // float is repaid via the treasury→EOA top-up machinery instead of in-band.
+    const vault = inBand && vaultActiveForChain(this.config.settlementVaultChains, this.config.chainId);
+    const beneficiary = inBand
+      ? (vault ? this.config.treasuryAddress : eoa.address)
+      : this.config.splitterAddress;
+    // Dual-accept window, BOTH directions: around a canary flip a wallet can hold the
+    // other recipient for up to its 30s account-info cache, and the durable mempool can
+    // hold ops signed for it across the redeploy. Credit legs paid to the OTHER operator
+    // recipient too — the EOA while vault is on (lagging wallets), the TREASURY while it
+    // is off (rollback; without this, treasury-signed ops strand at "reimbursement too
+    // low" until their TTL burns the user's passkey signature). Both addresses are
+    // operator pockets, so the gate's total still bounds what the operator receives; a
+    // payer shifting funds between pockets moves nothing out of the operator's custody.
+    // In POOL mode `eoa.address` is the leased POOL EOA — an address no wallet ever signs a
+    // reimbursement to, so crediting it as the "other pocket" is meaningless. Pool mode is
+    // also enabled long AFTER the vault flip (its prerequisite), so the vault-transition
+    // dual-accept window is already closed; disable it. (A truly-lagging wallet's per-safe
+    // leg would fail per-op attribution and be dropped cleanly, not strand the bundle.)
+    const dualAcceptOther = !inBand || pool
+      ? null
+      : (vault ? eoa.address : this.config.treasuryAddress);
+    const dualAccept = dualAcceptOther && dualAcceptOther.toLowerCase() !== beneficiary.toLowerCase()
+      ? dualAcceptOther
+      : null;
+
+    // Generic in-band ops sign maxFeePerGas=0, so the revenueCap-based outerGas above is 0 and would
+    // make the outer tx unminable. The bundler is repaid in-band (not via EntryPoint), so there is
+    // no revenue cap — reprice the outer tx straight from the network. (Route-A keeps the clamp;
+    // Tempo prices its own 0x76 fee in submitTempoBundle and does not use outerGas.)
+    if (inBand && !tempoEnvelope) {
+      outerGas = calcOuterTxGasPrice({
+        currentBaseFee: baseFee,
+        baseFeeMultiplier: this.config.baseFeeMultiplier,
+        bundlerTipGwei: this.config.bundlerTipGwei,
+        chainSuggestedTip: gasPrices.suggestedMaxPriorityFeePerGas,
+      });
+    }
 
     // Full bundle simulation. The outer handleOps tx is sent BY the EOA (eoa.address is
     // tx.origin), so simulation's `from` stays the EOA even when the encoded beneficiary is
     // the splitter — otherwise tx.origin would resolve to the splitter and mis-simulate.
     const packedOps = checkedEntries.map((e) => e.entry.packed);
-    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, eoa.address, rpcOverride, dl);
+    // In-band paths run simulateExecutionSuccess (eth_simulateV1) below, which proves per-op
+    // execution + returns real gasUsed — so simulateBundle's redundant eth_call is skipped there
+    // (keeps only its eth_estimateGas for gas + FailedOp). Non-in-band (splitter) keeps both.
+    const bundleSim = await this.simulator.simulateBundle(packedOps, beneficiary, eoa.address, rpcOverride, dl, inBand);
 
     if (!bundleSim.success) {
       // Drop the failed op (with a terminal receipt) if identified
@@ -753,26 +1252,56 @@ export class BundlerService {
     // Gating on the node's own rule keeps the op IN the mempool instead, where the
     // stuck-mempool alert observes it. On Tempo it's meaningless (no native coin) and unused.
     const expectedCost = bundleSim.estimatedGas! * outerGas.maxFeePerGas;
+    // In-band ops reserve nothing (the EOA is an operator float, repaid in-band, not a user
+    // custody balance). Persist 0 as the reserved amount so the receipt's later release / fee-bump
+    // re-reserve are no-ops. releaseReservation clamps at 0, so the immediate release paths that
+    // still pass expectedCost are harmless for in-band.
+    const reservedAmount = inBand ? 0n : expectedCost;
+    // Fee-bump ceiling basis. Route-A uses the signed revenueCap. Generic in-band signs maxFee=0 so
+    // revenueCap is 0, which would collapse the fee-bump ceiling and strand a stuck tx forever;
+    // use the network outer price instead — the reimbursement is ≥IN_BAND_GATE_MARKUP_X× that, so bumping
+    // up to the ceiling (a small multiple of this) stays comfortably profitable.
+    const revenueCapForReceipt = inBand && !tempoEnvelope ? outerGas.maxFeePerGas : revenueCap;
 
-    if (tempo) {
+    if (inBand && tempoEnvelope) {
       // Tempo: the bundler is repaid by a stablecoin transfer batched into the UserOp,
       // not by EntryPoint (maxFee=0 → refund 0). Native profitability/balance checks
       // don't apply — instead we (1) verify execution succeeds (else the in-band transfer
       // is rolled back), (2) price our real cost from the simulated gas, (3) require the
       // in-band reimbursement (paid in the trusted feeToken) to cover it.
+      // Each op is priced in ITS OWN declared feeToken — NEVER op[0]'s. A pool bundle mixes
+      // senders; letting the first op choose the bundle feeToken would let a first-positioned
+      // op declare a bogus token and zero out every other sender's legitimate pathUSD legs.
+      // (Per-safe bundles are single-sender, so op[0]'s token == every op's token — unchanged.)
+      const perOpReimbursed = checkedEntries.map((e) => {
+        const ft = resolveFeeToken(e.entry.userOp.feeToken);
+        // Count ONLY transfers to the recipient paid in the op's trusted feeToken — counting
+        // any token would let an attacker repay in a worthless token and drain the bundler.
+        let r = parseTempoReimbursement(e.entry.userOp.callData, beneficiary, ft);
+        if (dualAccept) r += parseTempoReimbursement(e.entry.userOp.callData, dualAccept, ft);
+        return r;
+      });
       const feeToken = resolveFeeToken(checkedEntries[0]!.entry.userOp.feeToken);
       let reimbursed = 0n;
-      for (const e of checkedEntries) {
-        // Count ONLY transfers to the EOA paid in the trusted feeToken — counting any
-        // token would let an attacker repay in a worthless token and drain the bundler.
-        reimbursed += parseTempoReimbursement(e.entry.userOp.callData, beneficiary, feeToken);
-      }
+      for (const r of perOpReimbursed) reimbursed += r;
 
       // Verify execution actually succeeds AND read the REAL gas it burns. handleOps
       // swallows inner reverts, so this also protects against an OOG/insufficient-balance
       // op that would leave us unpaid. Fails closed — no proof of success ⇒ no submit.
       const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
       if (!execCheck.success) {
+        // Capability failure (RPC can't run eth_simulateV1 and the eth_call probe couldn't decide,
+        // or a multi-op / deploy op): NOT an op defect — defer, never drop/penalize (see in-band).
+        if (execCheck.transient) {
+          metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "exec_sim_unavailable" });
+          this.lastSubmitError = execCheck.errorMessage ?? "execution sim unavailable";
+          console.warn(`[Bundler][Tempo] DEFER — execution unverifiable (RPC capability): ${execCheck.errorMessage}`);
+          return {
+            submitted: false,
+            userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+            error: `Tempo execution unverifiable (RPC lacks eth_simulateV1): ${execCheck.errorMessage}`,
+          };
+        }
         if (execCheck.failedOpIndex !== undefined) {
           const failed = checkedEntries[execCheck.failedOpIndex];
           if (failed) {
@@ -796,12 +1325,197 @@ export class BundlerService {
       console.log(
         `[Bundler][Tempo] reimbursed=${reimbursed} cost=${costInFeeToken} feeToken=${feeToken} realGas=${realGas} simGas=${execCheck.gasUsed ?? "n/a"} (${checkedEntries.length} ops)`,
       );
+      // POOL MODE: per-op attribution (Tempo cost per gas is feeToken-agnostic — all Tempo
+      // stables are 6-dec USD — so a per-op share priced in each op's own feeToken is directly
+      // comparable). Drop the specific underpayer(s) and reassemble instead of freezing the bundle.
+      if (pool) {
+        const perOpCost = costInFeeToken / BigInt(checkedEntries.length);
+        const underpayers = perOpReimbursed
+          .map((r, i) => ({ r, i }))
+          .filter(({ r }) => r < perOpCost)
+          .map(({ i }) => i);
+        if (underpayers.length > 0) {
+          for (const i of underpayers) {
+            const failed = checkedEntries[i]!;
+            this.dropWithReceipt(failed.entry, `Tempo reimbursement below per-op share (pool bundle)`);
+            this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
+          }
+          console.warn(`[Bundler][Tempo][pool] dropped ${underpayers.length} underpaying op(s); reassembling survivors`);
+          return {
+            submitted: false,
+            userOpHashes: underpayers.map((i) => checkedEntries[i]!.entry.userOpHash),
+            error: `Dropped ${underpayers.length} op(s) paying below their per-op gas share`,
+          };
+        }
+      }
       if (reimbursed < costInFeeToken) {
         console.warn(`[Bundler][Tempo] REJECT — reimbursement ${reimbursed} < cost ${costInFeeToken}`);
         return {
           submitted: false,
           userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
           error: `Tempo reimbursement too low: ${reimbursed} < cost ${costInFeeToken} in ${feeToken}`,
+        };
+      }
+    } else if (inBand) {
+      // Generic in-band (native EIP-1559 envelope): the bundler EOA fronts native L1 gas and is
+      // repaid by a native transfer to it batched into the UserOp. Same fail-closed shape as Tempo
+      // but priced in native wei: (1) prove execution succeeds (else the in-band transfer rolls
+      // back leaving us unpaid), (2) cost = realGas × network outer price, (3) require the in-band
+      // native reimbursement to cover IN_BAND_GATE_MARKUP_X × cost (the quote asks 3×). Stablecoin reimbursement + the $0.01
+      // floor land in step 8 (empty token allowlist here → native-only). See docs/.
+      const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
+      if (!execCheck.success) {
+        // Capability failure (no RPC could run eth_simulateV1 AND the eth_call probe couldn't decide,
+        // or a multi-op / deploy op we won't verify via eth_call): NOT an op defect. Keep the op
+        // (defer) — never dropWithReceipt / penalize — so an RPC limitation is not surfaced to the
+        // wallet as a terminal "failed". It retries next cycle (or the queue reassembles single-op).
+        if (execCheck.transient) {
+          metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "exec_sim_unavailable" });
+          this.lastSubmitError = execCheck.errorMessage ?? "execution sim unavailable";
+          console.warn(`[Bundler][InBand] DEFER — execution unverifiable (RPC capability): ${execCheck.errorMessage}`);
+          return {
+            submitted: false,
+            userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+            error: `In-band execution unverifiable (RPC lacks eth_simulateV1): ${execCheck.errorMessage}`,
+          };
+        }
+        if (execCheck.failedOpIndex !== undefined) {
+          const failed = checkedEntries[execCheck.failedOpIndex];
+          if (failed) {
+            this.dropWithReceipt(failed.entry, `in-band execution would revert: ${execCheck.errorMessage}`);
+            this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
+          }
+        }
+        console.warn(`[Bundler][InBand] REJECT — execution would revert: ${execCheck.errorMessage}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `In-band execution would revert (bundler not reimbursed): ${execCheck.errorMessage}`,
+        };
+      }
+      // outerGas was repriced from the network for generic in-band above (a maxFee=0 op makes
+      // revenueCap 0), so it is the price the submit path will actually pay — cost basis uses it.
+      const realGas = (execCheck.gasUsed ?? bundleSim.estimatedGas!) + EIP1559_COST_BUFFER_GAS;
+      const costNative = realGas * outerGas.maxFeePerGas;
+      let requiredNative = costNative * IN_BAND_GATE_MARKUP_X; // 2× the real gas (quote asks 3× — the band absorbs drift)
+
+      // Parse each op's in-band reimbursement (native value + allowlisted-stablecoin transfers
+      // to the recipient). Allowlist = the chain's registry `stables` (anti fake-token drain).
+      // Keep the legs PER-OP so pool mode can attribute cost to the specific payer (a
+      // multi-sender bundle must not let one op ride free on another's margin, and must be
+      // able to drop the single underpayer instead of freezing the whole bundle).
+      const stableAllow = (this.config.chainInfo?.stables ?? []).map((s) => s.contract);
+      const perOpLegs = checkedEntries.map((e) => {
+        const r = parseInBandReimbursement(e.entry.userOp.callData, beneficiary, stableAllow);
+        const native = { v: r.native };
+        const byToken: Record<string, bigint> = { ...r.byToken };
+        if (dualAccept) {
+          const other = parseInBandReimbursement(e.entry.userOp.callData, dualAccept, stableAllow);
+          native.v += other.native;
+          for (const [k, v] of Object.entries(other.byToken)) byToken[k] = (byToken[k] ?? 0n) + v;
+        }
+        return { native: native.v, byToken };
+      });
+
+      // Price each distinct stablecoin ONCE (DEX quote of the native cost), memoized; reused by
+      // both the per-op and aggregate valuations. Fail closed if a stablecoin can't be priced.
+      const quoter = this.config.chainInfo?.dex?.contracts?.quoterV2;
+      const wnative = this.config.chainInfo?.wrappedNativeToken;
+      const stableInfo = new Map<string, { costStable: bigint; floorNative: bigint }>();
+      const allStables = new Set<string>();
+      for (const legs of perOpLegs) for (const k of Object.keys(legs.byToken)) if (legs.byToken[k]! > 0n) allStables.add(k);
+      for (const stableLower of allStables) {
+        if (!quoter || !wnative) {
+          return { submitted: false, userOpHashes: checkedEntries.map((e) => e.entry.userOpHash), error: "stablecoin gas unsupported on this chain (no DEX quoter / wrappedNative)" };
+        }
+        const stable = stableLower as `0x${string}`;
+        const client = this.publicClient as PublicClient<Transport, Chain>;
+        const costStable = await quoteNativeToStable(client, { quoterV2: quoter, wrappedNative: wnative, stable }, costNative, this.config.chainId);
+        if (costStable === null || costStable <= 0n) {
+          return { submitted: false, userOpHashes: checkedEntries.map((e) => e.entry.userOpHash), error: `cannot price stablecoin ${stable} for in-band gas (no DEX quote)` };
+        }
+        const dec = await stableDecimals(client, stable);
+        stableInfo.set(stableLower, { costStable, floorNative: (stableFloorUnits(dec) * costNative) / costStable });
+      }
+      // Minimum-charge floors, in native wei — the submit-gate half of the two per-asset floors the
+      // quote endpoint applies (handlers.ts): 1e-5 of a native coin for a native leg, $0.01 for a
+      // stablecoin leg (each converted to native-equiv). Guarded PER LEG so a stable-only op keeps
+      // its $0.01 floor and is never inflated by the native floor (they are not equal — 1e-5 native
+      // is worth more than $0.01 on a high-value-native chain), matching the quote's per-asset split.
+      const nativeFloor = nativeFloorWei(this.config.chainInfo?.nativeCurrency?.decimals ?? 18);
+
+      // native-equiv of one op's legs, and a floor = max(baseFloor, this op's applicable per-asset
+      // floors). `baseFloor` differs by caller: the AGGREGATE backstop seeds it with requiredNative
+      // (the whole-bundle 2× cost, which it only ever raises); the PER-OP pool gate seeds it with 0n
+      // — a single op must clear its OWN 2× share (+ its own floor), NOT 2× the entire bundle. Seeding
+      // the per-op floor with requiredNative was the bug that dropped 100% of multi-op pool bundles
+      // (perOpCost×2 ≤ 2×costNative = requiredNative ∀ n≥1).
+      const valueOf = (legs: { native: bigint; byToken: Record<string, bigint> }, baseFloor: bigint) => {
+        let equiv = legs.native;
+        let floor = baseFloor;
+        // Native leg → enforce the 1e-5-native minimum (sibling of the $0.01 stable floor below).
+        if (legs.native > 0n && nativeFloor > floor) floor = nativeFloor;
+        for (const [t, amt] of Object.entries(legs.byToken)) {
+          if (amt <= 0n) continue;
+          const info = stableInfo.get(t)!;
+          equiv += (amt * costNative) / info.costStable;
+          if (info.floorNative > floor) floor = info.floorNative;
+        }
+        return { equiv, floor };
+      };
+
+      // POOL MODE: per-op attribution. Each op must cover its own fair share (bundle cost / N)
+      // × the gate markup — so a non-paying op can be DROPPED individually (the assembly loop
+      // reassembles the survivors) instead of dragging the aggregate down and stranding every
+      // other sender on the chain, and no op can free-ride on another's 3× margin.
+      if (pool) {
+        const n = BigInt(checkedEntries.length);
+        const perOpCost = costNative / n;
+        const underpayers: number[] = [];
+        for (let i = 0; i < checkedEntries.length; i++) {
+          // Per-op floor seeds at 0n: this op need only cover its OWN 2× share (raised by its own
+          // per-asset minimum — 1e-5 native / $0.01 stablecoin), not 2× the whole bundle.
+          const { equiv, floor } = valueOf(perOpLegs[i]!, 0n);
+          const need = perOpCost * IN_BAND_GATE_MARKUP_X > floor ? perOpCost * IN_BAND_GATE_MARKUP_X : floor;
+          if (equiv < need) underpayers.push(i);
+        }
+        if (underpayers.length > 0) {
+          for (const i of underpayers) {
+            const failed = checkedEntries[i]!;
+            this.dropWithReceipt(failed.entry, `in-band reimbursement below per-op share (pool bundle)`);
+            this.mempool.reputation.penalize(failed.entry.userOp.sender, "sender");
+          }
+          console.warn(`[Bundler][InBand][pool] dropped ${underpayers.length} underpaying op(s); reassembling survivors`);
+          return {
+            submitted: false,
+            userOpHashes: underpayers.map((i) => checkedEntries[i]!.entry.userOpHash),
+            error: `Dropped ${underpayers.length} op(s) paying below their per-op gas share`,
+          };
+        }
+      }
+
+      // Aggregate backstop (operator profitability). Sum every op's native-equiv; the required
+      // amount rises to the highest per-asset floor seen (1e-5 native / $0.01 stablecoin).
+      let reimbursedNativeEquiv = 0n;
+      let native = 0n;
+      for (const legs of perOpLegs) {
+        // Aggregate backstop: seed the floor with requiredNative (the whole-bundle 2× cost) — the
+        // loop only ever raises requiredNative to the highest per-asset floor seen.
+        const { equiv, floor } = valueOf(legs, requiredNative);
+        reimbursedNativeEquiv += equiv;
+        native += legs.native;
+        if (floor > requiredNative) requiredNative = floor;
+      }
+
+      console.log(
+        `[Bundler][InBand] reimbursedNativeEquiv=${reimbursedNativeEquiv} required=${requiredNative} (${IN_BAND_GATE_MARKUP_X}× of ${costNative}; native=${native}, stables=${allStables.size}) simGas=${execCheck.gasUsed ?? "n/a"} (${checkedEntries.length} ops)`,
+      );
+      if (reimbursedNativeEquiv < requiredNative) {
+        console.warn(`[Bundler][InBand] REJECT — reimbursement ${reimbursedNativeEquiv} < required ${requiredNative}`);
+        return {
+          submitted: false,
+          userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+          error: `In-band reimbursement too low: ${reimbursedNativeEquiv} < required ${requiredNative}`,
         };
       }
     } else {
@@ -859,8 +1573,7 @@ export class BundlerService {
             `(spendable=${balanceCheck.spendableBalance} < required=${balanceCheck.requiredBalance})`,
         );
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
-        this.insufficientFundsEoa = eoa.address;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = `EOA balance insufficient: spendable ${balanceCheck.spendableBalance} < required ${balanceCheck.requiredBalance}`;
         return {
           submitted: false,
@@ -894,34 +1607,37 @@ export class BundlerService {
       }
     }
 
-    // Reserve balance atomically (native only — Tempo settles in stablecoin in-band).
-    if (!tempo) this.accountService.reserveBalance(eoa.address, expectedCost);
+    // Reserve balance atomically (route-A native only — in-band settles by reimbursement).
+    if (!inBand) this.accountService.reserveBalance(eoa.address, expectedCost);
 
-    // SECURITY: sign & broadcast ONLY via the bundler's own trusted RPC, never the
-    // user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC leaks it and lets
-    // the attacker drop/withhold it or feed lies into the (subsequent) reconciliation.
-    // The user RPC (rpcOverride) is still used for the read-only sim/gas/balance above,
-    // where the worst case is the user grieving their OWN op. (On mainnet config.rpcUrl is
-    // Alchemy/public; on a dev chain it is whatever the registry resolved.)
+    // SECURITY: sign & broadcast ONLY via the bundler's own TRUSTED RPC set (primary + registry
+    // public RPCs), never the user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC
+    // leaks it and lets the attacker drop/withhold it or feed lies into the (subsequent)
+    // reconciliation. The user RPC (rpcOverride) is still used for the read-only sim/gas/balance
+    // above, where the worst case is the user grieving their OWN op.
+    //   Failover: the raw tx is signed locally with a PINNED nonce and precomputed hash, so
+    //   re-broadcasting the SAME bytes to a fallback RPC after the primary rate-limits is
+    //   idempotent ("already known" / identical hash) — never a second position. viem's fallback
+    //   advances on 429 / 5xx / timeout but fast-fails on a definitive tx rejection.
     const account = privateKeyToAccount(eoa.privateKey!);
-    const submitRpcUrl = this.config.rpcUrl;
+    const submitRpcUrl = this.moneyPathRpcs[0] ?? this.config.rpcUrl;
     const walletClient = createWalletClient({
       account,
-      transport: http(submitRpcUrl, BROADCAST_TRANSPORT_OPTS),
+      transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0),
     });
 
     const calldata = encodeHandleOps(packedOps, beneficiary);
     const userOpHashes = checkedEntries.map((e) => e.entry.userOpHash);
 
     console.log(
-      `[Bundler] Submitting bundle for ${safeAddress} via ${tempo ? "Tempo 0x76" : "EIP-1559"} (eoa=${eoa.address}, rpc=${submitRpcUrl})`,
+      `[Bundler] Submitting bundle for ${safeAddress} via ${tempoEnvelope ? "Tempo 0x76" : "EIP-1559"} (eoa=${eoa.address}, rpc=${submitRpcUrl})`,
     );
 
     // ------------------------------------------------------------------
     // Tempo: submit handleOps inside a native 0x76 tx paying gas in the stablecoin.
     // sendTransactionSync waits for the receipt, so success here means MINED.
     // ------------------------------------------------------------------
-    if (tempo) {
+    if (tempoEnvelope) {
       // Pin the outer nonce for Tempo too (best-effort): the sync submit signs its own tx,
       // but the value read here right before it feeds (a) proof-based EOA recovery on the
       // ambiguous path and (b) the proof-based dropped verdict for the pending receipt —
@@ -953,6 +1669,7 @@ export class BundlerService {
           safeAddress,
           reservedAmount: 0n, // Tempo reserves nothing (stablecoin in-band settlement)
           txNonce: tempoNonce,
+          poolIndex: pool?.index,
         });
       } catch (err) {
         if (classifyBroadcastError(err) === "ambiguous") {
@@ -1021,10 +1738,14 @@ export class BundlerService {
       // keep the ops in the mempool (retry once funded / gas falls) and surface the EOA
       // via the eoa-underfunded alert — dropping with failed receipts would recreate the
       // drop→resubmit churn the maxFee-basis balance gate exists to prevent.
-      if (isInsufficientFundsError(err)) {
+      //
+      // Besides the error STRING, cross-check the EOA's LIVE balance against the bundle cost:
+      // eth_estimateGas surfaces a prefund shortfall as an estimate failure whose phrasing
+      // varies by provider ("gas required exceeds allowance (0)" on Alchemy), and a string
+      // miss here is exactly what left a stablecoin-fee EOA drained to 0 and stuck.
+      if (isInsufficientFundsError(err) || await this.eoaBelowCost(eoa.address, expectedCost)) {
         this.accountService.releaseBalance(eoa.address, expectedCost);
-        this.insufficientFundsEoa = eoa.address;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = redactError(err);
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
         console.warn(`[Bundler] prepare hit insufficient funds for ${eoa.address} — keeping ops, needs top-up: ${redactError(err)}`);
@@ -1062,14 +1783,15 @@ export class BundlerService {
           checkedEntries,
           eoaAddress: eoa.address,
           safeAddress,
-          reservedAmount: expectedCost,
+          reservedAmount,
           txNonce,
           txTo: this.config.entryPointAddress,
           txData: calldata,
           txGas,
           maxFeePerGas: outerGas.maxFeePerGas,
           maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
-          revenueCapPerGas: revenueCap,
+          revenueCapPerGas: revenueCapForReceipt,
+          poolIndex: pool?.index,
           ambiguous: true,
         });
       }
@@ -1077,8 +1799,7 @@ export class BundlerService {
       // (see the identical prepare-stage branch above for the rationale).
       if (isInsufficientFundsError(err)) {
         this.accountService.releaseBalance(eoa.address, expectedCost);
-        this.insufficientFundsEoa = eoa.address;
-        this._cycleSawInsufficientFunds = true;
+        this.flagInsufficientFunds(eoa.address, expectedCost);
         this.lastSubmitError = redactError(err);
         metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "insufficient_balance" });
         console.warn(`[Bundler] broadcast hit insufficient funds for ${eoa.address} — keeping ops, needs top-up: ${redactError(err)}`);
@@ -1092,14 +1813,15 @@ export class BundlerService {
       checkedEntries,
       eoaAddress: eoa.address,
       safeAddress,
-      reservedAmount: expectedCost,
+      reservedAmount,
       txNonce,
       txTo: this.config.entryPointAddress,
       txData: calldata,
       txGas,
       maxFeePerGas: outerGas.maxFeePerGas,
       maxPriorityFeePerGas: outerGas.maxPriorityFeePerGas,
-      revenueCapPerGas: revenueCap,
+      revenueCapPerGas: revenueCapForReceipt,
+      poolIndex: pool?.index,
     });
   }
 
@@ -1122,6 +1844,9 @@ export class BundlerService {
     maxFeePerGas?: bigint;
     maxPriorityFeePerGas?: bigint;
     revenueCapPerGas?: bigint;
+    /** Pool relayer index — set on the Stage 3 pool path so reconciliation/fee-bump
+     *  re-derive the POOL key instead of the per-safe one. */
+    poolIndex?: number;
     /** True when the broadcast outcome is UNPROVEN (transport error after possibly reaching
      *  the node): tracked for reconciliation but NOT counted as a success — no streak reset,
      *  no ok metric, no reputation credit. Proof arrives via the confirmed receipt. */
@@ -1175,6 +1900,7 @@ export class BundlerService {
       maxPriorityFeePerGas: params.maxPriorityFeePerGas,
       revenueCapPerGas: params.revenueCapPerGas,
       bumpCount: 0,
+      poolIndex: params.poolIndex,
     });
     // Persist immediately (Worker: DO storage; Deno: no-op) so an eviction before the next tick
     // cannot abandon this bundle's reconciliation. Non-fatal on error.
@@ -1410,6 +2136,30 @@ export class BundlerService {
           }
         }
 
+        // Cancellation-based recovery: once fee-bumps are exhausted/refused (base fee rose past
+        // the ceiling) and the tx is still stuck, replace it with a 0-value self-transfer at the
+        // pinned nonce so the EOA can't brick. Native pinned-nonce path only (Tempo's base fee is
+        // constant → no "underpriced" stall; legacy/unpinned receipts have no nonce to cancel).
+        if (
+          pending.txNonce !== undefined &&
+          // Normal path: fee-bumps exhausted at 2 min. Escape hatch: a tx stuck past the hard
+          // bound whose bumps were all REFUSED (ceiling / unaffordable → bumpCount still 0) —
+          // otherwise it deadlocks and bricks the pool EOA until the ~1h abandonment.
+          ((pending.bumpCount ?? 0) >= MAX_FEE_BUMPS
+            ? Date.now() - pending.submittedAt > CANCELLATION_AFTER_MS
+            : Date.now() - pending.submittedAt > CANCELLATION_HARD_MS) &&
+          Date.now() - (pending.lastCancelAt ?? 0) > CANCELLATION_AFTER_MS
+        ) {
+          try {
+            await this.tryCancellation(pending);
+            // A cancellation attempt mutates pending (lastCancelAt, maybe txHash/fees) — mark the
+            // pass dirty so the state is flushed to DO storage (else an eviction loses it).
+            bumpedThisPass = true;
+          } catch (err) {
+            console.warn(`[Bundler] cancellation attempt failed for ${pending.txHash} (original tx still stands): ${redactError(err)}`);
+          }
+        }
+
         // Give up after max checks. Do NOT fabricate a success=false receipt here: the
         // dropped-tx path above already stores a failed receipt when the nonce proves the
         // tx is gone. Reaching here means the tx is still pending (e.g. underpriced/stuck)
@@ -1492,27 +2242,42 @@ export class BundlerService {
     }
     if (newTip > newMax) newTip = newMax;
 
-    // The EOA must afford the new worst-case prefund.
+    // The EOA must afford the new worst-case prefund. If it can't, this is a NEEDS-TOP-UP
+    // deadlock, not a benign skip: a stuck underpriced tx on a drained pool EOA can never be
+    // bumped, and cancellation is gated behind bumpCount ≥ MAX_FEE_BUMPS which therefore never
+    // advances — so the op sits in-flight until it is abandoned (a guaranteed miss on the
+    // 5-minute window). Flag it so the treasury refill (/fund-eoa) tops the EOA up NOW; the next
+    // reconcile cycle then affords the bump. Mirrors tryCancellation's insufficient-funds path.
     const newPrefund = pending.txGas! * newMax;
     const balance = await this.publicClient.getBalance({ address: pending.eoaAddress });
     if (balance < newPrefund) {
+      this.flagInsufficientFunds(pending.eoaAddress, newPrefund);
       console.warn(
-        `[Bundler] fee-bump for ${pending.txHash} skipped: EOA ${pending.eoaAddress} balance ` +
-          `${balance} < required prefund ${newPrefund}`,
+        `[Bundler] fee-bump for ${pending.txHash} deferred: EOA ${pending.eoaAddress} balance ` +
+          `${balance} < required prefund ${newPrefund} — flagged for treasury top-up, retrying next cycle`,
       );
       return;
     }
 
-    // Re-derive the signing key from the bound safe (entries all share one sender).
-    const sender = pending.entries[0]?.userOp.sender;
-    if (!sender) return;
-    const eoa = await this.accountService.deriveEOA(sender);
+    // Re-derive the signing key. A pool-mode receipt (poolIndex set) re-keys to the POOL
+    // EOA — its entries span senders, so the per-safe derivation from entries[0] would
+    // produce the wrong signer. Legacy receipts (no poolIndex) keep deriving from the
+    // bound safe (entries all share one sender). Both paths verify the derived address
+    // against the receipt's eoaAddress before signing anything.
+    let eoa: { address: `0x${string}`; privateKey?: `0x${string}` };
+    if (pending.poolIndex !== undefined) {
+      eoa = await this.accountService.getPoolEOA(pending.poolIndex);
+    } else {
+      const sender = pending.entries[0]?.userOp.sender;
+      if (!sender) return;
+      eoa = await this.accountService.deriveEOA(sender);
+    }
     if (!eoa.privateKey || eoa.address.toLowerCase() !== pending.eoaAddress.toLowerCase()) return;
 
     const account = privateKeyToAccount(eoa.privateKey);
     const walletClient = createWalletClient({
       account,
-      transport: http(this.config.rpcUrl, BROADCAST_TRANSPORT_OPTS),
+      transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0),
     });
     // Explicit gas skips the re-estimate (see invariants above).
     const request = await walletClient.prepareTransactionRequest({
@@ -1552,6 +2317,88 @@ export class BundlerService {
     console.log(
       `[Bundler] fee-bumped stuck tx (bump #${pending.bumpCount}): ${pending.priorTxHashes.at(-1)} → ${newHash} ` +
         `(maxFee ${oldMax} → ${newMax}, nonce ${pending.txNonce})`,
+    );
+  }
+
+  /**
+   * Same-nonce CANCELLATION: a 0-value self-transfer at the stuck tx's pinned nonce, priced above
+   * the CURRENT base fee (NOT revenue-capped — this is recovery, not profit). Fired once fee-bumps
+   * are exhausted/refused (base fee rose past the ceiling), so a tx that can neither land nor be
+   * re-priced no longer bricks its pinned pool EOA: replacement semantics mean exactly one of
+   * {original, cancellation} mines, so either the ops land (original won) or the nonce advances via
+   * a plain transfer (cancellation won → reconciliation stores the ops' failed receipts + recovers
+   * the EOA). Tracked like a fee-bump so reconciliation keeps polling both hashes — never a
+   * fire-and-forget that could strand or double-execute.
+   */
+  private async tryCancellation(pending: PendingReceipt): Promise<void> {
+    if (pending.txNonce === undefined) return;
+    // Cooldown the NEXT attempt regardless of this outcome (a failed broadcast must be retried,
+    // not latched off). Set BEFORE the RPC work so an unaffordable/failed pass still cools down.
+    pending.lastCancelAt = Date.now();
+    const gasPrices = await this.simulator.getGasPrices(undefined);
+    const baseFee = gasPrices.baseFee;
+    const chainTip = gasPrices.suggestedMaxPriorityFeePerGas ?? 0n;
+    // Must clear geth's ≥12.5% replacement minimum over the original AND the current base fee.
+    let newTip = ((pending.maxPriorityFeePerGas ?? 0n) * 1125n) / 1000n + 1n;
+    if (chainTip > newTip) newTip = chainTip;
+    let newMax = ((pending.maxFeePerGas ?? 0n) * 1125n) / 1000n + 1n;
+    const target = (baseFee * 125n) / 100n + newTip;
+    if (target > newMax) newMax = target;
+    if (newTip > newMax) newTip = newMax;
+
+    const cost = CANCELLATION_GAS * newMax;
+    const balance = await this.publicClient.getBalance({ address: pending.eoaAddress });
+    if (balance < cost) {
+      // Can't afford to self-recover — surface it so the treasury refill loop tops the EOA up,
+      // then the next cycle retries the cancellation.
+      this.flagInsufficientFunds(pending.eoaAddress, cost);
+      console.warn(`[Bundler] cancellation for ${pending.txHash} deferred: EOA ${pending.eoaAddress} balance ${balance} < ${cost} — needs top-up`);
+      return;
+    }
+
+    let eoa: { address: `0x${string}`; privateKey?: `0x${string}` };
+    if (pending.poolIndex !== undefined) {
+      eoa = await this.accountService.getPoolEOA(pending.poolIndex);
+    } else {
+      const sender = pending.entries[0]?.userOp.sender;
+      if (!sender) return;
+      eoa = await this.accountService.deriveEOA(sender);
+    }
+    if (!eoa.privateKey || eoa.address.toLowerCase() !== pending.eoaAddress.toLowerCase()) return;
+
+    const account = privateKeyToAccount(eoa.privateKey);
+    const walletClient = createWalletClient({ account, transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0) });
+    const request = await walletClient.prepareTransactionRequest({
+      account,
+      to: eoa.address, // self-transfer
+      value: 0n,
+      gas: CANCELLATION_GAS,
+      maxFeePerGas: newMax,
+      maxPriorityFeePerGas: newTip,
+      nonce: pending.txNonce,
+      chain: null,
+    });
+    const serialized = await walletClient.signTransaction(request as Parameters<typeof walletClient.signTransaction>[0]);
+    const newHash = keccak256(serialized);
+    try {
+      await walletClient.sendRawTransaction({ serializedTransaction: serialized });
+    } catch (err) {
+      // A rejected broadcast might mean the nonce was ALREADY consumed (original landed →
+      // reconciliation finds its receipt) OR a fee/intrinsic reject that did NOT consume the nonce.
+      // Either way DON'T track this hash and DON'T latch: if the nonce advanced, reconciliation
+      // resolves it; if not, the lastCancelAt cooldown lets the next cycle retry with a recomputed
+      // (higher) fee. NEVER permanently disable recovery on a transient/fee reject.
+      console.warn(`[Bundler] cancellation broadcast failed for ${pending.txHash} (will retry after cooldown): ${redactError(err)}`);
+      return;
+    }
+    pending.priorTxHashes = [...(pending.priorTxHashes ?? []), pending.txHash];
+    pending.txHash = newHash;
+    pending.maxFeePerGas = newMax;
+    pending.maxPriorityFeePerGas = newTip;
+    metrics.inc("cancellation_total", 1, { chain: this.config.chainId });
+    console.warn(
+      `[Bundler] sent same-nonce CANCELLATION for a stuck tx (nonce ${pending.txNonce}, eoa ${pending.eoaAddress}) → ${newHash} ` +
+        `— unbricks the pinned EOA; the co-bundled ops will get failed receipts if the cancellation wins.`,
     );
   }
 
@@ -1650,6 +2497,8 @@ export class BundlerService {
       maxPriorityFeePerGas: p.maxPriorityFeePerGas?.toString(),
       revenueCapPerGas: p.revenueCapPerGas?.toString(),
       bumpCount: p.bumpCount,
+      lastCancelAt: p.lastCancelAt,
+      poolIndex: p.poolIndex,
       // Persist the lock clock so a DO eviction can't reset the stuck-eoa age to "just now"
       // (repeated evictions used to defer that alert indefinitely).
       lockedSince: this.accountService.lockManager.getState(p.eoaAddress)?.lockedSince ?? p.submittedAt,
@@ -1686,6 +2535,9 @@ export class BundlerService {
           maxPriorityFeePerGas: s.maxPriorityFeePerGas !== undefined ? BigInt(s.maxPriorityFeePerGas) : undefined,
           revenueCapPerGas: s.revenueCapPerGas !== undefined ? BigInt(s.revenueCapPerGas) : undefined,
           bumpCount: s.bumpCount,
+          lastCancelAt: s.lastCancelAt,
+          // Optional (Stage 3): absent on pre-pool persisted state → per-safe re-keying.
+          poolIndex: s.poolIndex,
         });
         // Re-establish the reservation + lock so a recovered DO doesn't double-spend the
         // EOA while the prior tx is still in flight. restorePending CREATES the EOA state
@@ -1826,5 +2678,80 @@ export class BundlerService {
     const receipt = this.getReceipt(userOpHash);
     if (receipt) return { userOp: undefined as unknown as MempoolEntry["userOp"], receipt };
     return undefined;
+  }
+
+  /**
+   * Read-only lifecycle introspection for a single op — powers the /debug observability UI.
+   * Reports which STAGE the op is in and WHERE it lives, checking the stores newest-stage-first:
+   * terminal receipt (confirmed/failed) → in-flight pending receipt → accepted-in-mempool →
+   * unknown (never accepted here / evicted / lives in a queue-mode RelayerDO). Never mutates.
+   */
+  inspectOp(userOpHash: string): OpInspection {
+    const h = userOpHash.toLowerCase();
+    const now = Date.now();
+
+    const receipt = this.getReceipt(h);
+    if (receipt) {
+      return {
+        hash: userOpHash,
+        stage: receipt.success ? "confirmed" : "failed",
+        detail: receipt.success
+          ? "landed on-chain (terminal)"
+          : "terminal failure — the wallet learns 'failed' and should resubmit with a fresh quote",
+        receipt: {
+          success: receipt.success,
+          txHash: receipt.receipt?.transactionHash,
+          actualGasCost: receipt.actualGasCost?.toString(),
+          actualGasUsed: receipt.actualGasUsed?.toString(),
+        },
+      };
+    }
+
+    const pending = this.pendingReceipts.find((p) => p.entries.some((e) => e.userOpHash.toLowerCase() === h));
+    if (pending) {
+      const notes: string[] = [];
+      if ((pending.bumpCount ?? 0) > 0) notes.push(`fee-bumped ${pending.bumpCount}×`);
+      if (pending.lastCancelAt) notes.push("cancellation attempted");
+      return {
+        hash: userOpHash,
+        stage: "in-flight",
+        detail: `bundle broadcast, awaiting confirmation${notes.length ? ` (${notes.join(", ")})` : ""}`,
+        inFlight: {
+          txHash: pending.txHash,
+          txNonce: pending.txNonce,
+          eoaAddress: pending.eoaAddress,
+          checkCount: pending.checkCount,
+          bumpCount: pending.bumpCount ?? 0,
+          lastCancelAt: pending.lastCancelAt,
+          submittedAtMs: pending.submittedAt,
+          ageMs: now - pending.submittedAt,
+          priorTxHashes: pending.priorTxHashes ?? [],
+          maxFeePerGas: pending.maxFeePerGas?.toString(),
+        },
+      };
+    }
+
+    const entry = this.mempool.get(h as `0x${string}`);
+    if (entry) {
+      return {
+        hash: userOpHash,
+        stage: "mempool",
+        detail: "accepted into the mempool, waiting to be bundled (retried each ~10s alarm until landed or the 5-min TTL)",
+        mempool: {
+          sender: entry.userOp.sender,
+          nonce: entry.userOp.nonce.toString(),
+          prefund: entry.prefund.toString(),
+          firstSeenAtMs: entry.firstSeenAt,
+          ageMs: now - entry.firstSeenAt,
+          rpcUrlOverride: entry.rpcUrlOverride,
+        },
+      };
+    }
+
+    return {
+      hash: userOpHash,
+      stage: "unknown",
+      detail: "not in this DO's mempool / pending / receipts — never accepted here, already evicted after its TTL, or (queue mode) it lives in a per-index RelayerDO; check the KV status below",
+    };
   }
 }

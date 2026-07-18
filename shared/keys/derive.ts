@@ -134,6 +134,62 @@ export async function deriveTreasuryAddress(
 }
 
 // ---------------------------------------------------------------------------
+// Pool relayer key derivation — fixed pool, same addresses on every chain
+// ---------------------------------------------------------------------------
+
+/** Size of the fixed relayer EOA pool. See docs/pool-queue-architecture.md. */
+export const RELAYER_POOL_SIZE = 100;
+
+function validatePoolIndex(index: number): void {
+  if (!Number.isInteger(index) || index < 0 || index >= RELAYER_POOL_SIZE) {
+    throw new Error(
+      `Pool relayer index must be an integer in [0, ${RELAYER_POOL_SIZE - 1}], got ${index}`,
+    );
+  }
+}
+
+/**
+ * Derive pool relayer key #index from the operator secret.
+ * Like the treasury, the info string has no chainId/safeAddress, so each pool
+ * relayer has an identical address on every chain. UserOps are not bound to a
+ * pool EOA at sign time. See docs/pool-queue-architecture.md.
+ */
+export async function derivePoolRelayerPrivateKey(
+  operatorSecret: string,
+  index: number,
+): Promise<`0x${string}`> {
+  validateOperatorSecret(operatorSecret);
+  validatePoolIndex(index);
+  const baseInfo = `relayer-#${index}`;
+  const ikm = hexToBytes(operatorSecret);
+  const salt = new TextEncoder().encode(DOMAIN_SEPARATOR);
+
+  for (let counter = 0; counter < 256; counter++) {
+    const info = counter === 0
+      ? baseInfo
+      : `${baseInfo}|counter=${counter}`;
+    const derived = await hkdfSha256(ikm, salt, new TextEncoder().encode(info), 32);
+    const keyBigInt = bytesToBigInt(derived);
+    if (keyBigInt > 0n && keyBigInt < SECP256K1_N) {
+      return ("0x" + bytesToHex(derived)) as `0x${string}`;
+    }
+  }
+  throw new Error("Failed to derive valid pool relayer key after 256 attempts");
+}
+
+/**
+ * Derive the address of pool relayer #index.
+ */
+export async function derivePoolRelayerAddress(
+  operatorSecret: string,
+  index: number,
+): Promise<`0x${string}`> {
+  const privateKey = await derivePoolRelayerPrivateKey(operatorSecret, index);
+  const account = privateKeyToAccount(privateKey);
+  return account.address.toLowerCase() as `0x${string}`;
+}
+
+// ---------------------------------------------------------------------------
 // Per-user EOA address derivation
 // ---------------------------------------------------------------------------
 

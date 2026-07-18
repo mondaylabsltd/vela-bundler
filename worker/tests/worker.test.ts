@@ -57,6 +57,43 @@ describe("worker/config.ts buildConfig", () => {
     expect(cfg.oldOperatorSecrets).toEqual(["0xaa", "0xbb"]);
     expect(cfg.alchemyApiKey).toBe("key123");
   });
+
+  it("in-band / vault default ON everywhere, pool / queue default OFF (Stage 0-4 flags)", () => {
+    const cfg = buildConfig(mkEnv(), TREASURY);
+    // Operator decision 2026-07-17: in-band + vault are the default on every chain.
+    expect(cfg.inBandChains).toBe("all");
+    expect(cfg.settlementVaultChains).toBe("all");
+    // Pool bundling + queue transport are opt-in per chain.
+    expect(cfg.poolEoaChains).toBe("");
+    expect(cfg.queueTransportChains).toBe("");
+  });
+
+  it("the stage flags pass their raw spec through for per-chain canaries", () => {
+    const cfg = buildConfig(mkEnv({
+      INBAND_ENABLED: "false",
+      SETTLEMENT_VAULT_ENABLED: "8453,42161",
+      POOL_EOA_ENABLED: "8453",
+      QUEUE_TRANSPORT_ENABLED: "true",
+    }), TREASURY);
+    expect(cfg.inBandChains).toBe("false");
+    expect(cfg.settlementVaultChains).toBe("8453,42161");
+    expect(cfg.poolEoaChains).toBe("8453");
+    expect(cfg.queueTransportChains).toBe("true");
+  });
+
+  it("envBigInt: an EMPTY float knob falls back to the default (not 0n — the bug it fixes)", () => {
+    // BigInt("") === 0n; a blank var in the CF dashboard would otherwise zero a money knob
+    // (min=0 disables the float refill, target=0 makes every amount ≤ 0).
+    const cfg = buildConfig(mkEnv({ POOL_FLOAT_MIN_WEI: "", POOL_FLOAT_TARGET_WEI: "  " }), TREASURY);
+    expect(cfg.poolFloatMinWei).toBe(500_000_000_000_000n);   // 0.0005 native default
+    expect(cfg.poolFloatTargetWei).toBe(2_000_000_000_000_000n); // 0.002 native default
+  });
+
+  it("envBigInt: a provided float value passes through", () => {
+    const cfg = buildConfig(mkEnv({ POOL_FLOAT_MIN_WEI: "1000", POOL_FLOAT_TARGET_WEI: "9000" }), TREASURY);
+    expect(cfg.poolFloatMinWei).toBe(1000n);
+    expect(cfg.poolFloatTargetWei).toBe(9000n);
+  });
 });
 
 describe("worker/index.ts entry routing (network-free paths)", () => {

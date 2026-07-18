@@ -2,24 +2,24 @@
  * Tests for RPC URL resolution.
  */
 
-import { assertEquals } from "@std/assert";
+import { it, expect } from "vitest";
 import { resolveRpcUrl } from "../shared/utils/rpc-client.ts";
 
-Deno.test("resolveRpcUrl - per-request override has highest priority", () => {
+it("resolveRpcUrl - per-request override has highest priority", () => {
   const result = resolveRpcUrl(
     { rpcUrl: "https://default.example.com" },
     "https://override.example.com",
   );
-  assertEquals(result, "https://override.example.com");
+  expect(result).toEqual("https://override.example.com");
 });
 
-Deno.test("resolveRpcUrl - falls back to config rpcUrl when no override", () => {
+it("resolveRpcUrl - falls back to config rpcUrl when no override", () => {
   const result = resolveRpcUrl({ rpcUrl: "https://default.example.com" });
-  assertEquals(result, "https://default.example.com");
+  expect(result).toEqual("https://default.example.com");
 });
 
-Deno.test("resolveRpcUrl - empty override falls back to config", () => {
-  assertEquals(resolveRpcUrl({ rpcUrl: "https://d.com" }, ""), "https://d.com");
-  assertEquals(resolveRpcUrl({ rpcUrl: "https://d.com" }, null), "https://d.com");
-  assertEquals(resolveRpcUrl({ rpcUrl: "https://d.com" }, undefined), "https://d.com");
+it("resolveRpcUrl - empty override falls back to config", () => {
+  expect(resolveRpcUrl({ rpcUrl: "https://d.com" }, "")).toEqual("https://d.com");
+  expect(resolveRpcUrl({ rpcUrl: "https://d.com" }, null)).toEqual("https://d.com");
+  expect(resolveRpcUrl({ rpcUrl: "https://d.com" }, undefined)).toEqual("https://d.com");
 });

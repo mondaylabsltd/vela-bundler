@@ -6,7 +6,7 @@
  * and receipt/mempool lookup without RPC dependencies.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { it, expect } from "vitest";
 import { handleRpcMethod } from "../shared/rpc/handlers.ts";
 import { processRequest } from "../shared/rpc/process.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
@@ -143,7 +143,7 @@ function mockChainRegistry(opts?: {
 
 // --- Tests ---
 
-Deno.test("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost with split", async () => {
+it("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost with split", async () => {
   const config = mockConfig({ walletGasMarkup: 2.0 }); // relayer fee = network fee (~2×)
   const registry = mockChainRegistry({
     gasPrices: {
@@ -165,22 +165,23 @@ Deno.test("pimlico_getUserOperationGasPrice - quotes 3 tiers at markup× cost wi
 
   // standard: tip×1.5 = 1.5 gwei → networkPrice = max(11.5, 11) = 11.5 gwei
   //           userPrice = 11.5 × 2 = 23 gwei
-  assertEquals(BigInt(result.standard!.networkFeePerGas), 11_500_000_000n);
-  assertEquals(BigInt(result.standard!.maxFeePerGas), 23_000_000_000n);
+  expect(BigInt(result.standard!.networkFeePerGas)).toEqual(11_500_000_000n);
+  expect(BigInt(result.standard!.maxFeePerGas)).toEqual(23_000_000_000n);
   // maxPriorityFeePerGas == maxFeePerGas so the EntryPoint charges exactly userPrice
-  assertEquals(result.standard!.maxPriorityFeePerGas, result.standard!.maxFeePerGas);
+  expect(result.standard!.maxPriorityFeePerGas).toEqual(result.standard!.maxFeePerGas);
   // network + relayer == total (relayer fee ≈ network fee at 2×)
-  assertEquals(
+  expect(
     BigInt(result.standard!.networkFeePerGas) + BigInt(result.standard!.relayerFeePerGas),
+  ).toEqual(
     BigInt(result.standard!.maxFeePerGas),
   );
 
   // Tiers strictly increase by speed: fast > standard > slow.
-  assert(BigInt(result.fast!.maxFeePerGas) > BigInt(result.standard!.maxFeePerGas));
-  assert(BigInt(result.standard!.maxFeePerGas) > BigInt(result.slow!.maxFeePerGas));
+  expect(BigInt(result.fast!.maxFeePerGas) > BigInt(result.standard!.maxFeePerGas)).toBeTruthy();
+  expect(BigInt(result.standard!.maxFeePerGas) > BigInt(result.slow!.maxFeePerGas)).toBeTruthy();
 });
 
-Deno.test("pimlico_getUserOperationGasPrice - all-zero price signals → retryable degraded error, never a 0x0 quote", async () => {
+it("pimlico_getUserOperationGasPrice - all-zero price signals → retryable degraded error, never a 0x0 quote", async () => {
   // Price reads can RESOLVE to zeros without throwing (HTTP-200 rate-limit envelope
   // on the forwarded RPC, zero-gas dev fork). A 0x0 quote is self-refuting — our own
   // validateUserOpFields rejects maxFeePerGas = 0 — so the handler must degrade
@@ -194,110 +195,138 @@ Deno.test("pimlico_getUserOperationGasPrice - all-zero price signals → retryab
     { jsonrpc: "2.0", id: 1, method: "pimlico_getUserOperationGasPrice", params: [] },
     config, registry, mockReqCtx(),
   );
-  assert(result.error !== undefined, "expected a degraded error, got a quote");
-  assertEquals(result.error!.code, -32000);
-  assertEquals((result.error!.data as { retryable?: boolean })?.retryable, true);
+  expect(result.error !== undefined, "expected a degraded error, got a quote").toBeTruthy();
+  expect(result.error!.code).toEqual(-32000);
+  expect((result.error!.data as { retryable?: boolean })?.retryable).toEqual(true);
 });
 
-Deno.test("handleRpcMethod - eth_supportedEntryPoints returns config entry point", async () => {
+/** A registry whose getChain always throws — models a chain-resolution failure. */
+function throwingRegistry(err: Error): ChainRegistryLike {
+  return { async getChain() { throw err; }, getAll() { return []; } };
+}
+
+it("resolveChain - a TRANSIENT registry outage degrades (retryable -32000), not a permanent chain rejection", async () => {
+  // The wallet keys off the code: a transient blip must be retried, not treated as an
+  // unsupported/bad-op rejection that makes it drop the trade during the exact retry window.
+  const registry = throwingRegistry(new Error("Chain registry temporarily unreachable for chain 1 (timeout). Retry shortly."));
+  const result = await processRequest(
+    { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [makeFullUserOp(), ENTRY_POINT] },
+    mockConfig(), registry, mockReqCtx(),
+  );
+  expect(result.error).toBeDefined();
+  expect(result.error!.code).toEqual(-32000); // SERVICE_DEGRADED (retryable)
+  expect((result.error!.data as { retryable?: boolean })?.retryable).toEqual(true);
+});
+
+it("resolveChain - a genuinely UNSUPPORTED chain stays a permanent INVALID_USEROPERATION (-32602)", async () => {
+  const registry = throwingRegistry(new Error("Chain 999 is not supported. Add it to the registry."));
+  const result = await processRequest(
+    { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [makeFullUserOp(), ENTRY_POINT] },
+    mockConfig(), registry, mockReqCtx(),
+  );
+  expect(result.error).toBeDefined();
+  expect(result.error!.code).toEqual(-32602); // INVALID_USEROPERATION (permanent)
+});
+
+it("handleRpcMethod - eth_supportedEntryPoints returns config entry point", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
     "eth_supportedEntryPoints", [], config, mockChainRegistry(), mockReqCtx(),
   );
-  assertEquals(result, [ENTRY_POINT]);
+  expect(result).toEqual([ENTRY_POINT]);
 });
 
-Deno.test("handleRpcMethod - eth_chainId returns hex chainId from reqCtx", async () => {
+it("handleRpcMethod - eth_chainId returns hex chainId from reqCtx", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
     "eth_chainId", [], config, mockChainRegistry(), mockReqCtx({ chainId: 137 }),
   );
-  assertEquals(result, "0x89");
+  expect(result).toEqual("0x89");
 });
 
-Deno.test("handleRpcMethod - eth_chainId for chain 1", async () => {
+it("handleRpcMethod - eth_chainId for chain 1", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
     "eth_chainId", [], config, mockChainRegistry(), mockReqCtx({ chainId: 1 }),
   );
-  assertEquals(result, "0x1");
+  expect(result).toEqual("0x1");
 });
 
 // RPC handlers throw plain {code, message} objects, not Error instances.
 // Use processRequest to capture errors as JSON-RPC error responses.
 
-Deno.test("processRequest - unknown method returns methodNotFound error", async () => {
+it("processRequest - unknown method returns methodNotFound error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_unknownMethod", params: [] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32601); // methodNotFound
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32601); // methodNotFound
 });
 
-Deno.test("processRequest - eth_sendUserOperation with missing params returns error", async () => {
+it("processRequest - eth_sendUserOperation with missing params returns error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32602); // invalidParams
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32602); // invalidParams
 });
 
-Deno.test("processRequest - eth_sendUserOperation with wrong entryPoint returns error", async () => {
+it("processRequest - eth_sendUserOperation with wrong entryPoint returns error", async () => {
   const config = mockConfig();
   const fakeUserOp = { sender: "0x" + "11".repeat(20) };
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [fakeUserOp, "0x0000000000000000000000000000000000000001"] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32602); // invalidParams
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32602); // invalidParams
 });
 
-Deno.test("processRequest - eth_estimateUserOperationGas with missing params returns error", async () => {
+it("processRequest - eth_estimateUserOperationGas with missing params returns error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_estimateUserOperationGas", params: [] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32602); // invalidParams
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32602); // invalidParams
 });
 
-Deno.test("processRequest - eth_getUserOperationByHash with non-hex hash returns error", async () => {
+it("processRequest - eth_getUserOperationByHash with non-hex hash returns error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_getUserOperationByHash", params: ["not-hex"] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32602);
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32602);
 });
 
-Deno.test("processRequest - eth_getUserOperationReceipt with non-hex hash returns error", async () => {
+it("processRequest - eth_getUserOperationReceipt with non-hex hash returns error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 1, method: "eth_getUserOperationReceipt", params: ["not-hex"] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32602);
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32602);
 });
 
-Deno.test("handleRpcMethod - eth_getUserOperationByHash returns null for unknown hash", async () => {
+it("handleRpcMethod - eth_getUserOperationByHash returns null for unknown hash", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
     "eth_getUserOperationByHash",
     ["0x" + "ab".repeat(32)],
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assertEquals(result, null);
+  expect(result).toEqual(null);
 });
 
-Deno.test("handleRpcMethod - eth_getUserOperationByHash returns receipt when found", async () => {
+it("handleRpcMethod - eth_getUserOperationByHash returns receipt when found", async () => {
   const config = mockConfig();
   const hash = "0x" + "ab".repeat(32) as `0x${string}`;
   const receipt = mockReceipt(hash);
@@ -307,22 +336,22 @@ Deno.test("handleRpcMethod - eth_getUserOperationByHash returns receipt when fou
     "eth_getUserOperationByHash", [hash], config, registry, mockReqCtx(),
   ) as Record<string, unknown>;
 
-  assertEquals(result!.entryPoint, ENTRY_POINT);
-  assertEquals(result!.transactionHash, receipt.receipt.transactionHash);
-  assertEquals(result!.blockNumber, "0x" + receipt.receipt.blockNumber.toString(16));
+  expect(result!.entryPoint).toEqual(ENTRY_POINT);
+  expect(result!.transactionHash).toEqual(receipt.receipt.transactionHash);
+  expect(result!.blockNumber).toEqual("0x" + receipt.receipt.blockNumber.toString(16));
 });
 
-Deno.test("handleRpcMethod - eth_getUserOperationReceipt returns null for unknown hash", async () => {
+it("handleRpcMethod - eth_getUserOperationReceipt returns null for unknown hash", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(
     "eth_getUserOperationReceipt",
     ["0x" + "ab".repeat(32)],
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assertEquals(result, null);
+  expect(result).toEqual(null);
 });
 
-Deno.test("handleRpcMethod - eth_getUserOperationReceipt returns formatted receipt", async () => {
+it("handleRpcMethod - eth_getUserOperationReceipt returns formatted receipt", async () => {
   const config = mockConfig();
   const hash = "0x" + "ab".repeat(32) as `0x${string}`;
   const receipt = mockReceipt(hash);
@@ -332,14 +361,14 @@ Deno.test("handleRpcMethod - eth_getUserOperationReceipt returns formatted recei
     "eth_getUserOperationReceipt", [hash], config, registry, mockReqCtx(),
   ) as Record<string, unknown>;
 
-  assertEquals(result!.userOpHash, hash);
-  assertEquals(result!.sender, receipt.sender);
-  assertEquals(result!.success, true);
-  assertEquals(result!.actualGasCost, "0x" + receipt.actualGasCost.toString(16));
-  assertEquals(result!.actualGasUsed, "0x" + receipt.actualGasUsed.toString(16));
+  expect(result!.userOpHash).toEqual(hash);
+  expect(result!.sender).toEqual(receipt.sender);
+  expect(result!.success).toEqual(true);
+  expect(result!.actualGasCost).toEqual("0x" + receipt.actualGasCost.toString(16));
+  expect(result!.actualGasUsed).toEqual("0x" + receipt.actualGasUsed.toString(16));
 });
 
-Deno.test("handleRpcMethod - eth_getUserOperationByHash prefers mempool over receipt", async () => {
+it("handleRpcMethod - eth_getUserOperationByHash prefers mempool over receipt", async () => {
   const config = mockConfig();
   const hash = "0x" + "ab".repeat(32) as `0x${string}`;
   const receipt = mockReceipt(hash);
@@ -358,43 +387,43 @@ Deno.test("handleRpcMethod - eth_getUserOperationByHash prefers mempool over rec
   ) as Record<string, unknown>;
 
   // Should find in mempool first (blockNumber null = pending)
-  assertEquals(result!.blockNumber, null);
-  assertEquals(result!.transactionHash, null);
+  expect(result!.blockNumber).toEqual(null);
+  expect(result!.transactionHash).toEqual(null);
 });
 
-Deno.test("processRequest - preserves request id in response", async () => {
+it("processRequest - preserves request id in response", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: 42, method: "eth_supportedEntryPoints", params: [] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assertEquals(result.id, 42);
-  assertEquals(result.jsonrpc, "2.0");
-  assertEquals(result.error, undefined);
+  expect(result.id).toEqual(42);
+  expect(result.jsonrpc).toEqual("2.0");
+  expect(result.error).toEqual(undefined);
 });
 
-Deno.test("processRequest - string id preserved", async () => {
+it("processRequest - string id preserved", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { jsonrpc: "2.0", id: "req-1", method: "eth_chainId", params: [] },
     config, mockChainRegistry(), mockReqCtx(),
   );
-  assertEquals(result.id, "req-1");
+  expect(result.id).toEqual("req-1");
 });
 
-Deno.test("processRequest - invalid body returns parse error", async () => {
+it("processRequest - invalid body returns parse error", async () => {
   const config = mockConfig();
   const result = await processRequest(
     null, config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
+  expect(result.error !== undefined).toBeTruthy();
 });
 
-Deno.test("processRequest - missing jsonrpc returns invalidRequest", async () => {
+it("processRequest - missing jsonrpc returns invalidRequest", async () => {
   const config = mockConfig();
   const result = await processRequest(
     { id: 1, method: "eth_chainId" }, config, mockChainRegistry(), mockReqCtx(),
   );
-  assert(result.error !== undefined);
-  assertEquals(result.error!.code, -32600);
+  expect(result.error !== undefined).toBeTruthy();
+  expect(result.error!.code).toEqual(-32600);
 });

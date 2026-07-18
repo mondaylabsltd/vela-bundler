@@ -2,7 +2,7 @@
  * Unit tests for mempool and reputation.
  */
 
-import { assertEquals, assert, assertThrows } from "@std/assert";
+import { it, expect } from "vitest";
 import { Mempool } from "../shared/mempool/index.ts";
 import { ReputationManager } from "../shared/mempool/reputation.ts";
 import { UserOpValidationError } from "../shared/userop/validate.ts";
@@ -42,54 +42,51 @@ function makeUserOp(overrides: Partial<UserOperation> = {}): UserOperation {
 
 // --- Mempool basic operations ---
 
-Deno.test("Mempool - add and retrieve UserOp", () => {
+it("Mempool - add and retrieve UserOp", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const userOp = makeUserOp();
   const hash = mempool.add(userOp);
 
-  assert(hash.startsWith("0x"));
-  assertEquals(hash.length, 66);
-  assertEquals(mempool.size, 1);
+  expect(hash.startsWith("0x")).toBeTruthy();
+  expect(hash.length).toEqual(66);
+  expect(mempool.size).toEqual(1);
 
   const entry = mempool.get(hash);
-  assert(entry !== undefined);
-  assertEquals(entry!.userOp.sender, userOp.sender);
+  expect(entry !== undefined).toBeTruthy();
+  expect(entry!.userOp.sender).toEqual(userOp.sender);
 });
 
-Deno.test("Mempool - remove UserOp", () => {
+it("Mempool - remove UserOp", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const hash = mempool.add(makeUserOp());
-  assertEquals(mempool.size, 1);
+  expect(mempool.size).toEqual(1);
 
-  assert(mempool.remove(hash));
-  assertEquals(mempool.size, 0);
+  expect(mempool.remove(hash)).toBeTruthy();
+  expect(mempool.size).toEqual(0);
 });
 
-Deno.test("Mempool - clear all entries", () => {
+it("Mempool - clear all entries", () => {
   const mempool = new Mempool(makeMempoolConfig());
   mempool.add(makeUserOp());
-  assertEquals(mempool.size, 1);
+  expect(mempool.size).toEqual(1);
 
   mempool.clear();
-  assertEquals(mempool.size, 0);
+  expect(mempool.size).toEqual(0);
 });
 
 // --- Sender limit ---
 
-Deno.test("Mempool - rejects second op from same sender (different nonce)", () => {
+it("Mempool - rejects second op from same sender (different nonce)", () => {
   const mempool = new Mempool(makeMempoolConfig());
   mempool.add(makeUserOp({ nonce: 0n }));
 
-  assertThrows(
-    () => mempool.add(makeUserOp({ nonce: 1n })),
-    UserOpValidationError,
-    "Already have a pending UserOperation",
-  );
+  expect(() => mempool.add(makeUserOp({ nonce: 1n }))).toThrow("Already have a pending UserOperation");
+  expect(() => mempool.add(makeUserOp({ nonce: 1n }))).toThrow(UserOpValidationError);
 });
 
 // --- Replacement rules ---
 
-Deno.test("Mempool - allows replacement with higher fees (same nonce)", () => {
+it("Mempool - allows replacement with higher fees (same nonce)", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const hash1 = mempool.add(
     makeUserOp({
@@ -106,13 +103,13 @@ Deno.test("Mempool - allows replacement with higher fees (same nonce)", () => {
     }),
   );
 
-  assertEquals(mempool.size, 1);
-  assert(hash1 !== hash2);
+  expect(mempool.size).toEqual(1);
+  expect(hash1 !== hash2).toBeTruthy();
   // Old entry should be gone
-  assert(mempool.get(hash1) === undefined);
+  expect(mempool.get(hash1) === undefined).toBeTruthy();
 });
 
-Deno.test("Mempool - rejects replacement with insufficient fee increase", () => {
+it("Mempool - rejects replacement with insufficient fee increase", () => {
   const mempool = new Mempool(makeMempoolConfig());
   mempool.add(
     makeUserOp({
@@ -122,7 +119,7 @@ Deno.test("Mempool - rejects replacement with insufficient fee increase", () => 
   );
 
   // Try to replace with only a tiny increase (< 10%)
-  assertThrows(
+  expect(
     () =>
       mempool.add(
         makeUserOp({
@@ -130,12 +127,19 @@ Deno.test("Mempool - rejects replacement with insufficient fee increase", () => 
           maxFeePerGas: 30_100_000_000n,
         }),
       ),
-    UserOpValidationError,
-    "at least 10%",
-  );
+  ).toThrow("at least 10%");
+  expect(
+    () =>
+      mempool.add(
+        makeUserOp({
+          maxPriorityFeePerGas: 2_100_000_000n, // only 5% increase
+          maxFeePerGas: 30_100_000_000n,
+        }),
+      ),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("Mempool - rejects replacement where maxFeePerGas delta is less than priority delta", () => {
+it("Mempool - rejects replacement where maxFeePerGas delta is less than priority delta", () => {
   const mempool = new Mempool(makeMempoolConfig());
   mempool.add(
     makeUserOp({
@@ -144,7 +148,7 @@ Deno.test("Mempool - rejects replacement where maxFeePerGas delta is less than p
     }),
   );
 
-  assertThrows(
+  expect(
     () =>
       mempool.add(
         makeUserOp({
@@ -152,14 +156,21 @@ Deno.test("Mempool - rejects replacement where maxFeePerGas delta is less than p
           maxFeePerGas: 30_500_000_000n,         // only +0.5 gwei, less than priority delta
         }),
       ),
-    UserOpValidationError,
-    "maxFeePerGas must increase",
-  );
+  ).toThrow("maxFeePerGas must increase");
+  expect(
+    () =>
+      mempool.add(
+        makeUserOp({
+          maxPriorityFeePerGas: 3_000_000_000n, // +1 gwei
+          maxFeePerGas: 30_500_000_000n,         // only +0.5 gwei, less than priority delta
+        }),
+      ),
+  ).toThrow(UserOpValidationError);
 });
 
 // --- Paymaster deposit reservation ---
 
-Deno.test("Mempool - tracks paymaster deposit reservation", () => {
+it("Mempool - tracks paymaster deposit reservation", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const pm = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`;
 
@@ -173,17 +184,17 @@ Deno.test("Mempool - tracks paymaster deposit reservation", () => {
   );
 
   const reserved = mempool.getPaymasterReserved(pm);
-  assert(reserved > 0n, "Paymaster should have reserved deposit");
+  expect(reserved > 0n, "Paymaster should have reserved deposit").toBeTruthy();
 });
 
 // --- Reputation ---
 
-Deno.test("ReputationManager - starts with ok status", () => {
+it("ReputationManager - starts with ok status", () => {
   const rm = new ReputationManager();
-  assertEquals(rm.getStatus("0x1234567890abcdef1234567890abcdef12345678", "sender"), "ok");
+  expect(rm.getStatus("0x1234567890abcdef1234567890abcdef12345678", "sender")).toEqual("ok");
 });
 
-Deno.test("ReputationManager - throttles after too many seen without included", () => {
+it("ReputationManager - throttles after too many seen without included", () => {
   const rm = new ReputationManager({ throttlingSlack: 5, banSlack: 20 });
   const addr = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
@@ -192,10 +203,10 @@ Deno.test("ReputationManager - throttles after too many seen without included", 
     rm.updateSeen(addr, "sender");
   }
 
-  assertEquals(rm.getStatus(addr, "sender"), "throttled");
+  expect(rm.getStatus(addr, "sender")).toEqual("throttled");
 });
 
-Deno.test("ReputationManager - bans after many seen without included", () => {
+it("ReputationManager - bans after many seen without included", () => {
   const rm = new ReputationManager({ throttlingSlack: 5, banSlack: 20 });
   const addr = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
@@ -203,10 +214,10 @@ Deno.test("ReputationManager - bans after many seen without included", () => {
     rm.updateSeen(addr, "sender");
   }
 
-  assertEquals(rm.getStatus(addr, "sender"), "banned");
+  expect(rm.getStatus(addr, "sender")).toEqual("banned");
 });
 
-Deno.test("ReputationManager - included ops improve reputation", () => {
+it("ReputationManager - included ops improve reputation", () => {
   const rm = new ReputationManager({ throttlingSlack: 5, banSlack: 20 });
   const addr = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
@@ -214,17 +225,17 @@ Deno.test("ReputationManager - included ops improve reputation", () => {
   for (let i = 0; i < 20; i++) {
     rm.updateSeen(addr, "sender");
   }
-  assertEquals(rm.getStatus(addr, "sender"), "throttled");
+  expect(rm.getStatus(addr, "sender")).toEqual("throttled");
 
   // Include many ops → should improve
   for (let i = 0; i < 5; i++) {
     rm.updateIncluded(addr, "sender");
   }
   // maxSeen = 5*10 + 5 = 55, opsSeen = 20 → ok
-  assertEquals(rm.getStatus(addr, "sender"), "ok");
+  expect(rm.getStatus(addr, "sender")).toEqual("ok");
 });
 
-Deno.test("ReputationManager - decay reduces counts", () => {
+it("ReputationManager - decay reduces counts", () => {
   const rm = new ReputationManager();
   const addr = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
@@ -233,10 +244,10 @@ Deno.test("ReputationManager - decay reduces counts", () => {
 
   const entries = rm.dump();
   const entry = entries.find((e) => e.address === addr.toLowerCase());
-  assertEquals(entry!.opsSeen, 50); // halved
+  expect(entry!.opsSeen).toEqual(50); // halved
 });
 
-Deno.test("Mempool - does NOT reject a banned sender (custodial: reputation is a rate limit, not a block)", () => {
+it("Mempool - does NOT reject a banned sender (custodial: reputation is a rate limit, not a block)", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const sender = "0x1234567890abcdef1234567890abcdef12345678" as `0x${string}`;
 
@@ -245,17 +256,17 @@ Deno.test("Mempool - does NOT reject a banned sender (custodial: reputation is a
   mempool.reputation.setReputation(sender, "sender", 100, 0, "banned");
 
   const hash = mempool.add(makeUserOp({ sender }));
-  assertEquals(typeof hash, "string");
-  assertEquals(mempool.size, 1);
+  expect(typeof hash).toEqual("string");
+  expect(mempool.size).toEqual(1);
 });
 
-Deno.test("Mempool - rejects banned paymaster", () => {
+it("Mempool - rejects banned paymaster", () => {
   const mempool = new Mempool(makeMempoolConfig());
   const pm = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as `0x${string}`;
 
   mempool.reputation.setReputation(pm, "paymaster", 100, 0, "banned");
 
-  assertThrows(
+  expect(
     () =>
       mempool.add(
         makeUserOp({
@@ -264,12 +275,20 @@ Deno.test("Mempool - rejects banned paymaster", () => {
           paymasterPostOpGasLimit: 30_000n,
         }),
       ),
-    UserOpValidationError,
-    "banned",
-  );
+  ).toThrow("banned");
+  expect(
+    () =>
+      mempool.add(
+        makeUserOp({
+          paymaster: pm,
+          paymasterVerificationGasLimit: 50_000n,
+          paymasterPostOpGasLimit: 30_000n,
+        }),
+      ),
+  ).toThrow(UserOpValidationError);
 });
 
-Deno.test("Mempool - dump returns all entries", () => {
+it("Mempool - dump returns all entries", () => {
   const mempool = new Mempool(makeMempoolConfig());
   mempool.add(
     makeUserOp({
@@ -283,5 +302,5 @@ Deno.test("Mempool - dump returns all entries", () => {
   );
 
   const dump = mempool.dump();
-  assertEquals(dump.length, 2);
+  expect(dump.length).toEqual(2);
 });

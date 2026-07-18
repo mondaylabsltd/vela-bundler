@@ -1,7 +1,9 @@
-import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+import { defineWorkersProject } from "@cloudflare/vitest-pool-workers/config";
 
-export default defineWorkersConfig({
+// Cloudflare Worker runtime tests — exercised under the real workerd pool (miniflare).
+export default defineWorkersProject({
   test: {
+    name: "workers",
     include: ["worker/tests/**/*.test.ts"],
     poolOptions: {
       workers: {
@@ -15,6 +17,7 @@ export default defineWorkersConfig({
           compatibilityFlags: ["nodejs_compat"],
           durableObjects: {
             BUNDLER: "BundlerDO",
+            RELAYER: "RelayerDO",
           },
           bindings: {
             OPERATOR_SECRET: "0x" + "ab".repeat(32),
