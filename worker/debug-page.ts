@@ -115,7 +115,7 @@ function render(d){
   if(op.mempool) o+=rows({ where:'DO mempool (mp:)', sender:op.mempool.sender, nonce:op.mempool.nonce, prefund:op.mempool.prefund+' wei', 'waiting for':ms(op.mempool.ageMs), rpcOverride:op.mempool.rpcUrlOverride });
   if(op.inFlight) o+=rows({ where:'pending receipt (in-flight)', txHash:op.inFlight.txHash, txNonce:op.inFlight.txNonce, 'fronting EOA':op.inFlight.eoaAddress, 'reconcile checks':op.inFlight.checkCount, 'fee-bumps':op.inFlight.bumpCount, cancelAttempted:op.inFlight.lastCancelAt?'yes':'no', 'in-flight for':ms(op.inFlight.ageMs), priorHashes:(op.inFlight.priorTxHashes||[]).join(', ') });
   if(op.receipt) o+=rows({ where:'receipt store (rc:) + KV', success:op.receipt.success, txHash:op.receipt.txHash, actualGasCost:op.receipt.actualGasCost, actualGasUsed:op.receipt.actualGasUsed });
-  if(kv) o+=rows({ 'KV marker':kv.present?('status='+(kv.status||'?')+(kv.hasReceipt?' (has receipt)':'')):'none' });
+  if(kv) o+=rows({ 'KV marker':kv.present?('status='+(kv.status||'?')+(kv.index!=null?' · RelayerDO #'+kv.index:'')+(kv.hasReceipt?' (has receipt)':'')):'none' });
   $('op').innerHTML=o;
 
   // chain card

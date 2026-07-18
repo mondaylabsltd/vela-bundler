@@ -5,6 +5,16 @@
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
 
+  // Runtime mode flags (non-secret). INBAND_ENABLED / SETTLEMENT_VAULT_ENABLED default to "all" in
+  // code. Pool (Stage 3) + queue transport (Stage 4) are turned ON for ALL chains here.
+  //   ROLLBACK is instant + per-chain: narrow to a chainId CSV (e.g. "1,42161") or set "" / "false"
+  //   and redeploy — no code change. PREREQUISITE for deploy: the queues + KV must exist remotely
+  //   (see the queues block below) and each chain's treasury must hold native ETH to fund the pool.
+  "vars": {
+    "POOL_EOA_ENABLED": "all",
+    "QUEUE_TRANSPORT_ENABLED": "all"
+  },
+
   // Durable Objects:
   //   BUNDLER — one instance per chain, env.BUNDLER.idFromName(`chain-${chainId}`)
   //   RELAYER — one instance per (chain, pool index i), env.RELAYER.idFromName(`chain-${chainId}-eoa-${i}`)

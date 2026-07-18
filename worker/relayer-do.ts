@@ -231,6 +231,13 @@ export class RelayerDO implements DurableObject {
       return await this.handleEnsureAlarm();
     }
 
+    if (url.pathname === "/inspect" && request.method === "GET") {
+      const hash = (url.searchParams.get("hash") ?? "").trim();
+      if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return Response.json({ error: "bad hash" }, { status: 400 });
+      if (!this.chainServices) return Response.json({ op: { hash, stage: "unknown", detail: "RelayerDO not initialized" } });
+      return Response.json({ op: this.chainServices.bundler.inspectOp(hash), poolIndex: this.poolIndex });
+    }
+
     return new Response("not found", { status: 404 });
   }
 
@@ -253,7 +260,9 @@ export class RelayerDO implements DurableObject {
       seen: this.seen,
       markStatus: kv
         ? (hash, status) => {
-            void kv.put(hash, JSON.stringify({ status }), { expirationTtl: STATUS_PENDING_TTL_SECONDS })
+            // Keep the pool index in the pending marker (like the producer's accepted marker) so
+            // the /debug inspector can fan out to THIS RelayerDO for the op's in-flight detail.
+            void kv.put(hash, JSON.stringify({ status, index: this.poolIndex }), { expirationTtl: STATUS_PENDING_TTL_SECONDS })
               .catch((err: unknown) => console.warn(`[RelayerDO] status marker failed for ${hash}: ${redactError(err)}`));
           }
         : undefined,

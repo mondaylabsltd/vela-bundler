@@ -975,17 +975,36 @@ export class BundlerDO implements DurableObject {
     const cs = this.chainServices;
     if (!cs) return Response.json({ error: "chain not initialized" }, { status: 503, headers: CORS_HEADERS });
 
-    const op = cs.bundler.inspectOp(hash);
+    let op = cs.bundler.inspectOp(hash);
 
-    // KV status marker (queue-mode 'accepted'/'pending' + terminal receipts).
-    let kv: { present: boolean; status?: string; hasReceipt?: boolean } | null = null;
+    // KV status marker (queue-mode 'accepted'/'pending' + terminal receipts). The 'accepted' and
+    // 'pending' markers also carry the pool INDEX so we can fan out to the owning RelayerDO.
+    let kv: { present: boolean; status?: string; hasReceipt?: boolean; index?: number } | null = null;
+    let kvIndex: number | undefined;
     if (this.env.USEROP_STATUS) {
       try {
         const raw = await this.env.USEROP_STATUS.get(hash);
-        kv = raw
-          ? (() => { const p = JSON.parse(raw) as { status?: string; receipt?: unknown }; return { present: true, status: p.status, hasReceipt: p.receipt !== undefined }; })()
-          : { present: false };
+        if (raw) {
+          const p = JSON.parse(raw) as { status?: string; receipt?: unknown; index?: number };
+          kvIndex = typeof p.index === "number" ? p.index : undefined;
+          kv = { present: true, status: p.status, hasReceipt: p.receipt !== undefined, index: kvIndex };
+        } else {
+          kv = { present: false };
+        }
       } catch { kv = null; }
+    }
+
+    // Queue mode: the op body lives in a per-index RelayerDO, not here. If we didn't find it locally
+    // and the KV marker names its index, fan out to that RelayerDO's /inspect for the real detail.
+    if (op.stage === "unknown" && kvIndex !== undefined && this.env.RELAYER) {
+      try {
+        const stub = this.env.RELAYER.get(this.env.RELAYER.idFromName(`chain-${chainId}-eoa-${kvIndex}`));
+        const res = await stub.fetch(new Request(`https://relayer-do/inspect?hash=${hash}`));
+        const body = await res.json().catch(() => null) as { op?: typeof op } | null;
+        if (body?.op) op = body.op;
+      } catch (err) {
+        console.warn(`[BundlerDO:${chainId}] inspect fan-out to relayer #${kvIndex} failed: ${redactError(err)}`);
+      }
     }
 
     const chain = {
