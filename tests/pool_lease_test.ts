@@ -9,7 +9,7 @@ import { it, expect } from "vitest";
 import type { PublicClient, Transport, Chain } from "viem";
 import { AccountService } from "../shared/account/index.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
-import { derivePoolRelayerAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
+import { derivePoolRelayerAddress, RELAYER_POOL_SIZE, RELAYER_ROUTING_WIDTH } from "../shared/keys/derive.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import type { KeyManager, KeyDerivationParams, DerivedEOA } from "../shared/keys/types.ts";
 
@@ -205,8 +205,12 @@ it("leaseFreePoolEOA - returns null when the whole pool is busy, leases resume a
   const svc = makeService();
   const client = freshNonceClient();
 
+  // The lease scan covers the ACTIVE routing width (default RELAYER_ROUTING_WIDTH), NOT the full
+  // key ceiling RELAYER_POOL_SIZE — new traffic only lands on [0, width-1].
+  const width = RELAYER_ROUTING_WIDTH;
+  expect(width).toBeLessThanOrEqual(RELAYER_POOL_SIZE);
   const leases = [];
-  for (let i = 0; i < RELAYER_POOL_SIZE; i++) {
+  for (let i = 0; i < width; i++) {
     const lease = await svc.leaseFreePoolEOA(client);
     expect(lease, `lease #${i}`).not.toBeNull();
     expect(lease!.index).toEqual(i);
@@ -215,9 +219,10 @@ it("leaseFreePoolEOA - returns null when the whole pool is busy, leases resume a
 
   expect(await svc.leaseFreePoolEOA(client)).toBeNull();
 
-  leases[42]!.release();
+  const freeIdx = Math.min(4, width - 1);
+  leases[freeIdx]!.release();
   const freed = await svc.leaseFreePoolEOA(client);
-  expect(freed!.index).toEqual(42);
+  expect(freed!.index).toEqual(freeIdx);
 });
 
 it("leaseFreePoolEOA - concurrent leases never hand out the same EOA", async () => {

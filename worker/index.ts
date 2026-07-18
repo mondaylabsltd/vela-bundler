@@ -4,7 +4,8 @@
 
 import type { Env, UserOpQueueMessage } from "./types.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
-import { relayerIndexForSender } from "../shared/queue/routing.ts";
+import { relayerIndexForSender, resolveRoutingWidth } from "../shared/queue/routing.ts";
+import { chainSpecEnables } from "../shared/config/vault.ts";
 import {
   computeSplitterAddress,
   SPLITTER_CREATION_CODE_HASH,
@@ -256,27 +257,66 @@ export default {
       return await handleDeadLetterBatch(batch, env);
     }
     try {
-      // Group by (chainId, pool index). The routing hash MUST be the identical function the
-      // producer used to write the KV marker index — both import relayerIndexForSender.
-      const groups = new Map<string, { chainId: number; index: number; msgs: Message<UserOpQueueMessage>[] }>();
+      // Phase 1: parse + bucket messages by chain (a malformed one retries individually — never
+      // crash the batch). sender is lowercased once here so lease + hash routing agree on the key.
+      const routingWidth = resolveRoutingWidth(env.POOL_ROUTING_WIDTH);
+      const perChain = new Map<number, { msg: Message<UserOpQueueMessage>; sender: string }[]>();
       for (const msg of batch.messages) {
         try {
           const body = msg.body;
-          const sender = String((body?.rpcUserOp as { sender?: unknown } | undefined)?.sender ?? "");
+          const sender = String((body?.rpcUserOp as { sender?: unknown } | undefined)?.sender ?? "").toLowerCase();
           const chainId = Number(body?.chainId);
           if (!(chainId > 0) || !sender) {
-            // Malformed message → retry (DLQ after max_retries) rather than crash the batch.
-            msg.retry();
+            msg.retry(); // malformed → retry (DLQ after max_retries) rather than crash the batch
             continue;
           }
-          const index = relayerIndexForSender(sender);
+          let arr = perChain.get(chainId);
+          if (!arr) { arr = []; perChain.set(chainId, arr); }
+          arr.push({ msg, sender });
+        } catch (err) {
+          console.error(`[Worker] queue: could not route a message: ${redactError(err)}`);
+          try { msg.retry(); } catch { /* already settled */ }
+        }
+      }
+
+      // Phase 2: the per-chain BundlerDO coordinator is the routing authority for EVERY queue op.
+      // It returns a DURABLE, dedup-stable sender→index assignment: an existing route is reused (so
+      // a redelivered or ambiguously-re-sent op returns to the SAME RelayerDO whose seen-set already
+      // deduped it — stable across BundlerDO eviction/deploy and a DYNAMIC_LEASE rollback), and a
+      // new sender gets a FREE index when leasing is enabled for the chain, else static hash. Any
+      // coordinator failure falls back to static hash routing so a batch is never dropped/stalled.
+      const groups = new Map<string, { chainId: number; index: number; msgs: Message<UserOpQueueMessage>[] }>();
+      for (const [chainId, entries] of perChain) {
+        const leasingOn = chainSpecEnables(env.DYNAMIC_LEASE_ENABLED, chainId);
+        const distinct = [...new Set(entries.map((e) => e.sender))];
+        const routed = await leasePoolIndices(env, chainId, distinct);
+        if (!routed && leasingOn) {
+          // Coordinator unreachable while leasing is ON: an already-leased sender's DURABLE index can
+          // diverge from hash(sender), so hash-routing here would land a redelivery on a different
+          // RelayerDO and double-bundle. DEFER instead — retry until the coordinator recovers
+          // (bounded by max_retries → DLQ). Static hash is only a safe fallback where leasing is off.
+          console.warn(`[Worker] queue: lease coordinator unreachable for chain ${chainId} (leasing on) — deferring ${entries.length} msg(s)`);
+          for (const { msg } of entries) { try { msg.retry(); } catch { /* already settled */ } }
+          continue;
+        }
+        for (const { msg, sender } of entries) {
+          let index: number;
+          if (routed && routed.has(sender)) {
+            index = routed.get(sender)!;
+          } else if (leasingOn) {
+            // routed but this sender is missing — a coordinator contract violation (it assigns EVERY
+            // requested sender). Defer rather than silently hash-route a possibly-leased sender to a
+            // divergent index. Dead code in practice; a belt-and-suspenders guard for the money path.
+            console.warn(`[Worker] queue: coordinator omitted sender ${sender} on chain ${chainId} — deferring`);
+            try { msg.retry(); } catch { /* already settled */ }
+            continue;
+          } else {
+            index = relayerIndexForSender(sender, routingWidth); // leasing off → hash is dedup-stable
+          }
           const key = `${chainId}-${index}`;
           let g = groups.get(key);
           if (!g) { g = { chainId, index, msgs: [] }; groups.set(key, g); }
           g.msgs.push(msg);
-        } catch (err) {
-          console.error(`[Worker] queue: could not route a message: ${redactError(err)}`);
-          try { msg.retry(); } catch { /* already settled */ }
         }
       }
 
@@ -335,6 +375,42 @@ export default {
     }
   },
 };
+
+/**
+ * Ask the per-chain BundlerDO coordinator to route each sender to a pool index — a DURABLE,
+ * dedup-stable assignment (reuse an existing route, else a free index when leasing is on for the
+ * chain, else static hash). Returns a sender→index map, or null on ANY failure so the caller falls
+ * back to static hash routing — a coordinator blip must never drop or stall a batch. The DO side is
+ * storage/in-memory only (no chain init, no RPC), so this is one cheap DO hop per (chain, batch).
+ */
+async function leasePoolIndices(
+  env: Env,
+  chainId: number,
+  senders: string[],
+): Promise<Map<string, number> | null> {
+  if (senders.length === 0) return new Map();
+  if (!env.BUNDLER) return null; // no coordinator binding → static hash fallback
+  try {
+    const stub = env.BUNDLER.get(env.BUNDLER.idFromName(`chain-${chainId}`));
+    const res = await stub.fetch(`https://bundler-do/lease?chainId=${chainId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ senders }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => null) as { assignments?: Record<string, unknown> } | null;
+    const a = body?.assignments;
+    if (!a || typeof a !== "object") return null;
+    const m = new Map<string, number>();
+    for (const [s, i] of Object.entries(a)) {
+      if (typeof i === "number" && Number.isInteger(i) && i >= 0) m.set(s.toLowerCase(), i);
+    }
+    return m;
+  } catch (err) {
+    console.warn(`[Worker] queue: lease request failed for chain ${chainId} — using hash routing: ${redactError(err)}`);
+    return null;
+  }
+}
 
 /**
  * Route a request to the BundlerDO instance for the given chain.

@@ -72,7 +72,11 @@
     "INBAND_ENABLED": "all",
     "SETTLEMENT_VAULT_ENABLED": "all",
     "POOL_EOA_ENABLED": "all",
-    "QUEUE_TRANSPORT_ENABLED": "all"
+    "QUEUE_TRANSPORT_ENABLED": "all",
+    // Dynamic-lease coordinator ON locally so ingress → enqueue → consumer → /lease → RelayerDO
+    // exercises the full sender-sticky free-EOA path. Width 10 (the new default).
+    "DYNAMIC_LEASE_ENABLED": "all",
+    "POOL_ROUTING_WIDTH": "10"
   },
 
   "observability": {

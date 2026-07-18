@@ -8,8 +8,10 @@
  * one pool EOA. The DO's input gate is the per-EOA lock — /submit calls serialize, giving a
  * correct nonce with no cross-isolate race.
  *
- * The queue consumer (worker/index.ts) routes each op by hash(sender)%RELAYER_POOL_SIZE to the
- * matching instance and POSTs `/submit`. Assembly (multi-sender drop-resim-reassemble, per-op
+ * The queue consumer (worker/index.ts) routes each op to the matching instance and POSTs
+ * `/submit` — the index comes from the dynamic-lease coordinator (a FREE pool EOA per sender)
+ * or, when that is off/unreachable, the static hash(sender)%width fallback. Assembly
+ * (multi-sender drop-resim-reassemble, per-op
  * attribution, receipt reconciliation) is UNCHANGED — it reuses BundlerService verbatim.
  *
  * The pool EOAs' native float is kept topped up by the chain BundlerDO's health loop

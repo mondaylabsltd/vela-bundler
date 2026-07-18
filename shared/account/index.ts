@@ -14,7 +14,7 @@ import {
   type Chain,
 } from "viem";
 import type { KeyManager, DerivedEOA } from "../keys/types.ts";
-import { deriveEOAAddress, RELAYER_POOL_SIZE } from "../keys/derive.ts";
+import { deriveEOAAddress, RELAYER_POOL_SIZE, RELAYER_ROUTING_WIDTH } from "../keys/derive.ts";
 import { EOALockManager, type EOAStatus } from "./eoa-lock.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import { getPublicClient } from "../utils/rpc-client.ts";
@@ -233,7 +233,10 @@ export class AccountService {
   async leaseFreePoolEOA(
     client: PublicClient<Transport, Chain> = this.client,
   ): Promise<PoolEOALease | null> {
-    for (let index = 0; index < RELAYER_POOL_SIZE; index++) {
+    // Scan only the ACTIVE routing width (default 10), not all 100 key slots — new traffic only
+    // lands on [0, width-1], so scanning the rest is wasted work + RPC on idle EOAs.
+    const width = this.config.routingWidth ?? RELAYER_ROUTING_WIDTH;
+    for (let index = 0; index < width; index++) {
       const eoa = await this.getPoolEOA(index);
       // First sight of this EOA in this isolate — seed its lock state from chain.
       // Existing states are NOT refreshed here: a per-lease RPC pair would turn a

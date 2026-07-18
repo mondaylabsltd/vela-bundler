@@ -34,13 +34,14 @@ import { AccountService } from "../shared/account/index.ts";
 import { BundlerService } from "../shared/bundler/index.ts";
 import { SponsorService } from "../shared/account/sponsor.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
-import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
+import { deriveTreasuryAddress, RELAYER_POOL_SIZE, RELAYER_ROUTING_WIDTH } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
 import { resolveRpcUrl, getPublicClient, getFailoverPublicClient, trustedMoneyPathRpcs } from "../shared/utils/rpc-client.ts";
 import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 import { metrics, logEvent, redactUrl } from "../shared/reliability/log.ts";
-import { relayerIndexForSender } from "../shared/queue/routing.ts";
+import { relayerIndexForSender, resolveRoutingWidth } from "../shared/queue/routing.ts";
+import { decidePoolIndex } from "../shared/queue/coordinator.ts";
 import { encodeFunctionData, decodeFunctionResult, parseAbi } from "viem";
 import { rateLimitGuard, type RateLimitConfig } from "../shared/auth/index.ts";
 import { handleRestApi } from "../shared/rpc/rest-api.ts";
@@ -97,8 +98,28 @@ const STORAGE_KEY_LAST_HEARTBEAT = "lastHeartbeatAt";
 const MEMPOOL_KEY_PREFIX = "mp:";
 const RECEIPT_KEY_PREFIX = "rc:";
 /** Dead-man watch registry (B6): a RelayerDO registers `rwatch:<index>` while it holds stranded
- *  money-path state; the cron liveness probe fans out to each registered index's /ensure-alarm. */
+ *  money-path state; the cron liveness probe fans out to each registered index's /ensure-alarm.
+ *  The dynamic-lease coordinator reuses this set as its per-index BUSY signal. */
 const RELAYER_WATCH_PREFIX = "rwatch:";
+
+/** Dynamic-lease coordinator tuning. The sender→index assignment is DURABLE (persisted below), so
+ *  it survives BundlerDO eviction/deploy and a DYNAMIC_LEASE rollback — THAT is what keeps a
+ *  redelivered / ambiguously-re-sent op on its original index (so one RelayerDO's seen-set dedups
+ *  it, no cross-index double-bundle). The in-memory maps are just a warm cache over the durable
+ *  store. ROUTE_TTL — how long an assignment stays sticky; must comfortably exceed the queue's
+ *  at-least-once redelivery window (CF max_retries × backoff = minutes), yet expire so a sender
+ *  idle past it is re-load-balanced. */
+const ROUTE_TTL_MS = 30 * 60_000;
+/** Durable per-sender route key prefix (BundlerDO storage): route:<lowercased sender> → {index,ts}. */
+const ROUTE_KEY_PREFIX = "route:";
+/** Throttle for the opportunistic durable-route GC sweep. */
+const ROUTE_SWEEP_INTERVAL_MS = 60_000;
+/** Optimistic "just handed out" busy window per index — covers the gap between /lease returning
+ *  an index and the destination RelayerDO registering it in rwatch, so two concurrent batches
+ *  (serialized by this single-threaded DO) can't both pick the same free index. */
+const RECENT_LEASE_TTL_MS = 30_000;
+/** FIFO bound on the in-memory sender→index warm cache. */
+const LEASE_MAP_MAX = 8192;
 
 /** DO storage flag: the alarm was stopped DELIBERATELY (chain fully idle / abandoned) —
  *  distinguishes "healthy idle" from "alarm chain broken" for the cron liveness probe. */
@@ -192,6 +213,21 @@ export class BundlerDO implements DurableObject {
    *  a process restart (the zombie scenario) must NOT inherit it. */
   private alarmInFlightSince: number | null = null;
 
+  // --- Dynamic-lease coordinator state (per-chain). The sender→index assignment is DURABLE
+  // (persisted under route:<sender>); these in-memory maps are a warm cache over it. Durability is
+  // load-bearing, not an optimization: it makes routing dedup-STABLE across eviction/deploy and a
+  // DYNAMIC_LEASE rollback, so a redelivered/re-sent op returns to its original index and that one
+  // RelayerDO's seen-set dedups it (no cross-index double-bundle). Nonce correctness still rests on
+  // the destination RelayerDO's own per-EOA lock; this only decides WHICH index a NEW sender gets. ---
+  /** Warm cache: sender(lowercased) → { assigned pool index, last-touched ts }. Backed by route:<sender>. */
+  private leaseAssignments = new Map<string, { index: number; ts: number }>();
+  /** index → last-handed-out ts (optimistic busy overlay; see RECENT_LEASE_TTL_MS). */
+  private recentlyLeased = new Map<number, number>();
+  /** Round-robin cursor for even spread + the all-busy fallback. */
+  private leaseCursor = 0;
+  /** Last time the durable route:<sender> store was GC-swept (throttled). */
+  private lastRouteSweepAt = 0;
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -248,6 +284,12 @@ export class BundlerDO implements DurableObject {
     // stranded money-path state. Storage-only, no init needed.
     if (url.pathname === "/relayer-watch") {
       return await this.handleRelayerWatch(url, request.method);
+    }
+
+    // Dynamic-lease coordinator: the queue consumer asks for a FREE pool index per sender.
+    // Storage-only + in-memory, NO chain init, NO RPC — must stay lightweight (one call/batch).
+    if (url.pathname === "/lease" && request.method === "POST") {
+      return await this.handleLease(request);
     }
 
     if (chainId > 0) {
@@ -892,6 +934,112 @@ export class BundlerDO implements DurableObject {
   }
 
   /**
+   * Dynamic-lease coordinator — the routing authority for queue-transport ops (the consumer calls
+   * this for EVERY batch). For each distinct sender it returns a pool index in [0, width-1]:
+   *   - REUSE the sender's existing DURABLE route if one is live (route:<sender>), so a redelivered
+   *     or ambiguously-re-sent op returns to the SAME RelayerDO whose seen-set dedups it — dedup
+   *     stability that survives eviction/deploy AND a DYNAMIC_LEASE rollback (both wipe the memory
+   *     cache but not durable storage). This is the fix for the cross-index double-bundle window.
+   *   - otherwise ASSIGN: a FREE index when leasing is on for this chain (DYNAMIC_LEASE_ENABLED),
+   *     else static hash(sender)%width. The new route is persisted (write-through; the DO output
+   *     gate makes it durable before the consumer sees the response).
+   * Storage-only + in-memory: reads rwatch + route:, never inits the chain, issues no RPC. Nonce
+   * correctness rests on the destination RelayerDO's own per-EOA lock, never on this map.
+   * Body: { senders: string[] } → { assignments: { [sender]: index }, width }.
+   */
+  private async handleLease(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const chainId = parseInt(url.searchParams.get("chainId") ?? "0");
+    let body: { senders?: unknown };
+    try { body = await request.json() as { senders?: unknown }; }
+    catch { return Response.json({ error: "bad json" }, { status: 400 }); }
+    const distinct = [...new Set(
+      (Array.isArray(body.senders) ? body.senders : [])
+        .filter((s): s is string => typeof s === "string" && s.length > 0)
+        .map((s) => s.toLowerCase()),
+    )];
+    const width = resolveRoutingWidth(this.env.POOL_ROUTING_WIDTH);
+    const lease = chainSpecEnables(this.env.DYNAMIC_LEASE_ENABLED, chainId);
+    const now = Date.now();
+
+    // GC the in-memory caches.
+    for (const [s, a] of this.leaseAssignments) if (now - a.ts > ROUTE_TTL_MS) this.leaseAssignments.delete(s);
+    for (const [i, ts] of this.recentlyLeased) if (now - ts > RECENT_LEASE_TTL_MS) this.recentlyLeased.delete(i);
+
+    // Busy = indices a RelayerDO registered as holding stranded money-path state (rwatch). DO-local
+    // storage read (no RPC); a read miss just costs load-balancing quality, never correctness.
+    const busy = new Set<number>();
+    try {
+      const watched = await this.state.storage.list<number>({ prefix: RELAYER_WATCH_PREFIX });
+      for (const key of watched.keys()) {
+        const i = parseInt(key.slice(RELAYER_WATCH_PREFIX.length));
+        if (i >= 0 && i < width) busy.add(i);
+      }
+    } catch { /* treat as none-busy */ }
+
+    // A route is honored if its index is a REAL derived pool EOA (0 ≤ i < RELAYER_POOL_SIZE) — NOT
+    // clamped to `width`. Honoring a route on an index ≥ width (leased before the width was lowered)
+    // is exactly what keeps a redelivery on its original RelayerDO after a width-shrink; new
+    // assignments below are still confined to [0, width). Only a nonsense/out-of-key-range index is
+    // dropped (→ reassigned fresh).
+    const usable = (i: number | undefined): boolean =>
+      i !== undefined && Number.isInteger(i) && i >= 0 && i < RELAYER_POOL_SIZE;
+
+    // Rehydrate durable routes for senders not in the warm cache (cold-start / post-eviction dedup).
+    const durable = new Map<string, number>();
+    await Promise.all(distinct.map(async (sender) => {
+      const cached = this.leaseAssignments.get(sender);
+      if (cached && now - cached.ts <= ROUTE_TTL_MS) return; // warm cache hit → no storage read
+      try {
+        const rec = await this.state.storage.get<{ index: number; ts: number }>(ROUTE_KEY_PREFIX + sender);
+        if (rec && usable(rec.index) && now - rec.ts <= ROUTE_TTL_MS) durable.set(sender, rec.index);
+      } catch { /* miss → assigned fresh below */ }
+    }));
+
+    const assignments: Record<string, number> = {};
+    for (const sender of distinct) {
+      const cached = this.leaseAssignments.get(sender);
+      const existingIndex = (cached && now - cached.ts <= ROUTE_TTL_MS && usable(cached.index))
+        ? cached.index
+        : (durable.has(sender) ? durable.get(sender)! : null);
+      const { index, cursor } = decidePoolIndex({
+        existingIndex, lease, width, sender, busy,
+        recentlyLeased: this.recentlyLeased, now, recentTtlMs: RECENT_LEASE_TTL_MS, cursor: this.leaseCursor,
+      });
+      this.leaseCursor = cursor;
+      this.leaseAssignments.set(sender, { index, ts: now });
+      this.recentlyLeased.set(index, now);
+      busy.add(index); // within THIS batch, don't stack every new sender on the same free index
+      // Write-through persist: the DO output gate holds the response until this is durable, so a
+      // redelivery after eviction reliably rehydrates the same index (strongly consistent — unlike
+      // an eventually-consistent KV marker).
+      void this.state.storage.put(ROUTE_KEY_PREFIX + sender, { index, ts: now })
+        .catch((err: unknown) => console.warn(`[BundlerDO:${chainId}] route persist failed for ${sender}: ${redactError(err)}`));
+      assignments[sender] = index;
+    }
+
+    // FIFO-bound the warm cache (Map preserves insertion order).
+    if (this.leaseAssignments.size > LEASE_MAP_MAX) {
+      let excess = this.leaseAssignments.size - LEASE_MAP_MAX;
+      for (const key of this.leaseAssignments.keys()) { if (excess-- <= 0) break; this.leaseAssignments.delete(key); }
+    }
+    // Opportunistic durable-route GC (throttled; fire-and-forget — never delays the lease response).
+    if (now - this.lastRouteSweepAt > ROUTE_SWEEP_INTERVAL_MS) {
+      this.lastRouteSweepAt = now;
+      void this.sweepExpiredRoutes(now).catch(() => { /* best-effort */ });
+    }
+    return Response.json({ assignments, width });
+  }
+
+  /** Delete durable route:<sender> entries older than ROUTE_TTL. Bounded, best-effort. */
+  private async sweepExpiredRoutes(now: number): Promise<void> {
+    const all = await this.state.storage.list<{ index: number; ts: number }>({ prefix: ROUTE_KEY_PREFIX });
+    const dead: string[] = [];
+    for (const [key, rec] of all) if (!rec || typeof rec.ts !== "number" || now - rec.ts > ROUTE_TTL_MS) dead.push(key);
+    if (dead.length > 0) await this.state.storage.delete(dead);
+  }
+
+  /**
    * Cron fan-out (B6): probe every RelayerDO pool index registered as holding stranded money-path
    * state. Their own alarm is layer 1; this is the ONLY layer that catches a RelayerDO whose alarm
    * chain itself died (queue transport puts the money-path state in the 100 RelayerDOs, not here).
@@ -1093,7 +1241,10 @@ export class BundlerDO implements DurableObject {
     else if (op.stage === "confirmed" || op.stage === "failed") { role = op.receipt?.txHash ? "see the tx from-address" : "terminal"; }
     else if (sender) {
       if (cs.bundler.queueModeActive()) {
-        const i = relayerIndexForSender(sender);
+        // Best-guess only: under dynamic leasing the true index is sender-assigned (carried in
+        // the KV marker → kvIndex above); this static-hash guess covers the pre-consume window
+        // and the static-routing fallback. Use the same width the consumer routes at.
+        const i = relayerIndexForSender(sender, this.config?.routingWidth);
         address = (await cs.accountService.getPoolEOA(i)).address; role = `pool EOA #${i} (queue-routed)`;
       } else if (cs.bundler.poolActive) {
         role = "a leased pool EOA (index assigned at bundle time)";
@@ -1250,6 +1401,11 @@ export class BundlerDO implements DurableObject {
             this.chainId,
             this.chainServices.rpcUrl,
             async (i) => (await this.chainServices!.accountService.getPoolEOA(i)).address,
+            // Only sweep the ACTIVE routing width (default 10), not all 100 key slots — new
+            // traffic only lands on [0, width-1], so funding the rest just parks treasury money
+            // in idle EOAs and multiplies the balance-read RPCs. Legacy funds on higher indices
+            // are recoverable via their deterministic keys.
+            this.config.routingWidth ?? RELAYER_ROUTING_WIDTH,
           );
           this.escalator.ok("pool-topup", this.chainId);
         } catch (err) {

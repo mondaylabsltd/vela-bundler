@@ -31,7 +31,7 @@ import { ENTRYPOINT_V07_ABI } from "../shared/contracts/entrypoint.ts";
 import { packUserOp } from "../shared/userop/pack.ts";
 import { getUserOpHash } from "../shared/userop/hash.ts";
 import { userOpToRpc } from "../shared/userop/normalize.ts";
-import { relayerIndexForSender, RELAYER_POOL_SIZE } from "../shared/queue/routing.ts";
+import { relayerIndexForSender, resolveRoutingWidth, RELAYER_POOL_SIZE, RELAYER_ROUTING_WIDTH } from "../shared/queue/routing.ts";
 import { relayerSubmit, fundingUnderway } from "../worker/relayer-do.ts";
 import { makeEnqueueHook } from "../worker/producer.ts";
 import workerEntry, { deadLetterFailedMarker, handleDeadLetterBatch } from "../worker/index.ts";
@@ -244,19 +244,31 @@ it("hash(sender) routing - deterministic, stable, pinned vectors, producer==cons
   const zeros = "0x" + "00".repeat(20);
   const aa = "0x" + "aa".repeat(20);
   const bb = "0x" + "bb".repeat(20);
-  // Pinned vectors: last 8 nibbles as uint32 mod 100.
+  // Default routing width is RELAYER_ROUTING_WIDTH (10), DECOUPLED from the key ceiling
+  // RELAYER_POOL_SIZE (100): last 8 nibbles as uint32 mod width.
+  expect(RELAYER_ROUTING_WIDTH).toBeLessThanOrEqual(RELAYER_POOL_SIZE);
   expect(relayerIndexForSender(zeros)).toEqual(0);
-  expect(relayerIndexForSender(aa)).toEqual(0xaaaaaaaa % RELAYER_POOL_SIZE); // 30
-  expect(relayerIndexForSender(bb)).toEqual(0xbbbbbbbb % RELAYER_POOL_SIZE); // 83
-  // Only the LAST 8 nibbles matter (high prefix ignored), and the modulo wraps at 100.
+  expect(relayerIndexForSender(aa)).toEqual(0xaaaaaaaa % RELAYER_ROUTING_WIDTH);
+  expect(relayerIndexForSender(bb)).toEqual(0xbbbbbbbb % RELAYER_ROUTING_WIDTH);
+  // An EXPLICIT width overrides the default — this is the knob the producer + consumer pass so
+  // they always agree (POOL_ROUTING_WIDTH). Pinned at width 100: last 8 nibbles as uint32 mod 100.
+  expect(relayerIndexForSender(aa, 100)).toEqual(0xaaaaaaaa % 100); // 30
+  expect(relayerIndexForSender(bb, 100)).toEqual(0xbbbbbbbb % 100); // 83
+  // Only the LAST 8 nibbles matter (high prefix ignored). 100 % 10 = 0, 101 % 10 = 1.
   expect(relayerIndexForSender("0x" + "00".repeat(18) + "0064")).toEqual(0);   // 0x00000064 = 100 → 0
   expect(relayerIndexForSender("0x" + "ff".repeat(16) + "00000065")).toEqual(1); // 0x00000065 = 101 → 1
-  // Deterministic + case-insensitive + in range.
+  // resolveRoutingWidth: blank/invalid → default; a value clamps to [1, RELAYER_POOL_SIZE].
+  expect(resolveRoutingWidth(undefined)).toEqual(RELAYER_ROUTING_WIDTH);
+  expect(resolveRoutingWidth("")).toEqual(RELAYER_ROUTING_WIDTH);
+  expect(resolveRoutingWidth("0")).toEqual(RELAYER_ROUTING_WIDTH);
+  expect(resolveRoutingWidth("25")).toEqual(25);
+  expect(resolveRoutingWidth("100000")).toEqual(RELAYER_POOL_SIZE);
+  // Deterministic + case-insensitive + in range at the default width.
   for (const s of [zeros, aa, bb]) {
     expect(relayerIndexForSender(s)).toEqual(relayerIndexForSender(s.toUpperCase()));
     const i = relayerIndexForSender(s);
     expect(i).toBeGreaterThanOrEqual(0);
-    expect(i).toBeLessThan(RELAYER_POOL_SIZE);
+    expect(i).toBeLessThan(RELAYER_ROUTING_WIDTH);
   }
 });
 
@@ -420,6 +432,76 @@ it("consumer - mixed batch routes each group to the right RelayerDO name and ack
     expect(m.acked).toEqual(true);
     expect(m.retried).toEqual(false);
   }
+});
+
+it("consumer - DYNAMIC_LEASE_ENABLED routes by the coordinator's assignment, not the hash", async () => {
+  const { env, idNames, posts } = fakeRelayerEnv(200);
+  // Coordinator assigns A→7 and B→8 (free indices), independent of hash(sender).
+  const assignMap: Record<string, number> = { [SAFE_A.toLowerCase()]: 7, [SAFE_B.toLowerCase()]: 8 };
+  const leaseCalls: string[][] = [];
+  env.DYNAMIC_LEASE_ENABLED = "all";
+  env.BUNDLER = {
+    idFromName: (name: string) => ({ name }),
+    get: () => ({
+      fetch: async (_url: string, init: { body: string }) => {
+        const { senders } = JSON.parse(init.body) as { senders: string[] };
+        leaseCalls.push(senders);
+        const assignments: Record<string, number> = {};
+        for (const s of senders) assignments[s.toLowerCase()] = assignMap[s.toLowerCase()] ?? 0;
+        return new Response(JSON.stringify({ assignments, width: 10 }), { status: 200 });
+      },
+    }),
+  };
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+  const m2 = fakeMsg(msgFor(makeInBandOp(SAFE_B, 1n), 1));
+
+  await (workerEntry as any).queue({ messages: [m1, m2] } as any, env, {} as any);
+
+  // Routed to the LEASED indices (7, 8), NOT the hash indices — proving the coordinator drives it.
+  expect(idNames.filter((n) => n.startsWith("chain-1-eoa-")).sort()).toEqual(
+    ["chain-1-eoa-7", "chain-1-eoa-8"].sort(),
+  );
+  expect(relayerIndexForSender(SAFE_A)).not.toEqual(7); // would be the hash target without leasing
+  const byName = new Map(posts.map((p) => [p.name, p.ops]));
+  expect(byName.get("chain-1-eoa-7")!.length).toEqual(1);
+  expect(byName.get("chain-1-eoa-8")!.length).toEqual(1);
+  expect(leaseCalls.length).toEqual(1); // ONE lease call for the whole chain-1 batch
+  expect(new Set(leaseCalls[0]!)).toEqual(new Set([SAFE_A.toLowerCase(), SAFE_B.toLowerCase()]));
+  expect(m1.acked && m2.acked).toEqual(true);
+});
+
+it("consumer - lease failure with leasing ON DEFERS (retry), never hash-routes (avoids divergent-index double-bundle)", async () => {
+  const { env, idNames, posts } = fakeRelayerEnv(200);
+  env.DYNAMIC_LEASE_ENABLED = "all";
+  env.BUNDLER = {
+    idFromName: (name: string) => ({ name }),
+    get: () => ({ fetch: async () => new Response("coordinator down", { status: 500 }) }),
+  };
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+
+  await (workerEntry as any).queue({ messages: [m1] } as any, env, {} as any);
+
+  // A leased sender's durable index can diverge from hash(sender), so on coordinator failure we must
+  // NOT hash-route — defer (retry) until the coordinator recovers. Nothing is routed/acked.
+  expect(idNames).toEqual([]);
+  expect(posts.length).toEqual(0);
+  expect(m1.retried).toEqual(true);
+  expect(m1.acked).toEqual(false);
+});
+
+it("consumer - lease failure with leasing OFF falls back to hash routing (safe: no divergent routes exist)", async () => {
+  const { env, idNames } = fakeRelayerEnv(200);
+  // DYNAMIC_LEASE_ENABLED unset → no leased routes can diverge from hash → hash fallback is safe.
+  env.BUNDLER = {
+    idFromName: (name: string) => ({ name }),
+    get: () => ({ fetch: async () => new Response("coordinator down", { status: 500 }) }),
+  };
+  const m1 = fakeMsg(msgFor(makeInBandOp(SAFE_A, 1n), 1));
+
+  await (workerEntry as any).queue({ messages: [m1] } as any, env, {} as any);
+
+  expect(idNames).toEqual([`chain-1-eoa-${relayerIndexForSender(SAFE_A)}`]);
+  expect(m1.acked).toEqual(true);
 });
 
 it("consumer - same (chain,sender) ops collapse into ONE group / one POST", async () => {

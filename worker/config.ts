@@ -5,6 +5,7 @@
 import type { Env } from "./types.ts";
 import type { BundlerConfig } from "../shared/config/types.ts";
 import { computeSplitterAddress } from "../shared/contracts/splitter.ts";
+import { resolveRoutingWidth } from "../shared/queue/routing.ts";
 
 /** BigInt env parse that treats present-but-EMPTY vars as unset. `BigInt("") === 0n`,
  *  so a blank var in the CF dashboard would otherwise silently zero a money knob
@@ -61,6 +62,8 @@ export function buildConfig(env: Env, treasuryAddress: `0x${string}`): BundlerCo
     settlementVaultChains: env.SETTLEMENT_VAULT_ENABLED ?? "all",
     poolEoaChains: env.POOL_EOA_ENABLED ?? "",
     queueTransportChains: env.QUEUE_TRANSPORT_ENABLED ?? "",
+    dynamicLeaseChains: env.DYNAMIC_LEASE_ENABLED ?? "",
+    routingWidth: resolveRoutingWidth(env.POOL_ROUTING_WIDTH),
     poolFloatMinWei: envBigInt(env.POOL_FLOAT_MIN_WEI, "500000000000000"), // 0.0005 native
     poolFloatTargetWei: envBigInt(env.POOL_FLOAT_TARGET_WEI, "2000000000000000"), // 0.002 native
     apiRateLimitPerMinute: parseInt(env.API_RATE_LIMIT_PER_MINUTE ?? "60"),

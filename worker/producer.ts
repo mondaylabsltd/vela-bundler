@@ -10,7 +10,7 @@
 import type { Env, UserOpQueueMessage } from "./types.ts";
 import type { EnqueueRequest } from "../shared/bundler/index.ts";
 import { userOpToRpc } from "../shared/userop/normalize.ts";
-import { relayerIndexForSender } from "../shared/queue/routing.ts";
+import { relayerIndexForSender, resolveRoutingWidth } from "../shared/queue/routing.ts";
 import { redactError } from "../shared/reliability/log.ts";
 
 /**
@@ -43,7 +43,11 @@ export function makeEnqueueHook(
       return false;
     }
 
-    const index = relayerIndexForSender(req.userOp.sender);
+    // Advisory routing index for the accepted marker (powers /debug fan-out before the op
+    // reaches a RelayerDO). Under dynamic leasing the CONSUMER picks the real index at consume
+    // time and the RelayerDO overwrites this marker with it, so this is only a best-guess for
+    // the pre-consume window — computed at the same width the consumer's fallback uses.
+    const index = relayerIndexForSender(req.userOp.sender, resolveRoutingWidth(env.POOL_ROUTING_WIDTH));
     const message: UserOpQueueMessage = {
       chainId: opts.chainId,
       entryPoint: opts.entryPoint,
