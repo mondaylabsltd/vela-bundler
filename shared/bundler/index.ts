@@ -261,6 +261,20 @@ interface PendingReceipt {
   poolIndex?: number;
 }
 
+/** Read-only lifecycle snapshot for a single op (the /debug observability UI). All bigints are
+ *  stringified so it serialises straight to JSON. */
+export interface OpInspection {
+  hash: string;
+  stage: "mempool" | "in-flight" | "confirmed" | "failed" | "unknown";
+  detail: string;
+  mempool?: { sender: string; nonce: string; prefund: string; firstSeenAtMs: number; ageMs: number; rpcUrlOverride?: string };
+  inFlight?: {
+    txHash: string; txNonce?: number; eoaAddress: string; checkCount: number; bumpCount: number;
+    lastCancelAt?: number; submittedAtMs: number; ageMs: number; priorTxHashes: string[]; maxFeePerGas?: string;
+  };
+  receipt?: { success: boolean; txHash?: string; actualGasCost?: string; actualGasUsed?: string };
+}
+
 /** JSON-safe form of a UserOperationReceipt (bigints → decimal strings) for DO storage. */
 export interface SerializedReceipt {
   userOpHash: `0x${string}`;
@@ -2587,5 +2601,80 @@ export class BundlerService {
     const receipt = this.getReceipt(userOpHash);
     if (receipt) return { userOp: undefined as unknown as MempoolEntry["userOp"], receipt };
     return undefined;
+  }
+
+  /**
+   * Read-only lifecycle introspection for a single op — powers the /debug observability UI.
+   * Reports which STAGE the op is in and WHERE it lives, checking the stores newest-stage-first:
+   * terminal receipt (confirmed/failed) → in-flight pending receipt → accepted-in-mempool →
+   * unknown (never accepted here / evicted / lives in a queue-mode RelayerDO). Never mutates.
+   */
+  inspectOp(userOpHash: string): OpInspection {
+    const h = userOpHash.toLowerCase();
+    const now = Date.now();
+
+    const receipt = this.getReceipt(h);
+    if (receipt) {
+      return {
+        hash: userOpHash,
+        stage: receipt.success ? "confirmed" : "failed",
+        detail: receipt.success
+          ? "landed on-chain (terminal)"
+          : "terminal failure — the wallet learns 'failed' and should resubmit with a fresh quote",
+        receipt: {
+          success: receipt.success,
+          txHash: receipt.receipt?.transactionHash,
+          actualGasCost: receipt.actualGasCost?.toString(),
+          actualGasUsed: receipt.actualGasUsed?.toString(),
+        },
+      };
+    }
+
+    const pending = this.pendingReceipts.find((p) => p.entries.some((e) => e.userOpHash.toLowerCase() === h));
+    if (pending) {
+      const notes: string[] = [];
+      if ((pending.bumpCount ?? 0) > 0) notes.push(`fee-bumped ${pending.bumpCount}×`);
+      if (pending.lastCancelAt) notes.push("cancellation attempted");
+      return {
+        hash: userOpHash,
+        stage: "in-flight",
+        detail: `bundle broadcast, awaiting confirmation${notes.length ? ` (${notes.join(", ")})` : ""}`,
+        inFlight: {
+          txHash: pending.txHash,
+          txNonce: pending.txNonce,
+          eoaAddress: pending.eoaAddress,
+          checkCount: pending.checkCount,
+          bumpCount: pending.bumpCount ?? 0,
+          lastCancelAt: pending.lastCancelAt,
+          submittedAtMs: pending.submittedAt,
+          ageMs: now - pending.submittedAt,
+          priorTxHashes: pending.priorTxHashes ?? [],
+          maxFeePerGas: pending.maxFeePerGas?.toString(),
+        },
+      };
+    }
+
+    const entry = this.mempool.get(h as `0x${string}`);
+    if (entry) {
+      return {
+        hash: userOpHash,
+        stage: "mempool",
+        detail: "accepted into the mempool, waiting to be bundled (retried each ~10s alarm until landed or the 5-min TTL)",
+        mempool: {
+          sender: entry.userOp.sender,
+          nonce: entry.userOp.nonce.toString(),
+          prefund: entry.prefund.toString(),
+          firstSeenAtMs: entry.firstSeenAt,
+          ageMs: now - entry.firstSeenAt,
+          rpcUrlOverride: entry.rpcUrlOverride,
+        },
+      };
+    }
+
+    return {
+      hash: userOpHash,
+      stage: "unknown",
+      detail: "not in this DO's mempool / pending / receipts — never accepted here, already evicted after its TTL, or (queue mode) it lives in a per-index RelayerDO; check the KV status below",
+    };
   }
 }

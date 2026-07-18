@@ -557,6 +557,33 @@ it("tryCancellation - a FAILED broadcast does NOT latch: it is retried after the
   expect((pending.priorTxHashes as string[] | undefined) ?? [], "and the original is not shuffled into priorTxHashes").toEqual([]);
 });
 
+it("inspectOp - reports the lifecycle stage across mempool / in-flight / terminal / unknown", async () => {
+  const svc = newService(new EOALockManager());
+  const mp = (svc as unknown as { mempool: Mempool }).mempool;
+
+  // MEMPOOL: an accepted-but-unbundled op
+  const hash = mp.add(makeUserOp());
+  const m = svc.inspectOp(hash);
+  expect(m.stage).toEqual("mempool");
+  expect(m.mempool?.sender.toLowerCase()).toEqual(SAFE.toLowerCase());
+
+  // UNKNOWN: never seen here
+  expect(svc.inspectOp("0x" + "99".repeat(32)).stage).toEqual("unknown");
+
+  // IN-FLIGHT: a pending receipt (pinnedPending's entry hash is 0x11..)
+  svc.importPendingState(pinnedPending("0x" + "e1".repeat(32), 7));
+  const f = svc.inspectOp("0x" + "11".repeat(32));
+  expect(f.stage).toEqual("in-flight");
+  expect(f.inFlight?.txHash).toEqual("0x" + "e1".repeat(32));
+  expect(f.inFlight?.eoaAddress.toLowerCase()).toEqual(TEST_EOA.toLowerCase());
+
+  // TERMINAL FAILED: a rejected op stores a failed receipt
+  svc.rejectAccepted(("0x" + "22".repeat(32)) as `0x${string}`, SAFE, 1n, "test reject");
+  const t = svc.inspectOp("0x" + "22".repeat(32));
+  expect(t.stage).toEqual("failed");
+  expect(t.receipt?.success).toEqual(false);
+});
+
 // ---------------------------------------------------------------------------
 // Mempool: firstSeenAt, serialization, restore
 // ---------------------------------------------------------------------------

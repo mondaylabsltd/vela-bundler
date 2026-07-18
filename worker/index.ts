@@ -14,6 +14,7 @@ import {
 import { CORS_HEADERS } from "../shared/rpc/cors.ts";
 import { redactError } from "../shared/reliability/log.ts";
 import { createAlerter } from "../shared/monitoring/telegram.ts";
+import { DEBUG_PAGE_HTML } from "./debug-page.ts";
 
 // Re-export the Durable Objects for wrangler to discover.
 export { BundlerDO } from "./bundler-do.ts";
@@ -113,6 +114,24 @@ export default {
         `<p><a href="/health">/health</a></p></body></html>`,
         { headers: { "Content-Type": "text/html; charset=utf-8" } },
       );
+    }
+
+    // Observability UI (dev): GET /debug serves the single-page op inspector.
+    if (url.pathname === "/debug" && request.method === "GET") {
+      return new Response(DEBUG_PAGE_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS } });
+    }
+
+    // Per-op inspection: GET /v1/debug/:chainId/:hash → the chain DO's read-only inspectOp + KV +
+    // health context (powers /debug). Its own route so the hash reaches the DO as a query param.
+    const debugMatch = url.pathname.match(/^\/v1\/debug\/(\d+)\/(0x[0-9a-fA-F]{64})$/);
+    if (debugMatch && request.method === "GET") {
+      const chainId = parseInt(debugMatch[1]!);
+      const stub = env.BUNDLER.get(env.BUNDLER.idFromName(`chain-${chainId}`));
+      const doUrl = new URL(request.url);
+      doUrl.pathname = "/inspect";
+      doUrl.searchParams.set("chainId", String(chainId));
+      doUrl.searchParams.set("hash", debugMatch[2]!);
+      return stub.fetch(new Request(doUrl.toString(), request));
     }
 
     // Per-chain health: GET /health/:chainId → the chain's DO (real degraded status: locked

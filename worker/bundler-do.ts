@@ -286,6 +286,10 @@ export class BundlerDO implements DurableObject {
         return this.handleHealth(chainId);
       }
 
+      if (url.pathname === "/inspect" && request.method === "GET") {
+        return await this.handleInspect(url, chainId);
+      }
+
       // Treasury-serialized EOA top-up. A per-EOA RelayerDO whose pool EOA can't afford its
       // outer gas calls this so ALL treasury sends go through the ONE chain DO's SponsorService
       // (runTreasuryExclusive) — 100 RelayerDOs sending treasury txs directly would race its
@@ -959,6 +963,43 @@ export class BundlerDO implements DurableObject {
       console.error(`[BundlerDO:${this.chainId}] fund-eoa error for ${address}:`, redactError(err));
       return Response.json({ toppedUp: false, reason: "internal_error" }, { status: 500 });
     }
+  }
+
+  /** Read-only per-op lifecycle inspection for the /debug UI: the op's stage + where it lives, the
+   *  KV status marker, and the chain's live health/funding context. No mutation, no secrets. */
+  private async handleInspect(url: URL, chainId: number): Promise<Response> {
+    const hash = (url.searchParams.get("hash") ?? "").trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+      return Response.json({ error: "bad hash (expected 0x + 64 hex chars)" }, { status: 400, headers: CORS_HEADERS });
+    }
+    const cs = this.chainServices;
+    if (!cs) return Response.json({ error: "chain not initialized" }, { status: 503, headers: CORS_HEADERS });
+
+    const op = cs.bundler.inspectOp(hash);
+
+    // KV status marker (queue-mode 'accepted'/'pending' + terminal receipts).
+    let kv: { present: boolean; status?: string; hasReceipt?: boolean } | null = null;
+    if (this.env.USEROP_STATUS) {
+      try {
+        const raw = await this.env.USEROP_STATUS.get(hash);
+        kv = raw
+          ? (() => { const p = JSON.parse(raw) as { status?: string; receipt?: unknown }; return { present: true, status: p.status, hasReceipt: p.receipt !== undefined }; })()
+          : { present: false };
+      } catch { kv = null; }
+    }
+
+    const chain = {
+      chainId,
+      mempoolSize: cs.mempool.size,
+      pendingReceiptCount: cs.bundler.pendingReceiptCount,
+      lockedEOAs: cs.accountService.lockManager.getLockedEOAs().map((e) => e.address),
+      insufficientFundsEoa: cs.bundler.insufficientFundsEoa,
+      insufficientFundsWei: cs.bundler.insufficientFundsWei?.toString() ?? null,
+      lastSubmitError: cs.bundler.lastSubmitError,
+      oldestMempoolAgeMs: cs.mempool.oldestEntryAgeMs(),
+    };
+
+    return Response.json({ op, kv, chain }, { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } });
   }
 
   private handleHealth(requestedChainId: number = this.chainId): Response {
