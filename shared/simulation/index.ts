@@ -36,6 +36,10 @@ import { isL2WithDataFee, isArbitrumChain, isOpStackChain, estimateArbitrumL1Gas
 /** Simulation calls get a longer timeout since they're heavier than simple RPC calls. */
 const SIMULATION_TIMEOUT_MS = RPC_TIMEOUT_MS * 3; // 15s
 
+/** Public RPCs tried (single attempt each) for the basic gas-price reads after the managed
+ *  primary fails — bounds failure-path latency while still surviving a single-provider outage. */
+const MAX_GAS_PRICE_FALLBACK_RPCS = 3;
+
 /**
  * Total wall-time budget for a multi-RPC simulation fan-out. Bounds the worst case
  * where the primary RPC is down and we walk the fallback list — without this, a
@@ -622,6 +626,12 @@ export function createSimulator(config: BundlerConfig) {
     from?: `0x${string}`,
     rpcUrlOverride?: string,
     deadline?: Deadline,
+    /** Skip the step-2 eth_call verification. Set by callers (the in-band path) that run a
+     *  separate full-execution check (simulateExecutionSuccess/eth_simulateV1) right after — that
+     *  proves per-op execution success AND returns real gasUsed, so the eth_call here (documented
+     *  as "a final safety net already caught by simulateExecution per-op") is a redundant heavy
+     *  round-trip on the hot path. eth_estimateGas (step 1, kept) still provides gas + FailedOp. */
+    skipCallVerification?: boolean,
   ): Promise<BundleSimulationResult> {
     // `beneficiary` is only the encoded handleOps arg; `from` is the actual outer-tx sender
     // (the bundler EOA / tx.origin). They differ once the beneficiary is the splitter — the
@@ -670,8 +680,9 @@ export function createSimulator(config: BundlerConfig) {
 
     // Step 2: eth_call to detect individual UserOp execution failures
     // (EntryPoint handleOps doesn't revert on individual op failures — it emits
-    // UserOperationEvent with success=false and UserOperationRevertReason)
-    try {
+    // UserOperationEvent with success=false and UserOperationRevertReason).
+    // Skipped on the in-band path, which runs eth_simulateV1 next (proves the same thing).
+    if (!skipCallVerification) try {
       const callJson = await rpcCall(
         rpcUrl,
         {
@@ -838,54 +849,85 @@ export function createSimulator(config: BundlerConfig) {
     /** eth_gasPrice — used as floor to prevent nodes rejecting txs with too-low gas price. */
     chainGasPrice: bigint;
   }> {
-    const rpcUrl = resolveRpcUrl(config, rpcUrlOverride);
+    const primary = resolveRpcUrl(config, rpcUrlOverride);
 
-    // Route through the unified wrapper: per-call timeout + circuit breaker + structured
-    // classification. Single attempt (the allSettled fan-out already tolerates partial
-    // failure by falling back to defaults), so no request amplification.
-    const call = (id: number, method: string) =>
-      rpcCall(rpcUrl, { jsonrpc: "2.0", id, method, params: method === "eth_getBlockByNumber" ? ["latest", false] : [] },
-        { dependency: "rpc", operation: method, timeoutMs: RPC_TIMEOUT_MS, maxAttempts: 1, deadline });
+    // Basic gas reads (eth_getBlockByNumber / eth_gasPrice / eth_maxPriorityFeePerGas) are served
+    // by EVERY node, so when the primary is a PUBLIC/user RPC we walk a capped set of the resolved
+    // public RPCs before degrading — a single flaky endpoint won't take pricing offline.
+    // BUT when the primary is the operator's paid, managed RPC (Alchemy) it is the highest-priority
+    // and most reliable source: DO NOT fall back to public RPCs (they can be flaky or return a
+    // different price the user then signs). Trust Alchemy alone — retry it, or degrade (retryable)
+    // if it's genuinely down. Mirrors buildSimulationRpcList's managed-primary gating.
+    const fallbacks = isManagedRpcUrl(primary)
+      ? []
+      : (config.publicRpcs ?? []).filter((u) => u && u !== primary).slice(0, MAX_GAS_PRICE_FALLBACK_RPCS);
+    const urls = [primary, ...fallbacks];
+    // Bound the whole walk even when the caller passes no deadline (the background fee-bump /
+    // cancellation callers) — otherwise each URL mints a fresh per-call timeout and a full-outage
+    // walk could run ~4× a single call's budget before returning.
+    const dl = deadline ?? createDeadline(SIMULATION_TIMEOUT_MS);
+    let lastReason: unknown = new Error("gas price unavailable");
 
-    // Fetch baseFee, priority fee, and gasPrice in parallel
-    const [blockRes, tipRes, gpRes] = await Promise.allSettled([
-      call(1, "eth_getBlockByNumber"),
-      call(2, "eth_maxPriorityFeePerGas"),
-      call(3, "eth_gasPrice"),
-    ]);
+    for (const rpcUrl of urls) {
+      // Route through the unified wrapper: per-call timeout + circuit breaker + structured
+      // classification. Single attempt per URL (the URL walk is the retry), no amplification.
+      const call = (id: number, method: string) =>
+        rpcCall(rpcUrl, { jsonrpc: "2.0", id, method, params: method === "eth_getBlockByNumber" ? ["latest", false] : [] },
+          { dependency: "rpc", operation: method, timeoutMs: RPC_TIMEOUT_MS, maxAttempts: 1, deadline: dl });
 
-    // ALL THREE reads failed → the RPC is unreachable, not "gas is free". Rethrow (the
-    // reason is already classified by rpcCall) so callers surface a retryable degraded
-    // error instead of quoting maxFeePerGas=0x0 to the wallet — a zero quote gets SIGNED
-    // by the user and then rejected/stuck at submission. Rejection-count only, no zero-value
-    // check: Tempo (maxFee=0 by design) and other legitimately-zero chains are unaffected.
-    if (blockRes.status === "rejected" && tipRes.status === "rejected" && gpRes.status === "rejected") {
-      throw blockRes.reason;
+      const [blockRes, tipRes, gpRes] = await Promise.allSettled([
+        call(1, "eth_getBlockByNumber"),
+        call(2, "eth_maxPriorityFeePerGas"),
+        call(3, "eth_gasPrice"),
+      ]);
+
+      // ALL THREE reads failed → this RPC is unreachable, not "gas is free". Record the reason
+      // and try the next URL; only the final throw surfaces a retryable degraded error to the
+      // caller (never a maxFeePerGas=0x0 quote, which the user would SIGN and then get stuck).
+      if (blockRes.status === "rejected" && tipRes.status === "rejected" && gpRes.status === "rejected") {
+        lastReason = blockRes.reason;
+        continue;
+      }
+
+      // A FAILED base-fee read (block rejected) is NOT a legitimately-zero base fee: on a 1559
+      // chain baseFee is usually the dominant term, and returning 0 would quote a tip-only,
+      // grossly-underpriced op that stalls. eth_gasPrice (chainGasPrice) is the caller's floor
+      // and on 1559 chains ≈ base+tip, so it rescues us — but if BOTH the block read AND
+      // eth_gasPrice failed while only the tip succeeded, we have no reliable price: skip to the
+      // next URL, degrading only if none works. A block read that SUCCEEDED with no baseFeePerGas
+      // (Tempo / non-1559) keeps baseFee=0 correctly and is unaffected.
+      const baseFeeReadFailed = blockRes.status === "rejected";
+
+      let baseFee = 0n;
+      const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
+      if (blockResult?.baseFeePerGas) {
+        baseFee = BigInt(blockResult.baseFeePerGas);
+      }
+
+      let chainGasPrice = 0n;
+      const gpResult = gpRes.status === "fulfilled" ? (gpRes.value?.result as string | undefined) : undefined;
+      if (gpResult) {
+        chainGasPrice = BigInt(gpResult);
+      }
+
+      let suggestedMaxPriorityFeePerGas = 0n;
+      const tipResult = tipRes.status === "fulfilled" ? (tipRes.value?.result as string | undefined) : undefined;
+      if (tipResult) {
+        suggestedMaxPriorityFeePerGas = BigInt(tipResult);
+      } else {
+        // Fallback: derive tip from gasPrice - baseFee
+        suggestedMaxPriorityFeePerGas = chainGasPrice > baseFee ? chainGasPrice - baseFee : chainGasPrice;
+      }
+
+      if (baseFeeReadFailed && chainGasPrice === 0n && suggestedMaxPriorityFeePerGas > 0n) {
+        lastReason = blockRes.reason;
+        continue; // tip-only, no base-fee and no gasPrice floor → unreliable, try next URL
+      }
+
+      return { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice };
     }
 
-    let baseFee = 0n;
-    const blockResult = blockRes.status === "fulfilled" ? (blockRes.value?.result as { baseFeePerGas?: string } | undefined) : undefined;
-    if (blockResult?.baseFeePerGas) {
-      baseFee = BigInt(blockResult.baseFeePerGas);
-    }
-
-    // eth_gasPrice — always fetched, used as floor on non-EIP-1559 chains
-    let chainGasPrice = 0n;
-    const gpResult = gpRes.status === "fulfilled" ? (gpRes.value?.result as string | undefined) : undefined;
-    if (gpResult) {
-      chainGasPrice = BigInt(gpResult);
-    }
-
-    let suggestedMaxPriorityFeePerGas = 0n;
-    const tipResult = tipRes.status === "fulfilled" ? (tipRes.value?.result as string | undefined) : undefined;
-    if (tipResult) {
-      suggestedMaxPriorityFeePerGas = BigInt(tipResult);
-    } else {
-      // Fallback: derive tip from gasPrice - baseFee
-      suggestedMaxPriorityFeePerGas = chainGasPrice > baseFee ? chainGasPrice - baseFee : chainGasPrice;
-    }
-
-    return { baseFee, suggestedMaxPriorityFeePerGas, chainGasPrice };
+    throw lastReason;
   }
 
   /**

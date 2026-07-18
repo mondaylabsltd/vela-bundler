@@ -16,6 +16,7 @@
 
 import { it, expect } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
+import { parseTransaction } from "viem";
 import {
   BundlerService,
   classifyBroadcastError,
@@ -150,6 +151,19 @@ it("isInsufficientFundsError - native + Tempo shapes", () => {
   expect(isInsufficientFundsError(new Error("insufficient funds for gas * price + value"))).toBeTruthy();
   expect(isInsufficientFundsError(new Error("total cost exceeds balance"))).toBeTruthy();
   expect(!isInsufficientFundsError(new Error("nonce too low"))).toBeTruthy();
+});
+
+it("isInsufficientFundsError - Alchemy/geth 'gas required exceeds allowance' (the chain-1 stall)", () => {
+  // The exact production string: a drained fronting EOA's eth_estimateGas fails like this,
+  // and it MUST be recognised as needs-top-up (not a generic transient defer) or the top-up
+  // hook never fires and the op never lands.
+  expect(isInsufficientFundsError(
+    new Error("Execution reverted with reason: gas required exceeds allowance (0)."),
+  )).toBeTruthy();
+  expect(isInsufficientFundsError(new Error("gas required exceeds allowance (16600)"))).toBeTruthy();
+  expect(isInsufficientFundsError(new Error("sender doesn't have enough funds to send tx"))).toBeTruthy();
+  // A genuinely-reverting op (not a funds issue) must NOT be laundered into needs-top-up.
+  expect(!isInsufficientFundsError(new Error("execution reverted: AA23 reverted"))).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
@@ -446,6 +460,101 @@ it("tryFeeBump - refuses to bump past the bounded-loss ceiling", async () => {
 
   expect(pending.bumpCount, "no bump — the loss would exceed the cap").toEqual(0);
   expect(pending.txHash, "original tx untouched").toEqual("0x" + "f6".repeat(32));
+});
+
+it("tryCancellation - replaces a stuck tx with a 0-value self-transfer at the pinned nonce (B7 anti-brick)", async () => {
+  // Base fee rose past the fee-bump ceiling (revenueCap too low), so the tx can neither land nor be
+  // re-priced. Without a cancellation the pinned pool EOA stays LOCKED_PENDING_UNKNOWN forever
+  // (latestNonce never passes txNonce). The cancellation replaces it at the SAME nonce so, whoever
+  // wins, the nonce advances and the EOA recovers.
+  const lm = new EOALockManager();
+  const svc = newService(lm, {
+    getGasPrices: () => Promise.resolve({ baseFee: 100_000_000_000n, suggestedMaxPriorityFeePerGas: 1_000_000_000n, chainGasPrice: 0n }),
+  });
+  (svc as unknown as { publicClient: unknown }).publicClient = { getBalance: () => Promise.resolve(10n ** 18n) };
+  svc.importPendingState(pinnedPending("0x" + "c7".repeat(32), 7, {
+    txTo: ENTRY_POINT, txData: "0x1234", txGas: "100000",
+    maxFeePerGas: "2000000000", maxPriorityFeePerGas: "1000000000",
+    revenueCapPerGas: "2000000000", bumpCount: 2, // fee-bumps exhausted
+  } as Partial<SerializedPending>));
+  lm.restorePending(TEST_EOA, 1000n);
+  const pending = (svc as unknown as { pendingReceipts: Record<string, unknown>[] }).pendingReceipts[0]!;
+  const original = pending.txHash as string;
+
+  const originalFetch = globalThis.fetch;
+  const sentRaw: string[] = [];
+  globalThis.fetch = feeBumpFetchStub(sentRaw) as typeof fetch;
+  try {
+    await (svc as unknown as { tryCancellation: (p: unknown) => Promise<void> }).tryCancellation(pending);
+  } finally { globalThis.fetch = originalFetch; }
+
+  expect(sentRaw.length, "one cancellation broadcast").toEqual(1);
+  expect(pending.lastCancelAt, "cooldown stamped so it isn't re-sent immediately").toBeGreaterThan(0);
+  expect((pending.priorTxHashes as string[]).includes(original), "original still polled (may still win)").toBeTruthy();
+  expect(pending.txHash, "now also tracking the cancellation hash").not.toEqual(original);
+  const tx = parseTransaction(sentRaw[0]! as `0x${string}`);
+  expect(tx.to?.toLowerCase(), "self-transfer to the EOA").toEqual(TEST_EOA.toLowerCase());
+  expect(tx.value ?? 0n, "zero value").toEqual(0n);
+  expect(tx.nonce, "the pinned nonce").toEqual(7);
+});
+
+it("tryCancellation - unaffordable → defers + flags the EOA for top-up, no broadcast", async () => {
+  const lm = new EOALockManager();
+  const svc = newService(lm, {
+    getGasPrices: () => Promise.resolve({ baseFee: 100_000_000_000n, suggestedMaxPriorityFeePerGas: 1_000_000_000n, chainGasPrice: 0n }),
+  });
+  (svc as unknown as { publicClient: unknown }).publicClient = { getBalance: () => Promise.resolve(1n) }; // broke EOA
+  svc.importPendingState(pinnedPending("0x" + "c8".repeat(32), 7, {
+    txTo: ENTRY_POINT, txData: "0x1234", txGas: "100000",
+    maxFeePerGas: "2000000000", maxPriorityFeePerGas: "1000000000", revenueCapPerGas: "2000000000", bumpCount: 2,
+  } as Partial<SerializedPending>));
+  const pending = (svc as unknown as { pendingReceipts: Record<string, unknown>[] }).pendingReceipts[0]!;
+
+  const originalFetch = globalThis.fetch;
+  const sentRaw: string[] = [];
+  globalThis.fetch = feeBumpFetchStub(sentRaw) as typeof fetch;
+  try {
+    await (svc as unknown as { tryCancellation: (p: unknown) => Promise<void> }).tryCancellation(pending);
+  } finally { globalThis.fetch = originalFetch; }
+
+  expect(sentRaw.length, "no broadcast when unaffordable").toEqual(0);
+  expect((pending.priorTxHashes as string[] | undefined) ?? [], "no hash tracked — nothing was broadcast").toEqual([]);
+  expect((svc.insufficientFundsEoa ?? "").toLowerCase(), "flagged for the treasury refill loop").toEqual(TEST_EOA.toLowerCase());
+});
+
+it("tryCancellation - a FAILED broadcast does NOT latch: it is retried after the cooldown (B7 fix)", async () => {
+  // Self-review regression: latching on any broadcast failure permanently disabled recovery. Now a
+  // reject just cools down (lastCancelAt) and the next cycle retries with a recomputed fee.
+  const lm = new EOALockManager();
+  const svc = newService(lm, {
+    getGasPrices: () => Promise.resolve({ baseFee: 100_000_000_000n, suggestedMaxPriorityFeePerGas: 1_000_000_000n, chainGasPrice: 0n }),
+  });
+  (svc as unknown as { publicClient: unknown }).publicClient = { getBalance: () => Promise.resolve(10n ** 18n) };
+  svc.importPendingState(pinnedPending("0x" + "c9".repeat(32), 7, {
+    txTo: ENTRY_POINT, txData: "0x1234", txGas: "100000",
+    maxFeePerGas: "2000000000", maxPriorityFeePerGas: "1000000000", revenueCapPerGas: "2000000000", bumpCount: 2,
+  } as Partial<SerializedPending>));
+  lm.restorePending(TEST_EOA, 1000n);
+  const pending = (svc as unknown as { pendingReceipts: Record<string, unknown>[] }).pendingReceipts[0]!;
+  const original = pending.txHash as string;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((_i: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    const answer = (result: unknown) => new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { headers: { "Content-Type": "application/json" } });
+    if (body.method === "eth_chainId") return Promise.resolve(answer("0x1"));
+    if (body.method === "eth_sendRawTransaction") {
+      return Promise.resolve(new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "max fee per gas less than block base fee" } }), { headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(answer(null));
+  }) as typeof fetch;
+  try {
+    await (svc as unknown as { tryCancellation: (p: unknown) => Promise<void> }).tryCancellation(pending);
+  } finally { globalThis.fetch = originalFetch; }
+
+  expect(pending.lastCancelAt, "cooldown stamped → a retry is scheduled").toBeGreaterThan(0);
+  expect(pending.txHash, "a failed broadcast is NOT tracked as the new hash").toEqual(original);
+  expect((pending.priorTxHashes as string[] | undefined) ?? [], "and the original is not shuffled into priorTxHashes").toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

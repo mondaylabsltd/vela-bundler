@@ -530,6 +530,36 @@ it("pool per-op attribution - two full payers both ride in one bundle (no false 
   expect(sentRaw.length).toEqual(1);
 });
 
+it("pool per-op gate - two ops paying a REALISTIC per-op share both survive (B1 regression)", async () => {
+  // Regression for the whole-bundle-floor bug: the per-op gate seeded its floor with
+  // requiredNative (= 2× the WHOLE bundle cost), so EVERY op in an n≥2 bundle was required to
+  // repay 2× the entire bundle and all multi-op pool bundles were dropped. The old "two full
+  // payers" test masked it by paying 1e18 (>> 2× cost). Here each op pays 4e14, which is in the
+  // band [costNative, 2×costNative): costNative = realGas(210k = 150k sim + 60k buffer) ×
+  // outerMaxFee(1.35 gwei = 1.25×1gwei base + 0.1gwei tip) = 2.835e14. Per-op need is now
+  // 2×perOpCost = costNative = 2.835e14 ≤ 4e14 → both PASS; the old gate needed 2×costNative =
+  // 5.67e14 > 4e14 → both would be wrongly dropped.
+  const PAY = 4n * 10n ** 14n;
+  const acct = poolAccountService();
+  const mempool = newMempool();
+  const hashA = mempool.add(makeInBandOpPaying(SAFE_A, 1n, PAY));
+  const hashB = mempool.add(makeInBandOpPaying(SAFE_B, 1n, PAY));
+  const svc = new BundlerService(poolConfig(), mempool, poolSimulator(), acct, { disableTimers: true });
+  stubPublicClient(svc, { nonce: 7 });
+
+  const sentRaw: string[] = [];
+  const restore = stubBroadcastFetch(sentRaw);
+  try {
+    const r = await svc.tryBundle();
+    expect(r.submitted, "a 2-op pool bundle with realistic per-op payment must submit").toEqual(true);
+  } finally {
+    restore();
+  }
+  expect(sentRaw.length).toEqual(1);          // ONE handleOps carrying both ops
+  expect(svc.getReceipt(hashA)?.success).not.toEqual(false); // neither op falsely dropped
+  expect(svc.getReceipt(hashB)?.success).not.toEqual(false);
+});
+
 it("pool in-flight guard - a sender with a pending receipt is excluded from the next bundle", async () => {
   const acct = poolAccountService();
   const mempool = newMempool();

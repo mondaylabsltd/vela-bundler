@@ -200,6 +200,34 @@ it("pimlico_getUserOperationGasPrice - all-zero price signals → retryable degr
   expect((result.error!.data as { retryable?: boolean })?.retryable).toEqual(true);
 });
 
+/** A registry whose getChain always throws — models a chain-resolution failure. */
+function throwingRegistry(err: Error): ChainRegistryLike {
+  return { async getChain() { throw err; }, getAll() { return []; } };
+}
+
+it("resolveChain - a TRANSIENT registry outage degrades (retryable -32000), not a permanent chain rejection", async () => {
+  // The wallet keys off the code: a transient blip must be retried, not treated as an
+  // unsupported/bad-op rejection that makes it drop the trade during the exact retry window.
+  const registry = throwingRegistry(new Error("Chain registry temporarily unreachable for chain 1 (timeout). Retry shortly."));
+  const result = await processRequest(
+    { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [makeFullUserOp(), ENTRY_POINT] },
+    mockConfig(), registry, mockReqCtx(),
+  );
+  expect(result.error).toBeDefined();
+  expect(result.error!.code).toEqual(-32000); // SERVICE_DEGRADED (retryable)
+  expect((result.error!.data as { retryable?: boolean })?.retryable).toEqual(true);
+});
+
+it("resolveChain - a genuinely UNSUPPORTED chain stays a permanent INVALID_USEROPERATION (-32602)", async () => {
+  const registry = throwingRegistry(new Error("Chain 999 is not supported. Add it to the registry."));
+  const result = await processRequest(
+    { jsonrpc: "2.0", id: 1, method: "eth_sendUserOperation", params: [makeFullUserOp(), ENTRY_POINT] },
+    mockConfig(), registry, mockReqCtx(),
+  );
+  expect(result.error).toBeDefined();
+  expect(result.error!.code).toEqual(-32602); // INVALID_USEROPERATION (permanent)
+});
+
 it("handleRpcMethod - eth_supportedEntryPoints returns config entry point", async () => {
   const config = mockConfig();
   const result = await handleRpcMethod(

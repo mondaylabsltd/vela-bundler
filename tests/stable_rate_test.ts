@@ -1,9 +1,31 @@
 import { it, expect } from "vitest";
+import { encodeFunctionResult, parseAbi } from "viem";
 import {
   stableFloorUnits,
   requiredStableCharge,
   DEFAULT_FEE_TIER,
+  FEE_TIER_PREFERENCE,
+  quoteNativeToStable,
+  type StableQuoteConfig,
 } from "../shared/gas/stable-rate.ts";
+
+const QUOTER_V2_ABI = parseAbi([
+  "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
+]);
+const CFG: StableQuoteConfig = {
+  quoterV2: ("0x" + "a1".repeat(20)) as `0x${string}`,
+  wrappedNative: ("0x" + "b2".repeat(20)) as `0x${string}`,
+  stable: ("0x" + "c3".repeat(20)) as `0x${string}`,
+};
+const encQuote = (amountOut: bigint) =>
+  encodeFunctionResult({ abi: QUOTER_V2_ABI, functionName: "quoteExactInputSingle", result: [amountOut, 0n, 0, 0n] });
+
+/** Mock viem PublicClient.call driven by a per-call plan; returns a call counter. */
+function mockClient(plan: (i: number) => "throw" | { data: `0x${string}` }) {
+  let calls = 0;
+  const client = { call: async () => { const p = plan(calls++); if (p === "throw") throw new Error("execution reverted"); return p; } } as any;
+  return { client, calls: () => calls };
+}
 
 it("stableFloorUnits: $0.01 in a token's base units", () => {
   expect(stableFloorUnits(6)).toEqual(10_000n); // USDC/USDT (6-dec): 0.01 * 1e6
@@ -25,4 +47,34 @@ it("requiredStableCharge: max($0.01 floor, markup × cost)", () => {
 
 it("DEFAULT_FEE_TIER is the 0.05% Uniswap-v3 tier", () => {
   expect(DEFAULT_FEE_TIER).toEqual(500);
+});
+
+it("FEE_TIER_PREFERENCE probes 0.05% first then the deeper tiers", () => {
+  expect([...FEE_TIER_PREFERENCE]).toEqual([500, 3000, 10000, 100]);
+});
+
+it("quoteNativeToStable: falls back to the next fee tier when the 0.05% pool reverts (availability fix)", async () => {
+  // call 0 = tier 500 → revert (no 0.05% pool); call 1 = tier 3000 → a quote.
+  const { client, calls } = mockClient((i) => (i === 0 ? "throw" : { data: encQuote(2_000_000n) }));
+  const out = await quoteNativeToStable(client, CFG, 10n ** 15n, 990101);
+  expect(out).toEqual(2_000_000n);
+  expect(calls()).toEqual(2); // probed 500 (revert) then 3000 (hit)
+});
+
+it("quoteNativeToStable: returns null (fail closed) when NO fee tier has a pool", async () => {
+  const { client } = mockClient(() => "throw");
+  const out = await quoteNativeToStable(client, CFG, 10n ** 15n, 990102);
+  expect(out).toBeNull();
+});
+
+it("quoteNativeToStable: reuses the cache for a NEARBY amount but re-quotes for a FAR one", async () => {
+  const chainId = 990103;
+  const { client, calls } = mockClient(() => ({ data: encQuote(1_000_000n) }));
+  await quoteNativeToStable(client, CFG, 10n ** 15n, chainId);        // cold: 1 eth_call, caches tier 500
+  expect(calls()).toEqual(1);
+  const near = await quoteNativeToStable(client, CFG, 2n * 10n ** 15n, chainId); // 2× → within band → rescale, no call
+  expect(calls()).toEqual(1);
+  expect(near).toEqual(2_000_000n); // linear rescale of the cached price
+  await quoteNativeToStable(client, CFG, 100n * 10n ** 15n, chainId); // 100× → outside band → re-quote
+  expect(calls()).toEqual(2);
 });

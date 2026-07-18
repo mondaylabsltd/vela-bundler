@@ -31,7 +31,7 @@ import { blacklistRpc, isRpcBlacklisted, hasFallback } from "../utils/rpc-blackl
 import { applyMarkup, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
 import { createDeadline } from "../reliability/retry.ts";
 import { getClassification } from "../reliability/errors.ts";
-import { redactUrl } from "../reliability/log.ts";
+import { redactUrl, logEvent, metrics } from "../reliability/log.ts";
 
 /**
  * End-to-end budget for the synchronous accept path (eth_sendUserOperation /
@@ -41,13 +41,41 @@ import { redactUrl } from "../reliability/log.ts";
  */
 const REQUEST_DEADLINE_MS = 15_000;
 
+/** Per-(chain, what) consecutive-degrade streaks. A synchronous degrade rides an HTTP-200
+ *  envelope so it never trips the RPC circuit breaker — without this a chain stuck quoting
+ *  zero, or a fee-token whose DEX quoter persistently fails, would degrade every request while
+ *  the operator sees only healthy-looking telemetry. Module-level state is correct: handlers run
+ *  inside the long-lived per-chain DO isolate. A clean success resets the streak (see noteOk). */
+const degradeStreaks = new Map<string, number>();
+/** Escalate the log to error level once a (chain, what) has degraded this many times in a row. */
+const DEGRADE_ESCALATE_AT = 5;
+
+/** Record a SUCCESSFUL pricing/quote op so a recovered dependency clears its degrade streak. */
+function noteOk(what: string, chainId?: number): void {
+  degradeStreaks.delete(`${chainId ?? 0}:${what}`);
+}
+
 /**
  * Map an upstream-dependency error to a stable, retryable SERVICE_DEGRADED JSON-RPC
  * error. Never leaks the raw provider message/stack — only a stable reason + optional
  * Retry-After hint, so the client can back off and retry without parsing prose.
+ *
+ * ALSO the single observability choke point for every degrade path: emits a log + a per-chain
+ * counter (these degrades bypass the circuit breaker, so this is the ONLY operator-facing signal
+ * that a chain/fee-token is failing to price), and escalates the log level once a (chain, what)
+ * degrades repeatedly in a row so an external log/metric alert can page on a persistent outage.
  */
-function degradedFromError(err: unknown, what: string): ReturnType<typeof serviceDegraded> {
+function degradedFromError(err: unknown, what: string, chainId?: number): ReturnType<typeof serviceDegraded> {
   const cls = getClassification(err);
+  const key = `${chainId ?? 0}:${what}`;
+  const streak = (degradeStreaks.get(key) ?? 0) + 1;
+  degradeStreaks.set(key, streak);
+  metrics.inc("rpc_degraded_total", 1, { chain: chainId ?? 0, what, reason: cls.reason });
+  logEvent({
+    level: streak >= DEGRADE_ESCALATE_AT ? "error" : "warn",
+    dependency: "rpc", operation: what, outcome: "degraded", reason: cls.reason,
+    chain_id: chainId, retryable: true, detail: streak >= DEGRADE_ESCALATE_AT ? `persistent: ${streak}x in a row` : undefined,
+  });
   return serviceDegraded(
     `${what} temporarily unavailable — please retry`,
     { reason: cls.reason, retryAfterMs: cls.retryAfterMs },
@@ -92,8 +120,25 @@ async function resolveChain(
   reqCtx: RequestContext,
 ): Promise<ChainServices> {
   try {
-    return await chainRegistry.getChain(chainId, reqCtx.requestRpcUrl);
+    const chain = await chainRegistry.getChain(chainId, reqCtx.requestRpcUrl);
+    noteOk("chain resolution", chainId);
+    return chain;
   } catch (err) {
+    // A TRANSIENT registry outage (blip / timeout / circuit-open) is RETRYABLE, not a permanent
+    // business rejection. fetchChainInfo deliberately emits "temporarily unreachable … Retry
+    // shortly" for that case (vs "is not supported" for a genuinely unknown chain). Collapsing
+    // both into INVALID_USEROPERATION (a permanent -32602) makes the wallet DROP the op during
+    // the exact window a retry would succeed. Degrade (retryable) unless it is provably a
+    // not-supported chain.
+    const msg = err instanceof Error ? err.message : String(err);
+    const cls = getClassification(err);
+    const isNotSupported = /not supported/i.test(msg);
+    const isTransient = cls.category === "transient" || cls.retryable ||
+      /temporarily unreachable|retry shortly/i.test(msg);
+    if (isTransient && !isNotSupported) {
+      console.warn(`[RPC] Chain resolution temporarily unavailable for chainId ${chainId} (${cls.reason})`);
+      throw degradedFromError(err, "chain resolution", chainId);
+    }
     console.error(`[RPC] Chain resolution failed for chainId ${chainId}:`, err);
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
@@ -203,12 +248,13 @@ async function handleSendUserOperation(
       try {
         gasPrices = await chain.simulator.getGasPrices(undefined, deadline);
       } catch (retryErr) {
-        throw degradedFromError(retryErr, "gas price");
+        throw degradedFromError(retryErr, "gas price", reqCtx.chainId);
       }
     } else {
-      throw degradedFromError(err, "gas price");
+      throw degradedFromError(err, "gas price", reqCtx.chainId);
     }
   }
+  noteOk("gas price", reqCtx.chainId);
   const baseFee = gasPrices.baseFee;
   const outerGas = calcOuterTxGasPrice({
     currentBaseFee: baseFee,
@@ -245,14 +291,15 @@ async function handleSendUserOperation(
         console.log(`[RPC] Balance result (fallback): spendable=${balanceCheck.spendableBalance} required=${balanceCheck.requiredBalance} sufficient=${balanceCheck.sufficient}`);
       } catch (retryErr) {
         console.error(`[RPC] Balance query also failed on chain default RPC:`, getClassification(retryErr).reason);
-        throw degradedFromError(retryErr, "balance check");
+        throw degradedFromError(retryErr, "balance check", reqCtx.chainId);
       }
     } else {
       // No fallback available (dev network or already using chain default)
       console.error(`[RPC] Balance query failed for ${safeAddress}:`, getClassification(err).reason);
-      throw degradedFromError(err, "balance check");
+      throw degradedFromError(err, "balance check", reqCtx.chainId);
     }
   }
+  noteOk("balance check", reqCtx.chainId);
   if (!balanceCheck.sufficient) {
     throw bundlerError(
       RPC_ERROR_CODES.INVALID_USEROPERATION,
@@ -332,18 +379,20 @@ async function handleSendUserOperation(
   // mempool if the queue is unreachable, so a validated op is NEVER dropped. Flag off → this is
   // byte-identical to the pre-Stage-4 mempool.add + requestBundleKick.
   try {
-    return await chain.bundler.acceptUserOp(
+    const hash = await chain.bundler.acceptUserOp(
       userOp,
       simResult.validationResult?.prefund ?? 0n,
       rpcOverride,
     );
+    noteOk("op transport", reqCtx.chainId);
+    return hash;
   } catch (err) {
     if (err instanceof UserOpValidationError) {
       throw bundlerError(err.code, err.message);
     }
     // Ambiguous enqueue → retryable degraded (the wallet re-sends; the RelayerDO dedups).
     if (err instanceof EnqueueAmbiguousError) {
-      throw degradedFromError(err, "op transport");
+      throw degradedFromError(err, "op transport", reqCtx.chainId);
     }
     throw err;
   }
@@ -394,12 +443,13 @@ async function handleEstimateUserOperationGas(
       try {
         gasEstimate = await chain.simulator.estimateUserOpGas(userOp, undefined, deadline);
       } catch (retryErr) {
-        throw degradedFromError(retryErr, "gas estimation");
+        throw degradedFromError(retryErr, "gas estimation", reqCtx.chainId);
       }
     } else {
-      throw degradedFromError(err, "gas estimation");
+      throw degradedFromError(err, "gas estimation", reqCtx.chainId);
     }
   }
+  noteOk("gas estimation", reqCtx.chainId);
 
   const result: Record<string, string> = {
     preVerificationGas: "0x" + gasEstimate.preVerificationGas.toString(16),
@@ -488,8 +538,9 @@ async function handleGetInBandGasQuote(
   const client = getPublicClient(chain.rpcUrl || config.rpcUrl);
   const costStable = await quoteNativeToStable(client, { quoterV2: quoter, wrappedNative: wnative, stable }, nativeCost, reqCtx.chainId);
   if (costStable === null || costStable <= 0n) {
-    throw degradedFromError(new Error("no DEX quote for stablecoin"), "stablecoin rate");
+    throw degradedFromError(new Error("no DEX quote for stablecoin"), "stablecoin rate", reqCtx.chainId);
   }
+  noteOk("stablecoin rate", reqCtx.chainId);
   const decimals = await stableDecimals(client, stable);
   const required = requiredStableCharge(costStable, decimals, IN_BAND_MARKUP_X);
   return {
@@ -539,7 +590,7 @@ async function handleGetUserOperationGasPrice(
   } catch (err) {
     // All price reads failed — return a RETRYABLE degraded error, never a 0x0 quote the
     // user would sign and then have rejected at submission.
-    throw degradedFromError(err, "gas price");
+    throw degradedFromError(err, "gas price", reqCtx.chainId);
   }
 
   // walletGasMarkup is a float (e.g. 2.0); scale to bps for integer math (single source
@@ -555,8 +606,9 @@ async function handleGetUserOperationGasPrice(
   // X-Rpc-Url, or a zero-gas dev fork). All-zero signals = no usable price → the same
   // retryable degraded error, so the wallet falls back to its own local estimate.
   if (baseFee <= 0n && suggestedMaxPriorityFeePerGas <= 0n && chainGasPrice <= 0n) {
-    throw degradedFromError(new Error("all gas price signals are zero"), "gas price");
+    throw degradedFromError(new Error("all gas price signals are zero"), "gas price", reqCtx.chainId);
   }
+  noteOk("gas price", reqCtx.chainId);
 
   function quote(tipMulPercent: number): Record<string, string> {
     const tip = (suggestedMaxPriorityFeePerGas * BigInt(tipMulPercent)) / 100n;
