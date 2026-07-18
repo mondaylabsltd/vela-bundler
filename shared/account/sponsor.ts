@@ -11,10 +11,13 @@
 
 import {
   createWalletClient,
-  http,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { getPublicClient } from "../utils/rpc-client.ts";
+import {
+  getFailoverPublicClient,
+  buildFallbackTransport,
+  trustedMoneyPathRpcs,
+} from "../utils/rpc-client.ts";
 import { deriveTreasuryPrivateKey, RELAYER_POOL_SIZE } from "../keys/derive.ts";
 import type { BundlerConfig } from "../config/types.ts";
 import {
@@ -222,6 +225,25 @@ export class SponsorService {
     this.maxDailyWei = budgetLimits?.maxWei ?? SPONSOR_DAILY_MAX_WEI;
   }
 
+  /** Ordered TRUSTED RPC set for a treasury operation: the passed primary + this chain's registry
+   *  public RPCs (config.publicRpcs). All registry-resolved — safe to sign+broadcast treasury txs to
+   *  and to read balances/nonces from — so a rate-limited primary can no longer stall a top-up. */
+  private trustedRpcs(rpcUrl: string): string[] {
+    return trustedMoneyPathRpcs({ rpcUrl, publicRpcs: this.config.publicRpcs });
+  }
+
+  /** Read client that fails over across the trusted RPC set (balance/nonce reads). */
+  private readClient(rpcUrl: string) {
+    return getFailoverPublicClient(this.trustedRpcs(rpcUrl));
+  }
+
+  /** Treasury wallet client whose transport fails over across the trusted RPC set. A treasury send
+   *  is serialized (runTreasuryExclusive) and viem re-broadcasts the SAME signed bytes to a fallback
+   *  RPC on a transport error, so switching endpoints on a 429 is idempotent (same nonce → same tx). */
+  private treasuryWalletClient(account: ReturnType<typeof privateKeyToAccount>, rpcUrl: string) {
+    return createWalletClient({ account, transport: buildFallbackTransport(this.trustedRpcs(rpcUrl)) });
+  }
+
   /** Run `fn` exclusively against the treasury nonce (serialized across all callers). */
   private runTreasuryExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.treasuryTxChain.then(fn, fn);
@@ -320,7 +342,7 @@ export class SponsorService {
     let cooldownMs = RATE_LIMIT_COOLDOWN_MS;
     if (lastTime && isTempoChain(chainId) && Date.now() - lastTime < RATE_LIMIT_COOLDOWN_MS) {
       try {
-        const floatBalance = await tempoPathUsdBalance(getPublicClient(rpcUrl), relayerAddress);
+        const floatBalance = await tempoPathUsdBalance(this.readClient(rpcUrl), relayerAddress);
         if (floatBalance < TEMPO_SPONSOR_TARGET / 5n) cooldownMs = TEMPO_EMPTY_FLOAT_COOLDOWN_MS;
       } catch {
         // Balance read failed — keep the default cooldown (fail closed).
@@ -371,7 +393,7 @@ export class SponsorService {
     clientHintWei?: bigint,
     dryRun = false,
   ): Promise<SponsorResult> {
-    const client = getPublicClient(rpcUrl);
+    const client = this.readClient(rpcUrl);
 
     // Tempo has no native coin — the gas account is a bundler-provided pathUSD FLOAT that is
     // consumed as gas is fronted and (mostly) replenished by each tx's batched reimbursement.
@@ -478,10 +500,7 @@ export class SponsorService {
     // 7. Execute transfer from treasury
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     const account = privateKeyToAccount(treasuryPrivateKey);
-    const walletClient = createWalletClient({
-      account,
-      transport: http(rpcUrl),
-    });
+    const walletClient = this.treasuryWalletClient(account, rpcUrl);
 
     // Priority fee — query the chain's suggested tip instead of hardcoding
     // gasPrice/10. Chains like BSC enforce a minimum gas tip cap (e.g. 0.05 gwei);
@@ -588,7 +607,7 @@ export class SponsorService {
     rpcUrl: string,
     dryRun = false,
   ): Promise<SponsorResult> {
-    const client = getPublicClient(rpcUrl);
+    const client = this.readClient(rpcUrl);
 
     const relayerBalance = await tempoPathUsdBalance(client, relayerAddress);
     if (relayerBalance >= TEMPO_SPONSOR_TARGET) {
@@ -706,7 +725,7 @@ export class SponsorService {
    * which is harmless; only a PERSISTENT stall (>5 min) alerts the operator.
    */
   private async treasuryTxStuck(
-    client: ReturnType<typeof getPublicClient>,
+    client: ReturnType<typeof getFailoverPublicClient>,
     chainId: number,
   ): Promise<boolean> {
     let latest: number, pending: number;
@@ -738,7 +757,7 @@ export class SponsorService {
   /** Transfer gas for a treasury send: estimate +20% (L2s need more than 21k for a
    *  plain transfer — L1 data priced in L2 gas), fallback TRANSFER_GAS_FALLBACK. */
   private async estimateTransferGas(
-    client: ReturnType<typeof getPublicClient>,
+    client: ReturnType<typeof getFailoverPublicClient>,
     to: `0x${string}`,
     amount: bigint,
   ): Promise<bigint> {
@@ -785,7 +804,7 @@ export class SponsorService {
 
     const minWei = this.config.poolFloatMinWei ?? POOL_FLOAT_MIN_WEI_DEFAULT;
     const targetWei = this.config.poolFloatTargetWei ?? POOL_FLOAT_TARGET_WEI_DEFAULT;
-    const client = getPublicClient(rpcUrl);
+    const client = this.readClient(rpcUrl);
 
     // Roll the 24h top-up budget window.
     if (now - this.topUpBudget.windowStart > SPONSOR_BUDGET_WINDOW_MS) {
@@ -844,7 +863,7 @@ export class SponsorService {
 
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     const account = privateKeyToAccount(treasuryPrivateKey);
-    const walletClient = createWalletClient({ account, transport: http(rpcUrl) });
+    const walletClient = this.treasuryWalletClient(account, rpcUrl);
 
     let toppedUp = 0;
     for (const { address, balance } of low.slice(0, POOL_TOPUP_MAX_SENDS_PER_SWEEP)) {
@@ -958,7 +977,7 @@ export class SponsorService {
     const targetWei = shortfallWei !== undefined && shortfallWei > 0n
       ? shortfallWei * FLOAT_REFILL_BUFFER_X
       : staticTarget;
-    const client = getPublicClient(rpcUrl);
+    const client = this.readClient(rpcUrl);
 
     const balance = await client.getBalance({ address: eoaAddress });
     if (balance >= targetWei) return { toppedUp: false, reason: "already_funded" };
@@ -987,7 +1006,7 @@ export class SponsorService {
     // reservation (the derivation is pure/cheap; a rare wasted derive on a depleted return is fine).
     const treasuryPrivateKey = await deriveTreasuryPrivateKey(this.config.operatorSecret);
     const account = privateKeyToAccount(treasuryPrivateKey);
-    const walletClient = createWalletClient({ account, transport: http(rpcUrl) });
+    const walletClient = this.treasuryWalletClient(account, rpcUrl);
 
     // --- atomic check-and-reserve (NO await between the guard and the reservation) ---
     // Keeping the OPERATOR-controlled fronting EOA funded IS the service — a running bundler that
@@ -1062,7 +1081,7 @@ export class SponsorService {
       this.topUpBudgetPathUsd = { windowStart: now, totalUnits: 0n };
     }
 
-    const client = getPublicClient(rpcUrl);
+    const client = this.readClient(rpcUrl);
     const balance = await tempoPathUsdBalance(
       client as Parameters<typeof tempoPathUsdBalance>[0],
       eoaAddress,

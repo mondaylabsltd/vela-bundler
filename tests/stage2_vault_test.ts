@@ -171,7 +171,9 @@ it("vela_getInBandGasQuote - recipient is the EOA normally, the treasury in vaul
     "vela_getInBandGasQuote", params, quoteConfig(), fakeRegistry(), { chainId: 8453 },
   ) as { recipient: string; requiredAmount: string };
   expect(off.recipient.toLowerCase()).toEqual(EOA.toLowerCase());
-  expect(BigInt(off.requiredAmount)).toEqual(3000n); // 3× markup unchanged
+  // Tiny nativeCost=1000: 3× markup (3000 wei) is far below the 1e-5-native floor (1e13 wei on an
+  // 18-dec chain), so the floor binds. Recipient routing — the point of this test — is unaffected.
+  expect(BigInt(off.requiredAmount)).toEqual(10_000_000_000_000n);
 
   const on = await handleRpcMethod(
     "vela_getInBandGasQuote", params, quoteConfig({ settlementVaultChains: "8453" }), fakeRegistry(), { chainId: 8453 },

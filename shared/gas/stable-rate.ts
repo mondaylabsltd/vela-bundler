@@ -45,6 +45,29 @@ export function requiredStableCharge(costStable: bigint, decimals: number, marku
   return marked > floor ? marked : floor;
 }
 
+/** Native-coin minimum charge as a fraction of a whole coin: 1e-5 (one hundred-thousandth).
+ *  The native analog of the $0.01 stablecoin floor — a tiny op still pays a nonzero minimum so the
+ *  operator isn't dust-charged below its fixed overhead when native gas is nearly free. */
+export const NATIVE_FLOOR_FRACTION = 100_000n;
+
+/** 1e-5 of a native coin, in wei, given the chain's native `decimals` (18 on ~every EVM chain).
+ *  Sub-1e-5-precision natives (decimals < 5, effectively nonexistent) floor to 0 — i.e. no floor,
+ *  the pre-change behaviour — exactly as stableFloorUnits(dec<2) does. */
+export function nativeFloorWei(decimals: number = 18): bigint {
+  // (1/100_000) * 10^decimals = 10^decimals / 100_000
+  return 10n ** BigInt(decimals) / NATIVE_FLOOR_FRACTION;
+}
+
+/**
+ * Required native charge = max(1e-5-native floor, markupX × the bundler's native cost). All in wei.
+ * The native sibling of requiredStableCharge.
+ */
+export function requiredNativeCharge(costNative: bigint, markupX: bigint, decimals: number = 18): bigint {
+  const marked = costNative * markupX;
+  const floor = nativeFloorWei(decimals);
+  return marked > floor ? marked : floor;
+}
+
 const RATE_CACHE_MS = 30_000;
 /** A cached quote may be linearly rescaled only within this amount band — v3 price impact is
  *  negligible at gas-sized amounts but nonlinear across large deltas, so a materially different

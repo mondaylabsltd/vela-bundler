@@ -19,7 +19,7 @@ import { receiptToRpc, receiptToByHashRpc } from "./receipt-format.ts";
 import { validateUserOpFields, UserOpValidationError } from "../userop/validate.ts";
 import { EnqueueAmbiguousError } from "../bundler/index.ts";
 import { isTempoChain, inBandActiveForChain, vaultActiveForChain, IN_BAND_MARKUP_X } from "../tempo.ts";
-import { quoteNativeToStable, stableDecimals, requiredStableCharge } from "../gas/stable-rate.ts";
+import { quoteNativeToStable, stableDecimals, requiredStableCharge, requiredNativeCharge } from "../gas/stable-rate.ts";
 import { getAddress } from "viem";
 import { getPublicClient } from "../utils/rpc-client.ts";
 import { calcPreVerificationGas } from "../gas/preVerificationGas.ts";
@@ -83,8 +83,37 @@ function degradedFromError(err: unknown, what: string, chainId?: number): Return
   );
 }
 
+/** Signature of a single JSON-RPC method handler. A sync handler may return a plain value;
+ *  handleRpcMethod awaits the result either way. */
+type RpcMethodHandler = (
+  params: unknown[],
+  config: BundlerConfig,
+  chainRegistry: ChainRegistryLike,
+  reqCtx: RequestContext,
+) => unknown | Promise<unknown>;
+
 /**
- * Dispatch an RPC method to its handler.
+ * The JSON-RPC dispatch table — the SINGLE source of truth for the bundler's public method surface.
+ * Its keys (`EXPOSED_RPC_METHODS`) are the contract the wallet and docs/api-contract.md §1 depend
+ * on: adding or removing an entry is a DELIBERATE change to the external surface (pinned by
+ * tests/api_contract_test.ts, which asserts this set against the documented list).
+ */
+export const RPC_METHOD_HANDLERS: Record<string, RpcMethodHandler> = {
+  eth_sendUserOperation: (params, config, registry, reqCtx) => handleSendUserOperation(params, config, registry, reqCtx),
+  eth_estimateUserOperationGas: (params, config, registry, reqCtx) => handleEstimateUserOperationGas(params, config, registry, reqCtx),
+  eth_getUserOperationByHash: (params, config, registry, reqCtx) => handleGetUserOperationByHash(params, config, registry, reqCtx),
+  eth_getUserOperationReceipt: (params, config, registry, reqCtx) => handleGetUserOperationReceipt(params, config, registry, reqCtx),
+  eth_supportedEntryPoints: (_params, config) => [config.entryPointAddress],
+  eth_chainId: (_params, _config, _registry, reqCtx) => "0x" + reqCtx.chainId.toString(16),
+  pimlico_getUserOperationGasPrice: (_params, config, registry, reqCtx) => handleGetUserOperationGasPrice(config, registry, reqCtx),
+  vela_getInBandGasQuote: (params, config, registry, reqCtx) => handleGetInBandGasQuote(params, config, registry, reqCtx),
+};
+
+/** The exact set of JSON-RPC methods this bundler exposes (the dispatch-table keys). */
+export const EXPOSED_RPC_METHODS: readonly string[] = Object.keys(RPC_METHOD_HANDLERS);
+
+/**
+ * Dispatch an RPC method to its handler. Unknown method → methodNotFound (-32601).
  */
 export async function handleRpcMethod(
   method: string,
@@ -93,26 +122,9 @@ export async function handleRpcMethod(
   chainRegistry: ChainRegistryLike,
   reqCtx: RequestContext,
 ): Promise<unknown> {
-  switch (method) {
-    case "eth_sendUserOperation":
-      return await handleSendUserOperation(params, config, chainRegistry, reqCtx);
-    case "eth_estimateUserOperationGas":
-      return await handleEstimateUserOperationGas(params, config, chainRegistry, reqCtx);
-    case "eth_getUserOperationByHash":
-      return handleGetUserOperationByHash(params, config, chainRegistry, reqCtx);
-    case "eth_getUserOperationReceipt":
-      return handleGetUserOperationReceipt(params, config, chainRegistry, reqCtx);
-    case "eth_supportedEntryPoints":
-      return [config.entryPointAddress];
-    case "eth_chainId":
-      return "0x" + reqCtx.chainId.toString(16);
-    case "pimlico_getUserOperationGasPrice":
-      return await handleGetUserOperationGasPrice(config, chainRegistry, reqCtx);
-    case "vela_getInBandGasQuote":
-      return await handleGetInBandGasQuote(params, config, chainRegistry, reqCtx);
-    default:
-      throw methodNotFound(method);
-  }
+  const handler = RPC_METHOD_HANDLERS[method];
+  if (!handler) throw methodNotFound(method);
+  return await handler(params, config, chainRegistry, reqCtx);
 }
 
 async function resolveChain(
@@ -525,9 +537,17 @@ async function handleGetInBandGasQuote(
   const recipient = vaultActiveForChain(config.settlementVaultChains, reqCtx.chainId)
     ? config.treasuryAddress
     : eoa.address;
-  const requiredNative = nativeCost * IN_BAND_MARKUP_X;
+
+  // Read chain metadata from the RESOLVED chain services, falling back to config: in the
+  // CF worker this handler receives the GLOBAL config (chainInfo null, rpcUrl "") — reading
+  // config directly made every stablecoin quote 400 "unsupported" in production.
+  const chainInfo = chain.chainInfo ?? config.chainInfo;
 
   if (!arg.feeToken) {
+    // Native: markupX × cost, floored at 1e-5 of a native coin (the sibling of the $0.01 stable
+    // floor) so a near-free-gas chain still charges a nonzero minimum. Must match the submit gate.
+    const nativeDecimals = chainInfo?.nativeCurrency?.decimals ?? 18;
+    const requiredNative = requiredNativeCharge(nativeCost, IN_BAND_MARKUP_X, nativeDecimals);
     return {
       recipient,
       asset: "native",
@@ -538,10 +558,6 @@ async function handleGetInBandGasQuote(
   }
 
   // Stablecoin: must be whitelisted; priced by the chain's DEX; charge floored at $0.01.
-  // Read chain metadata from the RESOLVED chain services, falling back to config: in the
-  // CF worker this handler receives the GLOBAL config (chainInfo null, rpcUrl "") — reading
-  // config directly made every stablecoin quote 400 "unsupported" in production.
-  const chainInfo = chain.chainInfo ?? config.chainInfo;
   const stable = getAddress(arg.feeToken);
   const stables = (chainInfo?.stables ?? []).map((s) => {
     try {

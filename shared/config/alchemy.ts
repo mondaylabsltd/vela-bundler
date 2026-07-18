@@ -43,6 +43,9 @@ const ALCHEMY_CHAINS: Record<number, string> = {
   56: "bnb-mainnet",
   97: "bnb-testnet",
 
+  // ── X Layer (OKX) ──
+  196: "xlayer-mainnet",
+
   // ── Avalanche C-Chain ──
   43114: "avax-mainnet",
   43113: "avax-fuji",

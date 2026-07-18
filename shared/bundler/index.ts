@@ -24,7 +24,13 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ENTRYPOINT_V07_ABI } from "../contracts/entrypoint.ts";
-import { getPublicClient, RPC_REDIRECT_MODE } from "../utils/rpc-client.ts";
+import {
+  getPublicClient,
+  getFailoverPublicClient,
+  buildFallbackTransport,
+  trustedMoneyPathRpcs,
+  RPC_REDIRECT_MODE,
+} from "../utils/rpc-client.ts";
 import { RPC_TIMEOUT_MS } from "../utils/timeout.ts";
 import { metrics, redactError } from "../reliability/log.ts";
 import { getClassification } from "../reliability/errors.ts";
@@ -46,7 +52,7 @@ import {
   calcOuterTxGasPrice,
   checkBundleProfitability,
 } from "../gas/profitability.ts";
-import { quoteNativeToStable, stableDecimals, stableFloorUnits } from "../gas/stable-rate.ts";
+import { quoteNativeToStable, stableDecimals, stableFloorUnits, nativeFloorWei } from "../gas/stable-rate.ts";
 import { computeOuterGas, reverseMarkup, markupToBps } from "../gas/fee-model.ts";
 import { parseValidationData, isValidTimeRange } from "../userop/validate.ts";
 import { chainSpecEnables } from "../config/vault.ts";
@@ -194,6 +200,16 @@ const CANCELLATION_GAS = 100_000n;
  *  pinned pool EOA in minutes instead of the ~1h abandonment timeout, and a failed cancellation is
  *  retried (with a recomputed fee) rather than latched off. */
 const CANCELLATION_AFTER_MS = 120_000;
+
+/** Hard cancellation escape hatch: once a tx has been stuck this long WITHOUT a successful
+ *  fee-bump (bumpCount never reached MAX_FEE_BUMPS because every bump was refused — over the
+ *  revenue ceiling, or the EOA couldn't afford it), cancel anyway so the pinned pool EOA is
+ *  unbricked in minutes instead of sitting until the ~1h abandonment. Without this a tx that
+ *  can neither land nor be bumped deadlocks: bumpCount stays 0, so the normal
+ *  `bumpCount >= MAX_FEE_BUMPS` cancellation gate never opens. The trading window is long gone
+ *  by here, so replacing it with a 0-value self-transfer (exactly one of {original, cancel}
+ *  mines — never a double execution) is the correct recovery. */
+const CANCELLATION_HARD_MS = 180_000;
 
 /** Consecutive "nonce consumed but no receipt" observations required before a tx is
  *  declared replaced/dropped. Closes the race where the receipt read transiently errors
@@ -389,6 +405,10 @@ export class EnqueueAmbiguousError extends Error {
 export class BundlerService {
   private receiptStore: Map<string, { receipt: UserOperationReceipt; expiresAt: number }> = new Map();
   private readonly publicClient: PublicClient<Transport, Chain>;
+  /** Ordered, deduped TRUSTED RPC set (primary + registry public RPCs) for money-path reads and
+   *  broadcast. NEVER a user X-Rpc-Url override — see trustedMoneyPathRpcs. Rate-limit / degraded
+   *  failover walks this list so a single throttled endpoint can't strand a bundle at "submitted". */
+  private readonly moneyPathRpcs: string[];
   private autoBundleTimer?: ReturnType<typeof setInterval>;
   private receiptCleanupTimer?: ReturnType<typeof setInterval>;
   private currentBundlingMode: "auto" | "manual";
@@ -483,8 +503,12 @@ export class BundlerService {
     this.currentBundlingMode = config.bundlingMode;
     this.disableTimers = options?.disableTimers ?? false;
     this.fixedPoolIndex = options?.fixedPoolIndex;
-    // Tuned, cached read client (explicit timeout + bounded retry — see rpc-client.ts).
-    this.publicClient = getPublicClient(config.rpcUrl);
+    // Trusted RPC set for the money path (broadcast + nonce + receipt reconciliation).
+    this.moneyPathRpcs = trustedMoneyPathRpcs(config);
+    // Tuned, cached read client that FAILS OVER across the trusted set: a rate-limited / degraded
+    // primary must not stall nonce reads or receipt reconciliation (which strands an accepted op at
+    // "submitted" — the wallet polls forever). viem uses the primary alone while it is healthy.
+    this.publicClient = getFailoverPublicClient(this.moneyPathRpcs);
     // A TTL-evicted op must not vanish silently: store a terminal success=false receipt so the
     // wallet gets a definitive "dropped, resubmit" instead of polling eth_getUserOperationReceipt
     // → null forever (which is indistinguishable from "never seen").
@@ -1266,6 +1290,18 @@ export class BundlerService {
       // op that would leave us unpaid. Fails closed — no proof of success ⇒ no submit.
       const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
       if (!execCheck.success) {
+        // Capability failure (RPC can't run eth_simulateV1 and the eth_call probe couldn't decide,
+        // or a multi-op / deploy op): NOT an op defect — defer, never drop/penalize (see in-band).
+        if (execCheck.transient) {
+          metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "exec_sim_unavailable" });
+          this.lastSubmitError = execCheck.errorMessage ?? "execution sim unavailable";
+          console.warn(`[Bundler][Tempo] DEFER — execution unverifiable (RPC capability): ${execCheck.errorMessage}`);
+          return {
+            submitted: false,
+            userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+            error: `Tempo execution unverifiable (RPC lacks eth_simulateV1): ${execCheck.errorMessage}`,
+          };
+        }
         if (execCheck.failedOpIndex !== undefined) {
           const failed = checkedEntries[execCheck.failedOpIndex];
           if (failed) {
@@ -1329,6 +1365,20 @@ export class BundlerService {
       // floor land in step 8 (empty token allowlist here → native-only). See docs/.
       const execCheck = await this.simulator.simulateExecutionSuccess(packedOps, beneficiary, eoa.address, rpcOverride, dl);
       if (!execCheck.success) {
+        // Capability failure (no RPC could run eth_simulateV1 AND the eth_call probe couldn't decide,
+        // or a multi-op / deploy op we won't verify via eth_call): NOT an op defect. Keep the op
+        // (defer) — never dropWithReceipt / penalize — so an RPC limitation is not surfaced to the
+        // wallet as a terminal "failed". It retries next cycle (or the queue reassembles single-op).
+        if (execCheck.transient) {
+          metrics.inc("bundle_skipped_total", 1, { chain: this.config.chainId, reason: "exec_sim_unavailable" });
+          this.lastSubmitError = execCheck.errorMessage ?? "execution sim unavailable";
+          console.warn(`[Bundler][InBand] DEFER — execution unverifiable (RPC capability): ${execCheck.errorMessage}`);
+          return {
+            submitted: false,
+            userOpHashes: checkedEntries.map((e) => e.entry.userOpHash),
+            error: `In-band execution unverifiable (RPC lacks eth_simulateV1): ${execCheck.errorMessage}`,
+          };
+        }
         if (execCheck.failedOpIndex !== undefined) {
           const failed = checkedEntries[execCheck.failedOpIndex];
           if (failed) {
@@ -1387,15 +1437,24 @@ export class BundlerService {
         const dec = await stableDecimals(client, stable);
         stableInfo.set(stableLower, { costStable, floorNative: (stableFloorUnits(dec) * costNative) / costStable });
       }
-      // native-equiv of one op's legs, and a floor = max(baseFloor, the op's per-stablecoin $0.01
-      // native-equiv floors). `baseFloor` differs by caller: the AGGREGATE backstop seeds it with
-      // requiredNative (the whole-bundle 2× cost, which it only ever raises); the PER-OP pool gate
-      // seeds it with 0n — a single op must clear its OWN 2× share (+ its own $0.01 stable floor),
-      // NOT 2× the entire bundle. Seeding the per-op floor with requiredNative was the bug that
-      // dropped 100% of multi-op pool bundles (perOpCost×2 ≤ 2×costNative = requiredNative ∀ n≥1).
+      // Minimum-charge floors, in native wei — the submit-gate half of the two per-asset floors the
+      // quote endpoint applies (handlers.ts): 1e-5 of a native coin for a native leg, $0.01 for a
+      // stablecoin leg (each converted to native-equiv). Guarded PER LEG so a stable-only op keeps
+      // its $0.01 floor and is never inflated by the native floor (they are not equal — 1e-5 native
+      // is worth more than $0.01 on a high-value-native chain), matching the quote's per-asset split.
+      const nativeFloor = nativeFloorWei(this.config.chainInfo?.nativeCurrency?.decimals ?? 18);
+
+      // native-equiv of one op's legs, and a floor = max(baseFloor, this op's applicable per-asset
+      // floors). `baseFloor` differs by caller: the AGGREGATE backstop seeds it with requiredNative
+      // (the whole-bundle 2× cost, which it only ever raises); the PER-OP pool gate seeds it with 0n
+      // — a single op must clear its OWN 2× share (+ its own floor), NOT 2× the entire bundle. Seeding
+      // the per-op floor with requiredNative was the bug that dropped 100% of multi-op pool bundles
+      // (perOpCost×2 ≤ 2×costNative = requiredNative ∀ n≥1).
       const valueOf = (legs: { native: bigint; byToken: Record<string, bigint> }, baseFloor: bigint) => {
         let equiv = legs.native;
         let floor = baseFloor;
+        // Native leg → enforce the 1e-5-native minimum (sibling of the $0.01 stable floor below).
+        if (legs.native > 0n && nativeFloor > floor) floor = nativeFloor;
         for (const [t, amt] of Object.entries(legs.byToken)) {
           if (amt <= 0n) continue;
           const info = stableInfo.get(t)!;
@@ -1415,7 +1474,7 @@ export class BundlerService {
         const underpayers: number[] = [];
         for (let i = 0; i < checkedEntries.length; i++) {
           // Per-op floor seeds at 0n: this op need only cover its OWN 2× share (raised by its own
-          // $0.01 stablecoin floor), not 2× the whole bundle.
+          // per-asset minimum — 1e-5 native / $0.01 stablecoin), not 2× the whole bundle.
           const { equiv, floor } = valueOf(perOpLegs[i]!, 0n);
           const need = perOpCost * IN_BAND_GATE_MARKUP_X > floor ? perOpCost * IN_BAND_GATE_MARKUP_X : floor;
           if (equiv < need) underpayers.push(i);
@@ -1436,12 +1495,12 @@ export class BundlerService {
       }
 
       // Aggregate backstop (operator profitability). Sum every op's native-equiv; the required
-      // amount rises to the highest per-stable $0.01 floor seen.
+      // amount rises to the highest per-asset floor seen (1e-5 native / $0.01 stablecoin).
       let reimbursedNativeEquiv = 0n;
       let native = 0n;
       for (const legs of perOpLegs) {
         // Aggregate backstop: seed the floor with requiredNative (the whole-bundle 2× cost) — the
-        // loop only ever raises requiredNative to the highest per-stable $0.01 floor seen.
+        // loop only ever raises requiredNative to the highest per-asset floor seen.
         const { equiv, floor } = valueOf(legs, requiredNative);
         reimbursedNativeEquiv += equiv;
         native += legs.native;
@@ -1551,17 +1610,20 @@ export class BundlerService {
     // Reserve balance atomically (route-A native only — in-band settles by reimbursement).
     if (!inBand) this.accountService.reserveBalance(eoa.address, expectedCost);
 
-    // SECURITY: sign & broadcast ONLY via the bundler's own trusted RPC, never the
-    // user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC leaks it and lets
-    // the attacker drop/withhold it or feed lies into the (subsequent) reconciliation.
-    // The user RPC (rpcOverride) is still used for the read-only sim/gas/balance above,
-    // where the worst case is the user grieving their OWN op. (On mainnet config.rpcUrl is
-    // Alchemy/public; on a dev chain it is whatever the registry resolved.)
+    // SECURITY: sign & broadcast ONLY via the bundler's own TRUSTED RPC set (primary + registry
+    // public RPCs), never the user-supplied X-Rpc-Url. Submitting a signed tx to an attacker RPC
+    // leaks it and lets the attacker drop/withhold it or feed lies into the (subsequent)
+    // reconciliation. The user RPC (rpcOverride) is still used for the read-only sim/gas/balance
+    // above, where the worst case is the user grieving their OWN op.
+    //   Failover: the raw tx is signed locally with a PINNED nonce and precomputed hash, so
+    //   re-broadcasting the SAME bytes to a fallback RPC after the primary rate-limits is
+    //   idempotent ("already known" / identical hash) — never a second position. viem's fallback
+    //   advances on 429 / 5xx / timeout but fast-fails on a definitive tx rejection.
     const account = privateKeyToAccount(eoa.privateKey!);
-    const submitRpcUrl = this.config.rpcUrl;
+    const submitRpcUrl = this.moneyPathRpcs[0] ?? this.config.rpcUrl;
     const walletClient = createWalletClient({
       account,
-      transport: http(submitRpcUrl, BROADCAST_TRANSPORT_OPTS),
+      transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0),
     });
 
     const calldata = encodeHandleOps(packedOps, beneficiary);
@@ -2080,8 +2142,12 @@ export class BundlerService {
         // constant → no "underpriced" stall; legacy/unpinned receipts have no nonce to cancel).
         if (
           pending.txNonce !== undefined &&
-          (pending.bumpCount ?? 0) >= MAX_FEE_BUMPS &&
-          Date.now() - pending.submittedAt > CANCELLATION_AFTER_MS &&
+          // Normal path: fee-bumps exhausted at 2 min. Escape hatch: a tx stuck past the hard
+          // bound whose bumps were all REFUSED (ceiling / unaffordable → bumpCount still 0) —
+          // otherwise it deadlocks and bricks the pool EOA until the ~1h abandonment.
+          ((pending.bumpCount ?? 0) >= MAX_FEE_BUMPS
+            ? Date.now() - pending.submittedAt > CANCELLATION_AFTER_MS
+            : Date.now() - pending.submittedAt > CANCELLATION_HARD_MS) &&
           Date.now() - (pending.lastCancelAt ?? 0) > CANCELLATION_AFTER_MS
         ) {
           try {
@@ -2176,13 +2242,19 @@ export class BundlerService {
     }
     if (newTip > newMax) newTip = newMax;
 
-    // The EOA must afford the new worst-case prefund.
+    // The EOA must afford the new worst-case prefund. If it can't, this is a NEEDS-TOP-UP
+    // deadlock, not a benign skip: a stuck underpriced tx on a drained pool EOA can never be
+    // bumped, and cancellation is gated behind bumpCount ≥ MAX_FEE_BUMPS which therefore never
+    // advances — so the op sits in-flight until it is abandoned (a guaranteed miss on the
+    // 5-minute window). Flag it so the treasury refill (/fund-eoa) tops the EOA up NOW; the next
+    // reconcile cycle then affords the bump. Mirrors tryCancellation's insufficient-funds path.
     const newPrefund = pending.txGas! * newMax;
     const balance = await this.publicClient.getBalance({ address: pending.eoaAddress });
     if (balance < newPrefund) {
+      this.flagInsufficientFunds(pending.eoaAddress, newPrefund);
       console.warn(
-        `[Bundler] fee-bump for ${pending.txHash} skipped: EOA ${pending.eoaAddress} balance ` +
-          `${balance} < required prefund ${newPrefund}`,
+        `[Bundler] fee-bump for ${pending.txHash} deferred: EOA ${pending.eoaAddress} balance ` +
+          `${balance} < required prefund ${newPrefund} — flagged for treasury top-up, retrying next cycle`,
       );
       return;
     }
@@ -2205,7 +2277,7 @@ export class BundlerService {
     const account = privateKeyToAccount(eoa.privateKey);
     const walletClient = createWalletClient({
       account,
-      transport: http(this.config.rpcUrl, BROADCAST_TRANSPORT_OPTS),
+      transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0),
     });
     // Explicit gas skips the re-estimate (see invariants above).
     const request = await walletClient.prepareTransactionRequest({
@@ -2295,7 +2367,7 @@ export class BundlerService {
     if (!eoa.privateKey || eoa.address.toLowerCase() !== pending.eoaAddress.toLowerCase()) return;
 
     const account = privateKeyToAccount(eoa.privateKey);
-    const walletClient = createWalletClient({ account, transport: http(this.config.rpcUrl, BROADCAST_TRANSPORT_OPTS) });
+    const walletClient = createWalletClient({ account, transport: buildFallbackTransport(this.moneyPathRpcs, BROADCAST_TRANSPORT_OPTS, 0) });
     const request = await walletClient.prepareTransactionRequest({
       account,
       to: eoa.address, // self-transfer

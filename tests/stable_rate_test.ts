@@ -3,6 +3,8 @@ import { encodeFunctionResult, parseAbi } from "viem";
 import {
   stableFloorUnits,
   requiredStableCharge,
+  nativeFloorWei,
+  requiredNativeCharge,
   DEFAULT_FEE_TIER,
   FEE_TIER_PREFERENCE,
   quoteNativeToStable,
@@ -43,6 +45,29 @@ it("requiredStableCharge: max($0.01 floor, markup × cost)", () => {
   expect(requiredStableCharge(10_000n / 3n, 6, 3n)).toEqual(10_000n); // 3*3333=9999 < floor → floor
   // 18-dec token.
   expect(requiredStableCharge(5n * 10n ** 16n, 18, 3n)).toEqual(15n * 10n ** 16n); // markup binds
+});
+
+it("nativeFloorWei: 1e-5 of a native coin in its base units", () => {
+  expect(nativeFloorWei(18)).toEqual(10_000_000_000_000n); // 1e-5 ETH = 1e13 wei
+  expect(nativeFloorWei()).toEqual(10_000_000_000_000n); // default decimals = 18
+  expect(nativeFloorWei(6)).toEqual(10n); // 1e-5 * 1e6
+  expect(nativeFloorWei(5)).toEqual(1n); // 1e-5 * 1e5
+  expect(nativeFloorWei(4)).toEqual(0n); // sub-1e-5 precision → no floor (pre-change behaviour)
+  expect(nativeFloorWei(0)).toEqual(0n);
+});
+
+it("requiredNativeCharge: max(1e-5-native floor, markup × cost)", () => {
+  const floor18 = 10_000_000_000_000n; // 1e13 wei
+  // Tiny op: 3× cost below the floor → the floor binds.
+  expect(requiredNativeCharge(1_000_000n, 3n, 18)).toEqual(floor18); // 3e6 ≪ 1e13
+  // Normal op: 3× cost exceeds the floor → the markup binds.
+  expect(requiredNativeCharge(10n ** 13n, 3n, 18)).toEqual(3n * 10n ** 13n);
+  // Just below the boundary: 3× cost < floor → floor.
+  expect(requiredNativeCharge(floor18 / 3n, 3n, 18)).toEqual(floor18); // 3*3.33e12 = 9.99e12 < floor
+  // Default decimals = 18.
+  expect(requiredNativeCharge(1n, 3n)).toEqual(floor18);
+  // Gate markup (2×) binds once above the floor — quote (3×) and gate (2×) share the same floor.
+  expect(requiredNativeCharge(10n ** 13n, 2n, 18)).toEqual(2n * 10n ** 13n);
 });
 
 it("DEFAULT_FEE_TIER is the 0.05% Uniswap-v3 tier", () => {

@@ -36,7 +36,7 @@ import { SponsorService } from "../shared/account/sponsor.ts";
 import { LocalKeyManager } from "../shared/keys/local.ts";
 import { deriveTreasuryAddress, RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import type { ChainServices, ChainRegistryLike } from "../shared/chain/index.ts";
-import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { resolveRpcUrl, getPublicClient, getFailoverPublicClient, trustedMoneyPathRpcs } from "../shared/utils/rpc-client.ts";
 import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { reliabilityHealth } from "../shared/reliability/rpc-fetch.ts";
 import { metrics, logEvent, redactUrl } from "../shared/reliability/log.ts";
@@ -513,9 +513,6 @@ export class BundlerDO implements DurableObject {
       oldOperatorSecrets: this.config.oldOperatorSecrets,
     });
 
-    // Share the DO's alerter (one dedup map per chain isolate).
-    this.sponsorService = new SponsorService(this.config, this.alerter);
-
     // Resolve chain RPC + metadata (mirrors ChainRegistry.initChain)
     const resolved = await resolveChain(chainId, this.config.alchemyApiKey);
     const effectiveRpc = resolveRpcUrl({ rpcUrl: resolved.rpcUrl });
@@ -527,6 +524,10 @@ export class BundlerDO implements DurableObject {
       publicRpcs: resolved.publicRpcs,
       chainInfo: resolved.chain,
     };
+
+    // Share the DO's alerter (one dedup map per chain isolate). Built with the CHAIN config so the
+    // treasury top-up path has this chain's publicRpcs and can fail over off a rate-limited primary.
+    this.sponsorService = new SponsorService(chainConfig, this.alerter);
 
     const simulator = createSimulator(chainConfig);
     const mempool = new Mempool({
@@ -1191,7 +1192,9 @@ export class BundlerDO implements DurableObject {
     try {
       const locked = this.chainServices.accountService.lockManager.getLockedEOAs();
       if (locked.length > 0) {
-        const client = getPublicClient(this.chainServices.rpcUrl);
+        // Fail over across the trusted RPC set: a rate-limited primary must not leave a locked
+        // EOA (funds stuck) unrecoverable cycle after cycle.
+        const client = getFailoverPublicClient(trustedMoneyPathRpcs(this.chainServices));
         let recovered = 0;
         for (const eoa of locked) {
           try {
@@ -1221,7 +1224,7 @@ export class BundlerDO implements DurableObject {
           chainId: this.chainId,
           chainName: this.chainServices.chainInfo?.name ?? null,
           treasuryAddress: this.config.treasuryAddress,
-          client: getPublicClient(this.chainServices.rpcUrl),
+          client: getFailoverPublicClient(trustedMoneyPathRpcs(this.chainServices)),
           thresholdWei: this.config.treasuryAlertThresholdWei,
           thresholdPathUsd: this.config.treasuryAlertThresholdPathUsd,
           alerter: this.alerter,

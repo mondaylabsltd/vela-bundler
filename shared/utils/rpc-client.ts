@@ -4,6 +4,7 @@
 
 import {
   createPublicClient,
+  fallback,
   http,
   type PublicClient,
   type Transport,
@@ -189,6 +190,81 @@ export function getPublicClient(rpcUrl: string): PublicClient<Transport, Chain> 
       transport: http(rpcUrl, READ_TRANSPORT_OPTS),
     }) as PublicClient<Transport, Chain>;
     clientCache.set(rpcUrl, client);
+  }
+  return client;
+}
+
+/**
+ * The ORDERED, deduped set of TRUSTED RPC URLs for money-path calls (nonce pin, broadcast,
+ * receipt reconciliation): the resolved primary first (Alchemy when configured, else the
+ * registry's health-picked public RPC), then the remaining registry public RPCs.
+ *
+ * SECURITY: this set is registry-resolved ONLY — it MUST NOT contain a per-request X-Rpc-Url
+ * override. It is the set we are willing to SIGN AND BROADCAST to, so a caller-supplied RPC
+ * (which could leak the signed tx, withhold it, or feed lies into reconciliation) is excluded
+ * by construction. Read-only simulation/gas quoting handles the user override separately.
+ */
+export function trustedMoneyPathRpcs(config: { rpcUrl: string; publicRpcs?: string[] }): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const u of [config.rpcUrl, ...(config.publicRpcs ?? [])]) {
+    if (u && !seen.has(u)) {
+      seen.add(u);
+      out.push(u);
+    }
+  }
+  return out;
+}
+
+/**
+ * Build a viem `fallback` transport over an ORDERED list of trusted RPC URLs. viem tries them
+ * in order and advances to the NEXT one on a transport-level failure (network error, timeout,
+ * HTTP 429 rate-limit, 5xx) — it does NOT advance (fast-fails) on a definitive tx rejection
+ * (TransactionRejected / UserRejected / ExecutionReverted), so failover never masks a real
+ * rejection nor amplifies a bad request. viem also forces each inner transport to
+ * `retryCount: 0`, so the URL walk is the retry — no per-URL amplification.
+ *
+ * For broadcast (`sendRawTransaction`) this is idempotent by construction: the tx is signed
+ * locally with a PINNED nonce and its hash is precomputed, so re-sending the SAME bytes to a
+ * second RPC after the first rate-limits either lands the identical tx or returns
+ * "already known" — never a second, distinct on-chain position.
+ */
+export function buildFallbackTransport(
+  rpcUrls: string[],
+  httpOpts?: Parameters<typeof http>[1],
+  fallbackRetryCount = 1,
+): Transport {
+  const urls = rpcUrls.filter((u, i) => u && rpcUrls.indexOf(u) === i);
+  const list = urls.length > 0 ? urls : rpcUrls.slice(0, 1);
+  return fallback(
+    list.map((u) => http(u, httpOpts)),
+    { retryCount: fallbackRetryCount, retryDelay: 150 },
+  );
+}
+
+/** Cache of failover clients keyed by the ordered RPC-URL list. Bounded like clientCache. */
+const failoverClientCache = new Map<string, PublicClient<Transport, Chain>>();
+
+/**
+ * Get or create a read PublicClient that FAILS OVER across the given trusted RPC URLs (see
+ * buildFallbackTransport). Use for money-path reads (nonce, receipts, balances) so a single
+ * rate-limited / degraded endpoint does not stall reconciliation or brick a locked EOA.
+ * When the primary is healthy viem uses ONLY it — a fallback URL is touched solely on failure.
+ */
+export function getFailoverPublicClient(rpcUrls: string[]): PublicClient<Transport, Chain> {
+  const list = rpcUrls.filter((u, i) => u && rpcUrls.indexOf(u) === i);
+  if (list.length <= 1) return getPublicClient(list[0] ?? rpcUrls[0] ?? "");
+  const key = list.join("|");
+  let client = failoverClientCache.get(key);
+  if (!client) {
+    if (failoverClientCache.size >= CLIENT_CACHE_MAX) {
+      const oldest = failoverClientCache.keys().next().value;
+      if (oldest !== undefined) failoverClientCache.delete(oldest);
+    }
+    client = createPublicClient({
+      transport: buildFallbackTransport(list, READ_TRANSPORT_OPTS),
+    }) as PublicClient<Transport, Chain>;
+    failoverClientCache.set(key, client);
   }
   return client;
 }

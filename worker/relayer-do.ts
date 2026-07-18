@@ -36,7 +36,7 @@ import { LocalKeyManager } from "../shared/keys/local.ts";
 import { RELAYER_POOL_SIZE } from "../shared/keys/derive.ts";
 import { deriveTreasuryAddress } from "../shared/keys/derive.ts";
 import type { ChainServices } from "../shared/chain/index.ts";
-import { resolveRpcUrl, getPublicClient } from "../shared/utils/rpc-client.ts";
+import { resolveRpcUrl, getPublicClient, getFailoverPublicClient, trustedMoneyPathRpcs } from "../shared/utils/rpc-client.ts";
 import { alarmIsLive, ALARM_TIGHT_GRACE_MS, ALARM_IN_FLIGHT_WEDGE_MS } from "../shared/utils/alarm-liveness.ts";
 import { metrics, logEvent, redactError } from "../shared/reliability/log.ts";
 import { normalizeUserOp } from "../shared/userop/normalize.ts";
@@ -60,6 +60,14 @@ const RECEIPT_KEY_PREFIX = "rc:";
 /** Consecutive fully-idle alarm cycles before the alarm stops re-arming (~5 min @ 10s). A
  *  /submit re-arms instantly via the kick hook, so an idle stop can never strand an op. */
 const IDLE_STOP_CYCLES = 30;
+
+/** Proactive float floor for THIS RelayerDO's pinned pool EOA (native wei), used only when
+ *  config.poolFloatMinWei is unset. An in-band fronting EOA is reimbursed in the fee TOKEN, never
+ *  in native — so its gas balance only drains and MUST be refilled from the treasury. The chain
+ *  DO's proactive sweep idle-stops in queue mode, so each RelayerDO keeps its OWN EOA above this
+ *  floor (via /fund-eoa) while it has work — the fix for a pool EOA draining until bundles/fee-bumps
+ *  can no longer afford gas and ops get stuck. Mirrors POOL_FLOAT_MIN_WEI_DEFAULT in sponsor.ts. */
+const RELAYER_FLOAT_MIN_WEI_DEFAULT = 500_000_000_000_000n; // 0.0005 native
 
 /** Bound on the persisted dedup seen-set (FIFO). Queues are at-least-once but redelivery
  *  windows are short; this only guards against re-submitting an op whose in-flight/terminal
@@ -456,6 +464,19 @@ export class RelayerDO implements DurableObject {
         console.error(`[RelayerDO:${this.chainId}#${this.poolIndex}] recovery error:`, err);
       }
 
+      // Proactive float: keep THIS pool EOA above the float floor from the treasury BEFORE a
+      // bundle/fee-bump runs out of gas — the reactive /fund-eoa (bounce-driven) is "just in time"
+      // and on a 5-minute window that is a miss. An in-band EOA is reimbursed in the fee token, so
+      // its native gas only drains; the chain-DO proactive sweep idle-stops in queue mode, so the
+      // top-up must originate here.
+      try {
+        await this.ensureFrontingEoaFloat(cs);
+        this.escalator.ok("relayer-float", this.chainId);
+      } catch (err) {
+        console.error(`[RelayerDO:${this.chainId}#${this.poolIndex}] float check error:`, err);
+        await this.escalator.note("relayer-float", this.chainId, err);
+      }
+
       cs.bundler.cleanExpiredReceipts();
 
       // Re-assert recent terminal-receipt KV writes (belt-and-suspenders for a dropped put; the
@@ -531,6 +552,41 @@ export class RelayerDO implements DurableObject {
     } catch (err) {
       console.error(`[RelayerDO:${this.chainId}#${this.poolIndex}] alarm cycle error:`, err);
     }
+  }
+
+  /**
+   * Keep this RelayerDO's pinned pool EOA above the float floor by asking the CHAIN DO to top it
+   * up from the treasury. All treasury sends funnel through the single chain-DO SponsorService
+   * (/fund-eoa → runTreasuryExclusive) so the 100 relayers never race the treasury nonce. Runs
+   * each alarm cycle while this relayer has work; a no-op once the EOA is funded (topUpFloatEOA
+   * re-checks and only sends when below its target) and inert on non-vault chains (handleFundEoa's
+   * own gate). This is the proactive "keep the fronting EOA funded" the idle-stopping chain-DO
+   * sweep can no longer guarantee in queue mode.
+   */
+  private async ensureFrontingEoaFloat(cs: ChainServices): Promise<void> {
+    // Only when this relayer is actually in use — don't have 100 idle DOs each polling a balance.
+    if (cs.mempool.size === 0 && cs.bundler.pendingReceiptCount === 0) return;
+    if (this.poolIndex < 0) return;
+
+    const eoa = (await cs.accountService.getPoolEOA(this.poolIndex)).address;
+    const client = getFailoverPublicClient(trustedMoneyPathRpcs(cs));
+    const balance = await client.getBalance({ address: eoa });
+    const minWei = this.config?.poolFloatMinWei ?? RELAYER_FLOAT_MIN_WEI_DEFAULT;
+    if (balance >= minWei) return;
+
+    // Below the floor — request a treasury top-up (no shortfall hint → the chain DO funds to the
+    // static float target). Fast-retry our alarm when funding is under way so the just-funded EOA
+    // re-bundles promptly instead of waiting a full cycle; back off to normal cadence otherwise
+    // (treasury depleted / budget exhausted already alert + would only pile RPC load).
+    const stub = this.env.BUNDLER.get(this.env.BUNDLER.idFromName(`chain-${this.chainId}`));
+    const u = `https://bundler-do/fund-eoa?chainId=${this.chainId}&address=${eoa}`;
+    const res = await stub.fetch(new Request(u, { method: "POST" }));
+    const body = await res.json().catch(() => null) as FundEoaResult | null;
+    console.warn(
+      `[RelayerDO:${this.chainId}#${this.poolIndex}] pool EOA ${eoa} float low (${balance} < ${minWei}) — ` +
+        `requested treasury top-up: ${body?.reason ?? (body?.toppedUp ? "topped_up" : "requested")}`,
+    );
+    if (fundingUnderway(res.ok, body)) await this.state.storage.setAlarm(Date.now() + 4_000);
   }
 
   private async ensureInitialized(chainId: number, index: number): Promise<void> {

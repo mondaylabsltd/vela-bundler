@@ -166,17 +166,23 @@ For **gas-price reads**, when the primary is the paid managed (Alchemy) RPC it i
 
 ## API
 
+> **Full contract:** [`docs/api-contract.md`](docs/api-contract.md) is the authoritative,
+> type-level reference (every request/response shape, error code, and envelope rule) — the
+> pin a refactor must preserve. The tables below are the summary.
+
 ### JSON-RPC: `POST /:chainId`
 
 
-| Method                         | Description                                            |
-| -------------------------------- | -------------------------------------------------------- |
-| `eth_sendUserOperation`        | Submit UserOp (checks balance, binding, profitability) |
-| `eth_estimateUserOperationGas` | Estimate gas limits                                    |
-| `eth_getUserOperationByHash`   | Get UserOp by hash                                     |
-| `eth_getUserOperationReceipt`  | Get receipt                                            |
-| `eth_supportedEntryPoints`     | List EntryPoints                                       |
-| `eth_chainId`                  | Chain ID                                               |
+| Method                              | Description                                             |
+| ------------------------------------- | -------------------------------------------------------- |
+| `eth_sendUserOperation`             | Submit UserOp (checks balance, binding, profitability) |
+| `eth_estimateUserOperationGas`      | Estimate gas limits                                    |
+| `eth_getUserOperationByHash`        | Get UserOp by hash                                     |
+| `eth_getUserOperationReceipt`       | Get receipt                                             |
+| `eth_supportedEntryPoints`          | List EntryPoints                                       |
+| `eth_chainId`                       | Chain ID                                               |
+| `pimlico_getUserOperationGasPrice`  | 3-tier gas price quote (network/relayer split)         |
+| `vela_getInBandGasQuote`            | In-band gas reimbursement sizing (native / stablecoin) |
 
 All methods support `X-Rpc-Url` header. Batch requests capped at 20.
 

@@ -124,3 +124,66 @@ it("simulateExecutionSuccess: FAILS CLOSED when fetch throws", async () => {
     expect(r.success).toEqual(false);
   });
 });
+
+// --- eth_call fallback (RPCs without eth_simulateV1, e.g. X Layer free tier) ---
+// Route responses by JSON-RPC method so we can drive "eth_simulateV1 unavailable → eth_call decides".
+function mockByMethod(byMethod: Record<string, unknown>) {
+  globalThis.fetch = ((_url: unknown, init?: { body?: string }) => {
+    let method = "";
+    try { method = JSON.parse(init?.body ?? "{}").method ?? ""; } catch { /* ignore */ }
+    const resp = byMethod[method] ?? byMethod["*"] ?? { error: { message: `unmocked ${method}` } };
+    return Promise.resolve(new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } }));
+  }) as typeof fetch;
+}
+async function withMethodMock(byMethod: Record<string, unknown>, fn: () => Promise<void>) {
+  mockByMethod(byMethod);
+  try { await fn(); } finally { globalThis.fetch = realFetch; }
+}
+const V1_UNAVAILABLE = { error: { code: 35, message: "method is not available on freetier, please upgrade to paid tier" } };
+
+it("fallback: eth_simulateV1 unavailable + single deployed op + eth_call OK → success (no gasUsed)", async () => {
+  await withMethodMock({ eth_simulateV1: V1_UNAVAILABLE, eth_call: { result: "0x" } }, async () => {
+    const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
+    expect(r.success).toEqual(true);
+    expect(r.gasUsed).toBeUndefined();
+    expect(r.transient).toBeFalsy();
+  });
+});
+
+it("fallback: eth_simulateV1 unavailable + eth_call probe REVERTS → reject with failedOpIndex (not transient)", async () => {
+  await withMethodMock({ eth_simulateV1: V1_UNAVAILABLE, eth_call: { error: { code: 3, message: "execution reverted" } } }, async () => {
+    const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
+    expect(r.success).toEqual(false);
+    expect(r.failedOpIndex).toEqual(0);
+    expect(r.transient).toBeFalsy();
+  });
+});
+
+it("fallback: eth_simulateV1 unavailable + MULTI-OP → DEFER (transient, no drop) — closes sequential-drain hole", async () => {
+  // eth_call must NOT be trusted for a multi-op bundle (per-op probe can't see cross-op state).
+  await withMethodMock({ eth_simulateV1: V1_UNAVAILABLE, eth_call: { result: "0x" } }, async () => {
+    const r = await createSimulator(config).simulateExecutionSuccess([op(), op()], BENE);
+    expect(r.success).toEqual(false);
+    expect(r.transient).toEqual(true);
+    expect(r.failedOpIndex).toBeUndefined();
+  });
+});
+
+it("fallback: eth_simulateV1 unavailable + undeployed account (initCode present) → DEFER (transient)", async () => {
+  const deployOp = { ...op(), initCode: "0xabcabcabc0000000000000000000000000000000deadbeef" as `0x${string}` };
+  await withMethodMock({ eth_simulateV1: V1_UNAVAILABLE, eth_call: { result: "0x" } }, async () => {
+    const r = await createSimulator(config).simulateExecutionSuccess([deployOp], BENE);
+    expect(r.success).toEqual(false);
+    expect(r.transient).toEqual(true);
+  });
+});
+
+it("fallback NOT taken: a genuine UserOperationEvent.success=false verdict still rejects (never transient)", async () => {
+  // eth_simulateV1 RAN and returned a real verdict — must reject as a defect, not defer.
+  await withMethodMock({ eth_simulateV1: { result: [{ calls: [{ status: "0x1", logs: [uoeLog(false, 0)] }] }] }, eth_call: { result: "0x" } }, async () => {
+    const r = await createSimulator(config).simulateExecutionSuccess([op()], BENE);
+    expect(r.success).toEqual(false);
+    expect(r.failedOpIndex).toEqual(0);
+    expect(r.transient).toBeFalsy();
+  });
+});
