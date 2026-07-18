@@ -84,6 +84,18 @@ export interface BundlerConfig {
    *  hash(sender)%100 to a per-EOA RelayerDO. Requires pool mode (POOL_EOA_ENABLED) + vault.
    *  Resolve via chainSpecEnables. Default off → the in-DO mempool path (Stage 3) unchanged. */
   readonly queueTransportChains?: string;
+  /** Per-chain spec for the dynamic-lease coordinator (DYNAMIC_LEASE_ENABLED env: "" | "true"/
+   *  "all" | chainId CSV). When active on a chain, the queue consumer asks the per-chain
+   *  BundlerDO coordinator for a FREE pool index (sender-sticky while in-flight) instead of the
+   *  static hash(sender)%width routing. Requires queue transport. Resolve via chainSpecEnables.
+   *  Default off → the static hash routing (relayerIndexForSender) is unchanged. */
+  readonly dynamicLeaseChains?: string;
+  /** How many pool EOAs new traffic spreads across (the hash fallback's modulus AND the
+   *  dynamic-lease coordinator's [0, width-1] range). Decoupled from the key-derivation ceiling
+   *  RELAYER_POOL_SIZE so the active fleet can shrink with no migration hazard. Default 10,
+   *  overridden by POOL_ROUTING_WIDTH. Optional in the type (defaulted to RELAYER_ROUTING_WIDTH
+   *  at every read site) so existing BundlerConfig literals/tests need no change. */
+  readonly routingWidth?: number;
   /** Pool relayer float: top up a pool EOA when its native balance falls below this (wei).
    *  Default 0.0005 native. Stage 2 top-up loop. */
   readonly poolFloatMinWei?: bigint;

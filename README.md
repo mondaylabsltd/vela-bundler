@@ -49,7 +49,7 @@ Where a UserOp flows and how each failure is handled. Watch any op live at **`GE
  2. ACCEPT  acceptUserOp — transport is flag-gated:
     ├─ QUEUE off ─▶ DO mempool  (persisted mp:<hash>)  ── kicks the alarm
     └─ QUEUE on  ─▶ Cloudflare Queue + KV 'accepted' marker
-                     └─ consumer routes hash(sender)%100 ─▶ RelayerDO /submit
+                     └─ consumer leases a FREE pool EOA (or hash fallback) ─▶ RelayerDO /submit
                           └─▶ RelayerDO mempool  (persisted mp:<hash>)
        ✗ queue send ambiguous → NOT dropped (wallet retries, deduped)   ✗ unbound → mempool fallback
 
@@ -138,7 +138,7 @@ wrangler queues create vela-userops-dlq
 
 Also ensure each active chain's **treasury holds native ETH** — the pool EOAs front gas and refill from it.
 
-**How it works**: Each chain gets a `BundlerDO` (created on first request) holding its mempool, EOA locks, reputation, and alarm-driven auto-bundling. Requests route `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. In **queue mode** ingress instead enqueues to `USEROP_QUEUE`; the consumer routes `hash(sender)%100` to a per-index `RelayerDO`, each pinned to one pool EOA (its input gate is that EOA's lock). DO alarms persist across eviction; every activated chain self-registers with a `chain-registry` DO, and a 5-minute cron probes each registered chain **and each stranded RelayerDO** (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains stop their alarm after ~5 minutes and wake instantly on the next accepted op.
+**How it works**: Each chain gets a `BundlerDO` (created on first request) holding its mempool, EOA locks, reputation, and alarm-driven auto-bundling. Requests route `POST /:chainId` → `env.BUNDLER.idFromName("chain-${chainId}")`. In **queue mode** ingress instead enqueues to `USEROP_QUEUE`; the consumer routes each op to a per-index `RelayerDO` (each pinned to one pool EOA, its input gate that EOA's lock) — the index comes from the **dynamic-lease coordinator** (`DYNAMIC_LEASE_ENABLED`: the per-chain `BundlerDO` hands out a FREE pool EOA per sender, sticky while in-flight, over `POOL_ROUTING_WIDTH` EOAs — default 10) or, when it's off/unreachable, the static `hash(sender)%width` fallback. DO alarms persist across eviction; every activated chain self-registers with a `chain-registry` DO, and a 5-minute cron probes each registered chain **and each stranded RelayerDO** (storage-only) to revive a broken alarm chain — zero per-chain configuration. Fully idle chains stop their alarm after ~5 minutes and wake instantly on the next accepted op.
 
 ## Key Derivation
 

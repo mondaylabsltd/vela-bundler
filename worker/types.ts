@@ -4,9 +4,10 @@
 
 /**
  * Message shape for the `vela-userops` queue. Produced by eth_sendUserOperation
- * after validate+simulate; consumed by the queue() handler which routes each op
- * by hash(sender)%RELAYER_POOL_SIZE to a per-EOA DO. Not consumed yet — Stage 0
- * of docs/pool-queue-architecture.md (transport activates in Stage 4).
+ * after validate+simulate; consumed by the queue() handler which routes each op to a
+ * per-EOA DO — via the dynamic-lease coordinator (DYNAMIC_LEASE_ENABLED, a FREE pool
+ * index per sender) or the static hash(sender)%width fallback. See
+ * docs/pool-queue-architecture.md.
  */
 export interface UserOpQueueMessage {
   chainId: number;
@@ -83,6 +84,15 @@ export interface Env {
    *  When on, the producer enqueues validated ops and the queue consumer routes them to
    *  per-EOA RelayerDOs. Requires POOL_EOA_ENABLED + vault on the same chain. */
   QUEUE_TRANSPORT_ENABLED?: string;
+  /** Dynamic-lease coordinator per-chain spec: "" (off, default) | "true"/"all" | chainId CSV.
+   *  When on, the queue consumer leases a FREE pool index from the per-chain BundlerDO
+   *  coordinator (sender-sticky) instead of static hash(sender)%width routing. Requires
+   *  QUEUE_TRANSPORT_ENABLED on the same chain. Instant rollback: unset → static hash routing. */
+  DYNAMIC_LEASE_ENABLED?: string;
+  /** How many pool EOAs new traffic spreads across (routing modulus + dynamic-lease range).
+   *  Default 10. Decoupled from the 100-address key ceiling, so lowering it is migration-safe
+   *  (legacy in-flight ops on higher indices still reconcile). */
+  POOL_ROUTING_WIDTH?: string;
   /** Pool relayer float low-water mark in wei (top up below this). Default 0.0005 native. */
   POOL_FLOAT_MIN_WEI?: string;
   /** Pool relayer float top-up target in wei. Default 0.002 native. */

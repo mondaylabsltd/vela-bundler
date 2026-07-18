@@ -12,7 +12,22 @@
   //   (see the queues block below) and each chain's treasury must hold native ETH to fund the pool.
   "vars": {
     "POOL_EOA_ENABLED": "all",
-    "QUEUE_TRANSPORT_ENABLED": "all"
+    "QUEUE_TRANSPORT_ENABLED": "all",
+    // Dynamic-lease coordinator: the queue consumer routes every op via the per-chain BundlerDO,
+    // which returns a DURABLE, dedup-stable sender→index assignment — a FREE pool EOA per new sender
+    // (sender-sticky) instead of static hash(sender)%width. The durable route (persisted in the DO)
+    // is what keeps a redelivered/re-sent op on its original RelayerDO across eviction/deploy/
+    // rollback, so it can't double-bundle. ROLLBACK is instant + per-chain: set "" / "false" (new
+    // senders route by hash; in-flight leased routes stay honored) or a chainId CSV, then redeploy.
+    // NOTE: while this is ON, if the coordinator DO is unreachable the consumer DEFERS (retries)
+    // rather than hash-routing a possibly-leased sender — a coordinator outage slows delivery, it
+    // does not double-bundle.
+    "DYNAMIC_LEASE_ENABLED": "all",
+    // Active pool width: how many pool EOAs new traffic spreads across (hash modulus + dynamic-
+    // lease range). DECOUPLED from the 100-address key-derivation ceiling, so lowering it is
+    // migration-safe — legacy in-flight ops on higher indices still reconcile (poll by txHash),
+    // only NEW traffic concentrates on [0, width-1]. Started at 10 (raise to scale out).
+    "POOL_ROUTING_WIDTH": "10"
   },
 
   // Durable Objects:

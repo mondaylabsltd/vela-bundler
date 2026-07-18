@@ -137,8 +137,21 @@ export async function deriveTreasuryAddress(
 // Pool relayer key derivation — fixed pool, same addresses on every chain
 // ---------------------------------------------------------------------------
 
-/** Size of the fixed relayer EOA pool. See docs/pool-queue-architecture.md. */
+/** Size of the fixed relayer EOA pool — the KEY-DERIVATION CEILING, deliberately kept large
+ *  (a deterministic address exists for every index in [0, RELAYER_POOL_SIZE-1]). This is the
+ *  set of addresses that can EVER hold in-flight state, so it must NOT shrink: narrowing it
+ *  would make validatePoolIndex throw for a persisted poolIndex on a higher index and strand
+ *  its in-flight bundle/receipt. To run fewer EOAs, shrink RELAYER_ROUTING_WIDTH instead — new
+ *  traffic then concentrates on [0, width-1] while any legacy op on a higher index still
+ *  reconciles. See docs/pool-queue-architecture.md. */
 export const RELAYER_POOL_SIZE = 100;
+
+/** Default ROUTING WIDTH — how many pool EOAs new traffic is spread across (both the
+ *  hash(sender)%width fallback and the dynamic-lease coordinator pick from [0, width-1]).
+ *  Decoupled from RELAYER_POOL_SIZE (the key ceiling) on purpose so the active fleet can be
+ *  resized with no key-range/migration hazard. Overridable per-deploy via POOL_ROUTING_WIDTH.
+ *  Started at 10 (operator decision 2026-07-18: "10 起步, 后面再扩展"). */
+export const RELAYER_ROUTING_WIDTH = 10;
 
 function validatePoolIndex(index: number): void {
   if (!Number.isInteger(index) || index < 0 || index >= RELAYER_POOL_SIZE) {
