@@ -3496,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn prices_tempo_path_usd_with_ceiling_and_the_default_one_point_five_x_gate() {
+    fn prices_tempo_path_usd_with_ceiling_and_the_default_one_point_four_x_gate() {
         // 100,000 gas at Tempo's 20e9 attodollar base fee is exactly 0.002 pathUSD.
         assert_eq!(
             tempo_cost_in_path_usd(
@@ -3506,15 +3506,15 @@ mod tests {
             .unwrap(),
             U256::from(2_000u64)
         );
-        // The normal in-band 1.5x markup still applies, then the common $0.01 floor protects
+        // The normal in-band 1.4x markup still applies, then the common $0.01 floor protects
         // micro-transactions from consuming a relayer float for a dust reimbursement.
         assert_eq!(
-            marked_tempo_cost(U256::from(2_000u64), 15_000).unwrap(),
+            marked_tempo_cost(U256::from(2_000u64), 14_000).unwrap(),
             U256::from(10_000u64)
         );
         assert_eq!(
-            marked_tempo_cost(U256::from(20_000u64), 15_000).unwrap(),
-            U256::from(30_000u64)
+            marked_tempo_cost(U256::from(20_000u64), 14_000).unwrap(),
+            U256::from(28_000u64)
         );
     }
 

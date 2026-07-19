@@ -9,8 +9,8 @@ use std::{
     time::Duration,
 };
 
-/// Default in-band reimbursement multiplier: 1.5x the simulated outer transaction cost.
-pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 15_000;
+/// Default in-band reimbursement multiplier: 1.4x the simulated outer transaction cost.
+pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
 
 /// Amount retained for the next treasury transfer without preventing a lightly funded chain from
 /// serving the UserOperation that caused a relayer top-up.
