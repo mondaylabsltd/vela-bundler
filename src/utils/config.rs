@@ -253,12 +253,8 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         Some(value) => parse_trusted_rpc_urls(&value)?,
         None => BTreeMap::new(),
     };
-    if enabled && trusted_rpc_urls.is_empty() && alchemy_api_key.is_none() {
-        return Err(ConfigError(
-            "VELA_RELAY_EXECUTOR_ENABLED requires VELA_RELAY_EXECUTOR_RPC_URLS or ALCHEMY_API_KEY"
-                .into(),
-        ));
-    }
+    // The controlled chain directory provides trusted execution RPCs by default. Explicit URLs
+    // and Alchemy remain optional, higher-priority overrides.
     let pool_width = usize_value("VELA_RELAY_RELAYER_COUNT", 10)?;
     if pool_width > crate::utils::vault::RELAYER_POOL_SIZE {
         return Err(ConfigError(format!(

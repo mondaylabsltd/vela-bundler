@@ -373,7 +373,7 @@ impl ExecutorEngine {
                 "consumer returned a mixed chain/lane batch",
             );
         }
-        if !self.rpc.supports_chain(chain_id) {
+        if !self.rpc.supports_chain(chain_id).await {
             tracing::warn!(
                 chain_id,
                 "Iggy stream discovered without a trusted executor RPC"

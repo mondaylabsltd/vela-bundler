@@ -15,7 +15,6 @@ directory or Binance for Tempo quotes.
 - Remote Iggy instance reachable from the Relay process.
 - Remote Redis instance reachable from the Relay process.
 - `OPERATOR_SECRET` for the relayer pool when the executor is enabled.
-- Either `ALCHEMY_API_KEY` or `VELA_RELAY_EXECUTOR_RPC_URLS` for chain RPC access.
 
 ## Configure and run
 
@@ -32,15 +31,15 @@ The minimal configuration is:
 VELA_RELAY_IGGY_URL=iggy+tcp://username:password@iggy.example.com:3000
 VELA_RELAY_REDIS_URL=redis://:password@redis.example.com:6379
 OPERATOR_SECRET=your-operator-secret
-ALCHEMY_API_KEY=your-alchemy-api-key
 ```
 
 `VELA_RELAY_IGGY_URL` is the only Iggy connection setting required. Consumer and provisioner
 connections inherit it automatically. For a producer-only instance, set
-`VELA_RELAY_EXECUTOR_ENABLED=false`; then an operator secret and RPC configuration are not
-needed.
+`VELA_RELAY_EXECUTOR_ENABLED=false`; then an operator secret is not needed.
 
-To use explicitly trusted RPC endpoints instead of Alchemy:
+For execution, Relay resolves RPC endpoints automatically from Vela's controlled chain directory.
+If `ALCHEMY_API_KEY` is set, its endpoint is tried first for networks Alchemy supports. You can
+optionally prepend an explicit trusted endpoint for a particular chain:
 
 ```dotenv
 VELA_RELAY_EXECUTOR_RPC_URLS={"42161":"https://your-rpc.example"}
@@ -64,8 +63,9 @@ limits, verifies the final `eth_simulateV1` execution and the exact pathUSD tran
 submits `handleOps` in a signed `0x76` transaction. If the relayer float is low, the treasury
 automatically sends a durable pathUSD top-up through a separate self-paying `0x76` transaction.
 
-Configure a trusted Tempo RPC in the same normal way when it is not available through your
-Alchemy account:
+Tempo uses the same automatic controlled-directory RPC resolution. No Tempo-specific RPC
+configuration is needed. Add an explicit endpoint only when you want it tried ahead of the
+directory endpoints:
 
 ```dotenv
 VELA_RELAY_EXECUTOR_RPC_URLS={"4217":"https://your-tempo-rpc.example"}

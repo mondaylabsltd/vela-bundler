@@ -124,6 +124,17 @@ pub async fn call(
     .ok_or(())
 }
 
+/// Return the vetted public RPC endpoints from Vela's controlled chain directory.
+///
+/// This is deliberately separate from request-header RPC selection: background execution may
+/// broadcast signed transactions and therefore must not inherit a URL supplied by an API caller.
+/// The directory response is cached with the same one-hour policy as payment-asset metadata.
+pub async fn directory_rpc_urls(chain_id: u64) -> Result<Vec<String>, ()> {
+    fetch_fallback_rpc_urls(chain_id).await.map_err(|error| {
+        tracing::warn!(%error, chain_id, "could not fetch controlled directory RPC URLs");
+    })
+}
+
 /// Call an EVM simulation method while preserving a definitive contract revert.
 ///
 /// Transport errors, rate limits, and unsupported RPC features fail over to the next

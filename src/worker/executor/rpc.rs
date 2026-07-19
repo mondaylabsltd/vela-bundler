@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Display, Formatter},
     sync::{
         Arc,
@@ -13,13 +13,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::utils::{alchemy, config::ExecutorConfig};
+use crate::utils::{alchemy, config::ExecutorConfig, rpc as chain_directory};
 
 #[derive(Clone)]
 pub(super) struct TrustedRpcClient {
     http: Client,
     explicit_urls: Arc<BTreeMap<u64, Vec<String>>>,
     alchemy_api_key: Option<Arc<str>>,
+    directory_urls: Arc<Mutex<HashMap<u64, Vec<String>>>>,
     validated_urls: Arc<Mutex<HashSet<(u64, String)>>>,
     request_id: Arc<AtomicU64>,
 }
@@ -52,7 +53,7 @@ impl Display for RpcError {
             Self::NoTrustedRpc(chain_id) => {
                 write!(
                     formatter,
-                    "no trusted executor RPC is configured for chain {chain_id}"
+                    "no trusted executor RPC is available for chain {chain_id}"
                 )
             }
             Self::WrongChain => formatter.write_str("trusted RPC returned the wrong chain ID"),
@@ -81,13 +82,14 @@ impl TrustedRpcClient {
                 .alchemy_api_key
                 .as_ref()
                 .map(|key| Arc::from(key.expose())),
+            directory_urls: Arc::new(Mutex::new(HashMap::new())),
             validated_urls: Arc::new(Mutex::new(HashSet::new())),
             request_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
-    pub(super) fn supports_chain(&self, chain_id: u64) -> bool {
-        !self.urls(chain_id).is_empty()
+    pub(super) async fn supports_chain(&self, chain_id: u64) -> bool {
+        !self.urls(chain_id).await.is_empty()
     }
 
     pub(super) async fn call(
@@ -96,7 +98,7 @@ impl TrustedRpcClient {
         method: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        let urls = self.urls_or_error(chain_id)?;
+        let urls = self.urls_or_error(chain_id).await?;
         for url in urls {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
@@ -118,7 +120,7 @@ impl TrustedRpcClient {
         method: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        let urls = self.urls_or_error(chain_id)?;
+        let urls = self.urls_or_error(chain_id).await?;
         for url in urls {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
@@ -148,7 +150,7 @@ impl TrustedRpcClient {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
-        let urls = self.urls_or_error(chain_id)?;
+        let urls = self.urls_or_error(chain_id).await?;
         let first_id = self
             .request_id
             .fetch_add(calls.len() as u64, Ordering::Relaxed);
@@ -239,7 +241,7 @@ impl TrustedRpcClient {
         chain_id: u64,
         raw_transaction: &[u8],
     ) -> Result<BroadcastOutcome, RpcError> {
-        let urls = self.urls_or_error(chain_id)?;
+        let urls = self.urls_or_error(chain_id).await?;
         let raw_transaction = format!("0x{}", hex::encode(raw_transaction));
         let mut saw_ambiguous = false;
         let mut saw_rejection = false;
@@ -327,8 +329,8 @@ impl TrustedRpcClient {
             .map_err(|_| RpcError::InvalidResponse)
     }
 
-    fn urls_or_error(&self, chain_id: u64) -> Result<Vec<String>, RpcError> {
-        let urls = self.urls(chain_id);
+    async fn urls_or_error(&self, chain_id: u64) -> Result<Vec<String>, RpcError> {
+        let urls = self.urls(chain_id).await;
         if urls.is_empty() {
             Err(RpcError::NoTrustedRpc(chain_id))
         } else {
@@ -336,7 +338,7 @@ impl TrustedRpcClient {
         }
     }
 
-    fn urls(&self, chain_id: u64) -> Vec<String> {
+    async fn urls(&self, chain_id: u64) -> Vec<String> {
         let mut urls = self
             .explicit_urls
             .get(&chain_id)
@@ -344,11 +346,38 @@ impl TrustedRpcClient {
             .unwrap_or_default();
         if let Some(api_key) = &self.alchemy_api_key
             && let Some(url) = alchemy::rpc_url(chain_id, api_key)
-            && !urls.contains(&url)
         {
+            append_unique_urls(&mut urls, [url]);
+        }
+
+        let directory_urls =
+            if let Some(urls) = self.directory_urls.lock().await.get(&chain_id).cloned() {
+                urls
+            } else {
+                let (urls, cacheable) = match chain_directory::directory_rpc_urls(chain_id).await {
+                    Ok(urls) => (urls, true),
+                    // Do not cache an outage: a subsequent queued batch should be able to retry
+                    // the controlled directory after its built-in request retries are exhausted.
+                    Err(()) => (Vec::new(), false),
+                };
+                if cacheable {
+                    self.directory_urls
+                        .lock()
+                        .await
+                        .insert(chain_id, urls.clone());
+                }
+                urls
+            };
+        append_unique_urls(&mut urls, directory_urls);
+        urls
+    }
+}
+
+fn append_unique_urls(urls: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {
+    for url in candidates {
+        if !urls.contains(&url) {
             urls.push(url);
         }
-        urls
     }
 }
 
@@ -424,7 +453,7 @@ fn definitive_batch_result(response: UpstreamResponse) -> Option<Result<Value, R
 
 #[cfg(test)]
 mod tests {
-    use super::UpstreamError;
+    use super::{UpstreamError, append_unique_urls};
 
     #[test]
     fn distinguishes_ambiguous_and_definitive_broadcast_errors() {
@@ -440,5 +469,26 @@ mod tests {
         assert!(ambiguous.is_nonce_ambiguous());
         assert!(!ambiguous.is_definitive_broadcast_rejection());
         assert!(definitive.is_definitive_broadcast_rejection());
+    }
+
+    #[test]
+    fn appends_each_executor_rpc_url_once() {
+        let mut urls = vec!["https://first.example".into()];
+        append_unique_urls(
+            &mut urls,
+            [
+                "https://first.example".into(),
+                "https://second.example".into(),
+                "https://second.example".into(),
+            ],
+        );
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://first.example".to_owned(),
+                "https://second.example".to_owned(),
+            ]
+        );
     }
 }

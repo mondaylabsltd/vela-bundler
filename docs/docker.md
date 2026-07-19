@@ -12,9 +12,10 @@ docker compose up --build -d
 curl --fail http://127.0.0.1:4567/readyz
 ```
 
-`OPERATOR_SECRET` and either `ALCHEMY_API_KEY` or `VELA_RELAY_EXECUTOR_RPC_URLS` are required
-when the executor is enabled. The executor is enabled by default; set
-`VELA_RELAY_EXECUTOR_ENABLED=false` for an enqueue-only Relay.
+`OPERATOR_SECRET` is required when the executor is enabled. Trusted execution RPCs resolve
+automatically from Vela's controlled chain directory; `ALCHEMY_API_KEY` and
+`VELA_RELAY_EXECUTOR_RPC_URLS` are optional higher-priority overrides. The executor is enabled
+by default; set `VELA_RELAY_EXECUTOR_ENABLED=false` for an enqueue-only Relay.
 
 Set `VELA_RELAY_IGGY_URL` and `VELA_RELAY_REDIS_URL` in `.env` to the remote endpoints. The
 single Iggy URL is sufficient: do not add `VELA_RELAY_IGGY_PROVISIONER_URL` or
