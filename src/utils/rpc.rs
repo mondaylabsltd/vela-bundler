@@ -15,12 +15,16 @@ pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 const RPC_LIST_URL: &str = "https://ethereum-data.awesometools.dev/chains/eip155-";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const METADATA_REQUEST_ATTEMPTS: usize = 3;
 const FAILED_RPC_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_FAILED_RPC_ENTRIES: usize = 1_024;
 const CHAIN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_CHAIN_METADATA_CACHE_ENTRIES: usize = 512;
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static FAILED_RPCS: OnceLock<FailedRpcCache> = OnceLock::new();
 static CHAIN_METADATA_CACHE: OnceLock<Mutex<HashMap<u64, CachedChainMetadata>>> = OnceLock::new();
 
@@ -100,7 +104,7 @@ pub async fn call(
         return Ok(result);
     }
 
-    let fallback_urls = match fetch_fallback_rpc_urls(client, chain_id).await {
+    let fallback_urls = match fetch_fallback_rpc_urls(chain_id).await {
         Ok(urls) => urls,
         Err(error) => {
             tracing::warn!(%error, "could not fetch fallback RPC URLs");
@@ -153,7 +157,7 @@ pub async fn call_simulation(
         }
     }
 
-    let fallback_urls = match fetch_fallback_rpc_urls(client, chain_id).await {
+    let fallback_urls = match fetch_fallback_rpc_urls(chain_id).await {
         Ok(urls) => urls,
         Err(error) => {
             tracing::warn!(%error, "could not fetch fallback RPC URLs");
@@ -195,7 +199,7 @@ pub async fn settlement_assets(chain_id: u64) -> Result<SettlementAssets, ()> {
 /// Chain metadata is shared with RPC fallback resolution and cached for one hour because it
 /// changes far less frequently than account balances or gas prices.
 pub async fn payment_assets(chain_id: u64) -> Result<PaymentAssets, ()> {
-    let metadata = fetch_chain_metadata(http_client(), chain_id)
+    let metadata = fetch_chain_metadata(metadata_http_client(), chain_id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "could not fetch chain metadata for in-band payments");
@@ -267,6 +271,16 @@ fn http_client() -> &'static Client {
     })
 }
 
+fn metadata_http_client() -> &'static Client {
+    METADATA_HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(METADATA_CONNECT_TIMEOUT)
+            .timeout(METADATA_REQUEST_TIMEOUT)
+            .build()
+            .expect("metadata HTTP client configuration must be valid")
+    })
+}
+
 fn failed_rpcs() -> &'static FailedRpcCache {
     FAILED_RPCS.get_or_init(|| FailedRpcCache::new(FAILED_RPC_COOLDOWN, MAX_FAILED_RPC_ENTRIES))
 }
@@ -283,8 +297,8 @@ fn parse_user_rpc_url(value: &HeaderValue) -> Option<String> {
     parse_rpc_url(value)
 }
 
-async fn fetch_fallback_rpc_urls(client: &Client, chain_id: u64) -> Result<Vec<String>, String> {
-    let response = fetch_chain_metadata(client, chain_id).await?;
+async fn fetch_fallback_rpc_urls(chain_id: u64) -> Result<Vec<String>, String> {
+    let response = fetch_chain_metadata(metadata_http_client(), chain_id).await?;
 
     Ok(response
         .rpc
@@ -300,19 +314,41 @@ async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMet
     }
 
     let url = format!("{RPC_LIST_URL}{chain_id}.json");
-    let metadata = client
+    let mut last_error = None;
+    for attempt in 1..=METADATA_REQUEST_ATTEMPTS {
+        match fetch_chain_metadata_once(client, &url).await {
+            Ok(metadata) => {
+                store_chain_metadata(chain_id, metadata.clone(), now);
+                return Ok(metadata);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < METADATA_REQUEST_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "metadata request failed after {METADATA_REQUEST_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown error".into())
+    ))
+}
+
+async fn fetch_chain_metadata_once(client: &Client, url: &str) -> Result<ChainMetadata, String> {
+    let body = client
         .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| format!("metadata request failed: {error}"))?
+        .map_err(|error| error.to_string())?
         .error_for_status()
-        .map_err(|error| format!("metadata request failed: {error}"))?
-        .json::<ChainMetadata>()
+        .map_err(|error| error.to_string())?
+        .text()
         .await
-        .map_err(|error| format!("invalid chain metadata: {error}"))?;
-
-    store_chain_metadata(chain_id, metadata.clone(), now);
-    Ok(metadata)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_str(&body).map_err(|error| error.to_string())
 }
 
 fn cached_chain_metadata(chain_id: u64, now: Instant) -> Option<ChainMetadata> {
@@ -708,6 +744,7 @@ impl FailedRpcKey {
 
 #[derive(Clone, Deserialize)]
 struct ChainMetadata {
+    #[serde(default)]
     rpc: Vec<String>,
     #[serde(default)]
     stables: Vec<StablecoinMetadata>,
@@ -797,7 +834,7 @@ mod tests {
             "stables": [{
                 "symbol": "USDC",
                 "contract": "0x2222222222222222222222222222222222222222",
-                "decimals": 6
+                "type": "native"
             }],
             "dex": {
                 "contracts": {
@@ -808,7 +845,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(metadata.native_currency.unwrap().decimals, 18);
-        assert_eq!(metadata.stables[0].decimals, Some(6));
+        assert_eq!(metadata.stables[0].decimals, None);
         assert_eq!(
             metadata.wrapped_native_token.as_deref(),
             Some("0x1111111111111111111111111111111111111111")
