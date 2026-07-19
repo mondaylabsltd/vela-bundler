@@ -12,7 +12,6 @@ use std::{
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +25,7 @@ use crate::{
     },
     utils::{
         config::ExecutorConfig,
+        market::binance_usdt_price,
         rpc as chain_directory,
         vault::{
             derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
@@ -60,7 +60,6 @@ const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
 const USD_PRICE_SCALE: u64 = 100_000_000;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
-const BINANCE_TICKER_URL: &str = "https://api.binance.com/api/v3/ticker/price?symbol=";
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -89,11 +88,6 @@ struct ResolvedChainAssets {
 struct CachedMarketPrice {
     expires_at: Instant,
     price: U256,
-}
-
-#[derive(Deserialize)]
-struct BinanceTicker {
-    price: String,
 }
 
 #[derive(Debug)]
@@ -1300,21 +1294,10 @@ impl ExecutorEngine {
         {
             return Ok(cached.price);
         }
-        let url = format!("{BINANCE_TICKER_URL}{symbol}USDT");
-        let ticker = self
-            .market_http
-            .get(url)
-            .send()
+        let raw_price = binance_usdt_price(&self.market_http, &symbol)
             .await
-            .map_err(|_| ExecutorItemError("Binance native USD price request failed".into()))?
-            .error_for_status()
-            .map_err(|_| ExecutorItemError("Binance native USD price request failed".into()))?
-            .json::<BinanceTicker>()
-            .await
-            .map_err(|_| {
-                ExecutorItemError("Binance native USD price response is invalid".into())
-            })?;
-        let price = parse_market_usd_price(&ticker.price)
+            .ok_or_else(|| ExecutorItemError("Binance native USD price request failed".into()))?;
+        let price = parse_market_usd_price(&raw_price)
             .ok_or_else(|| ExecutorItemError("Binance native USD price is invalid".into()))?;
         self.market_prices.lock().await.insert(
             symbol,

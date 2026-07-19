@@ -6,7 +6,6 @@ use std::{
 
 use axum::http::HeaderValue;
 use num_bigint::BigUint;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -19,7 +18,10 @@ use crate::{
             },
         },
     },
-    utils::rpc::{self, PaymentAssets, StablecoinAsset},
+    utils::{
+        market::binance_usdt_price,
+        rpc::{self, PaymentAssets, StablecoinAsset},
+    },
 };
 
 const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
@@ -27,7 +29,6 @@ const AGGREGATE3_SELECTOR: [u8; 4] = [0x82, 0xad, 0x56, 0xcb];
 const GET_ETH_BALANCE_SELECTOR: [u8; 4] = [0x4d, 0x23, 0x01, 0xcc];
 const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
-const BINANCE_TICKER_URL: &str = "https://api.binance.com/api/v3/ticker/price?symbol=";
 const MARKET_PRICE_TTL: Duration = Duration::from_secs(60);
 const MARKET_PRICE_FAILURE_TTL: Duration = Duration::from_secs(3);
 const MAX_MARKET_PRICE_CACHE_ENTRIES: usize = 128;
@@ -349,18 +350,15 @@ async fn native_usd_price(symbol: &str) -> Option<String> {
         return price;
     }
 
-    let url = format!("{BINANCE_TICKER_URL}{symbol}USDT");
-    let price = match market_data_client().get(url).send().await {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response
-                .json::<BinanceTicker>()
-                .await
-                .ok()
-                .and_then(|ticker| normalize_usd_price(&ticker.price)),
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
+    let price = binance_usdt_price(market_data_client(), &symbol)
+        .await
+        .and_then(|price| normalize_usd_price(&price));
+    if price.is_none() {
+        tracing::warn!(
+            symbol,
+            "could not obtain native USD price from Binance endpoints"
+        );
+    }
     store_market_price(symbol, price.clone(), now);
     price
 }
@@ -435,8 +433,8 @@ fn market_price_cache() -> &'static Mutex<HashMap<String, CachedMarketPrice>> {
 fn market_data_client() -> &'static reqwest::Client {
     MARKET_DATA_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .timeout(Duration::from_secs(1))
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(2))
             .build()
             .expect("market data HTTP client configuration must be valid")
     })
@@ -579,11 +577,6 @@ fn read_bool_word(bytes: &[u8], offset: usize) -> Option<bool> {
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
-}
-
-#[derive(Deserialize)]
-struct BinanceTicker {
-    price: String,
 }
 
 struct CachedMarketPrice {
