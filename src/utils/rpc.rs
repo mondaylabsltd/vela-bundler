@@ -10,6 +10,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::utils::config::ExecutorChainAssets;
+
 pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 
 const RPC_LIST_URL: &str = "https://ethereum-data.awesometools.dev/chains/eip155-";
@@ -234,6 +236,19 @@ pub async fn payment_assets(chain_id: u64) -> Result<PaymentAssets, ()> {
             .as_deref()
             .and_then(parse_address),
     })
+}
+
+/// Reads the optional execution policy from the controlled chain directory.
+///
+/// When present, it replaces `VELA_RELAY_EXECUTOR_CHAIN_ASSETS` for this chain. The directory
+/// owner maintains the token and oracle allowlist.
+pub async fn executor_chain_assets(chain_id: u64) -> Result<Option<ExecutorChainAssets>, ()> {
+    fetch_chain_metadata(http_client(), chain_id)
+        .await
+        .map(|metadata| metadata.executor)
+        .map_err(|error| {
+            tracing::warn!(%error, chain_id, "could not fetch executor policy from chain metadata");
+        })
 }
 
 pub async fn erc20_decimals(
@@ -710,6 +725,8 @@ impl FailedRpcKey {
 struct ChainMetadata {
     rpc: Vec<String>,
     #[serde(default)]
+    executor: Option<ExecutorChainAssets>,
+    #[serde(default)]
     stables: Vec<StablecoinMetadata>,
     #[serde(rename = "nativeCurrency")]
     native_currency: Option<NativeCurrencyMetadata>,
@@ -789,7 +806,7 @@ mod tests {
     static TEST_CHAIN_IDS: AtomicU64 = AtomicU64::new(9_000_000_000);
 
     #[test]
-    fn parses_operator_neutral_payment_metadata() {
+    fn parses_chain_metadata_with_executor_policy() {
         let metadata: ChainMetadata = serde_json::from_value(json!({
             "rpc": ["https://rpc.example.com"],
             "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
@@ -803,12 +820,37 @@ mod tests {
                 "contracts": {
                     "quoterV2": "0x3333333333333333333333333333333333333333"
                 }
+            },
+            "executor": {
+                "costModel": "eip1559",
+                "nativeDecimals": 18,
+                "nativeUsdOracle": {
+                    "address": "0x4444444444444444444444444444444444444444",
+                    "decimals": 8,
+                    "maxAgeSeconds": 3600
+                },
+                "stablecoins": [{
+                    "address": "0x2222222222222222222222222222222222222222",
+                    "decimals": 6,
+                    "symbol": "USDC",
+                    "usdOracle": {
+                        "address": "0x5555555555555555555555555555555555555555",
+                        "decimals": 8,
+                        "maxAgeSeconds": 3600
+                    }
+                }]
             }
         }))
         .unwrap();
 
         assert_eq!(metadata.native_currency.unwrap().decimals, 18);
         assert_eq!(metadata.stables[0].decimals, Some(6));
+        assert_eq!(
+            metadata.executor.as_ref().unwrap().stablecoins[0]
+                .symbol
+                .as_deref(),
+            Some("USDC")
+        );
         assert_eq!(
             metadata.wrapped_native_token.as_deref(),
             Some("0x1111111111111111111111111111111111111111")

@@ -277,8 +277,9 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         Some(value) => parse_bool("VELA_RELAY_EXECUTOR_ENABLED", &value)?,
         None => match optional_value("VELA_RELAY_CONSUMER_ENABLED")? {
             Some(value) => parse_bool("VELA_RELAY_CONSUMER_ENABLED", &value)?,
-            // Signing and treasury movement are deliberately opt-in on upgrade.
-            None => false,
+            // The controlled chain directory supplies the default execution policy. Set the
+            // primary flag to false for a producer-only relay.
+            None => true,
         },
     };
     let operator_secret = match optional_value("OPERATOR_SECRET")? {
@@ -304,11 +305,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         return Err(ConfigError(
             "VELA_RELAY_EXECUTOR_ENABLED requires VELA_RELAY_EXECUTOR_RPC_URLS or ALCHEMY_API_KEY"
                 .into(),
-        ));
-    }
-    if enabled && chain_assets.is_empty() {
-        return Err(ConfigError(
-            "VELA_RELAY_EXECUTOR_ENABLED requires VELA_RELAY_EXECUTOR_CHAIN_ASSETS".into(),
         ));
     }
     let pool_width = usize_value("VELA_RELAY_RELAYER_COUNT", 10)?;

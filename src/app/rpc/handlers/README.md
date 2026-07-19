@@ -379,8 +379,39 @@ transaction is persisted before broadcast and replayed after a crash, so an ambi
 does not allocate another nonce. Iggy offsets advance only through the contiguous prefix whose
 result is durable in Redis.
 
-Execution is opt-configured per chain. Discovery accepts any `chain-{id}`, but a stream is never
-allowed to sign unless both a trusted RPC and an operator-owned asset policy exist for that chain:
+Discovery accepts any `chain-{id}`, but a stream signs only when both a trusted RPC and an asset
+policy exist for that chain. By default the policy is read from the controlled chain directory, so
+no executor-asset environment variable is required. Add this block to `eip155-{chainId}.json`:
+
+```json
+{
+  "executor": {
+    "costModel": "arbNitro",
+    "nativeDecimals": 18,
+    "nativeUsdOracle": {
+      "address": "0x<ETH-USD-oracle>",
+      "decimals": 8,
+      "maxAgeSeconds": 3600
+    },
+    "stablecoins": [{
+      "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "decimals": 6,
+      "symbol": "USDC",
+      "usdOracle": {
+        "address": "0x<USDC-USD-oracle>",
+        "decimals": 8,
+        "maxAgeSeconds": 3600
+      }
+    }]
+  }
+}
+```
+
+`VELA_RELAY_EXECUTOR_CHAIN_ASSETS` remains an optional local override for an emergency or staged
+rollout. The executor starts by default when `OPERATOR_SECRET` is supplied; set
+`VELA_RELAY_EXECUTOR_ENABLED=false` for a producer-only relay.
+
+To override the directory locally:
 
 ```sh
 VELA_RELAY_EXECUTOR_ENABLED=true

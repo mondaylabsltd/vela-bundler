@@ -24,6 +24,7 @@ use crate::{
     },
     utils::{
         config::{ExecutorChainAssets, ExecutorConfig, ExecutorOracle},
+        rpc as chain_directory,
         vault::{
             derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
         },
@@ -69,6 +70,7 @@ pub(crate) struct ExecutorEngine {
     treasury_key: Arc<k256::SecretKey>,
     treasury_address: Address,
     chain_assets: Arc<BTreeMap<u64, ChainAssetConfig>>,
+    directory_chain_assets: Arc<Mutex<HashMap<u64, ChainAssetConfig>>>,
     oracle_cache: Arc<Mutex<HashMap<(u64, Address), CachedOracleRound>>>,
     broadcast_seen: Arc<Mutex<HashMap<String, Instant>>>,
 }
@@ -190,6 +192,7 @@ impl ExecutorEngine {
             treasury_key: Arc::new(treasury_key),
             treasury_address,
             chain_assets: Arc::new(chain_assets),
+            directory_chain_assets: Arc::new(Mutex::new(HashMap::new())),
             oracle_cache: Arc::new(Mutex::new(HashMap::new())),
             broadcast_seen: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -367,12 +370,12 @@ impl ExecutorEngine {
             );
             return failure_results(operations.len(), "chain has no trusted executor RPC");
         }
-        let Some(chain_assets) = self.chain_assets.get(&chain_id) else {
-            tracing::warn!(
-                chain_id,
-                "Iggy stream discovered without an operator asset policy"
-            );
-            return failure_results(operations.len(), "chain has no operator asset policy");
+        let chain_assets = match self.chain_assets_for(chain_id).await {
+            Ok(chain_assets) => chain_assets,
+            Err(error) => {
+                tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
+                return failure_results(operations.len(), &error.to_string());
+            }
         };
 
         let hashes = operations
@@ -519,7 +522,7 @@ impl ExecutorEngine {
                 self.execute_with_lane_lease(
                     chain_id,
                     lane,
-                    chain_assets,
+                    &chain_assets,
                     candidates,
                     &mut results,
                     &lease_scope,
@@ -535,6 +538,35 @@ impl ExecutorEngine {
         }
 
         finish_results(results, "UserOperation execution was deferred")
+    }
+
+    async fn chain_assets_for(&self, chain_id: u64) -> Result<ChainAssetConfig, ExecutorItemError> {
+        if let Some(assets) = self.chain_assets.get(&chain_id) {
+            return Ok(assets.clone());
+        }
+        if let Some(assets) = self
+            .directory_chain_assets
+            .lock()
+            .await
+            .get(&chain_id)
+            .cloned()
+        {
+            return Ok(assets);
+        }
+
+        let assets = chain_directory::executor_chain_assets(chain_id)
+            .await
+            .map_err(|_| {
+                ExecutorItemError("could not load executor policy from chain directory".into())
+            })?
+            .ok_or_else(|| ExecutorItemError("chain directory has no executor policy".into()))?;
+        let assets = chain_asset_config(&assets, self.config.settlement_markup_bps)
+            .map_err(|error| ExecutorItemError(error.to_string()))?;
+        self.directory_chain_assets
+            .lock()
+            .await
+            .insert(chain_id, assets.clone());
+        Ok(assets)
     }
 
     #[allow(clippy::too_many_arguments)]
