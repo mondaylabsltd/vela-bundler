@@ -438,7 +438,7 @@ fn decode_erc20_transfer(data: &[u8]) -> Option<(Address, U256)> {
 }
 
 fn read_dynamic_bytes(data: &[u8], offset: usize) -> Option<&[u8]> {
-    if offset % 32 != 0 {
+    if !offset.is_multiple_of(32) {
         return None;
     }
     let length = read_usize_word(data, offset)?;
@@ -751,7 +751,7 @@ mod tests {
                     gas_native_cost: U256::ZERO,
                 },
             ],
-            Some(U256::from(2_000_00000000u64)),
+            Some(U256::from(200_000_000_000u64)),
         )
         .unwrap();
         assert_eq!(
@@ -769,7 +769,7 @@ mod tests {
             native_to_usd_stable_ceil(
                 U256::from(1_000_000_000_000_000u64),
                 18,
-                U256::from(2_000_00000000u64),
+                U256::from(200_000_000_000u64),
                 6,
             )
             .unwrap(),
