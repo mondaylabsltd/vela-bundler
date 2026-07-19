@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     net::IpAddr,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -13,7 +12,6 @@ use serde_json::{Value, json};
 
 pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 
-const ALCHEMY_API_KEY_ENV: &str = "ALCHEMY_API_KEY";
 const RPC_LIST_URL: &str = "https://ethereum-data.awesometools.dev/chains/eip155-";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -89,14 +87,10 @@ fn failed_rpcs() -> &'static FailedRpcCache {
 }
 
 fn alchemy_rpc_url(chain_id: u64) -> Option<String> {
-    if chain_id != 1 {
-        return None;
-    }
-
-    let api_key = env::var(ALCHEMY_API_KEY_ENV).ok()?;
+    let api_key = std::env::var("ALCHEMY_API_KEY").ok()?;
     let api_key = api_key.trim();
 
-    (!api_key.is_empty()).then(|| format!("https://eth-mainnet.g.alchemy.com/v2/{api_key}"))
+    (!api_key.is_empty()).then(|| crate::utils::alchemy::rpc_url(chain_id, api_key))?
 }
 
 fn parse_user_rpc_url(value: &HeaderValue) -> Option<String> {
@@ -426,7 +420,7 @@ mod tests {
                             let limited_calls = Arc::clone(&limited_calls_for_server);
                             async move {
                                 limited_calls.fetch_add(1, Ordering::Relaxed);
-                                StatusCode::TOO_MANY_REQUESTS
+                                (StatusCode::TOO_MANY_REQUESTS, "rate limited")
                             }
                         }),
                     )

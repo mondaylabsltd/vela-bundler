@@ -67,7 +67,7 @@ Response:
 
 RPC sources are tried in this order:
 
-1. Alchemy for Ethereum mainnet when `ALCHEMY_API_KEY` is set.
+1. Alchemy when `ALCHEMY_API_KEY` is set and the numeric EVM `chainId` is present in the Alchemy Chain Resource Directory registry. The registry includes all 80 networks currently listed at `https://www.alchemy.com/rpc`; non-EVM entries are retained for future use but are outside this ERC-4337 JSON-RPC API's scope.
 2. The HTTPS URL supplied by the `x-vela-rpc-url` request header.
 3. HTTPS URLs from `https://ethereum-data.awesometools.dev/chains/eip155-{chainId}.json`, in the published order.
 
@@ -81,11 +81,15 @@ When an RPC request fails, that `chainId`, URL, and method combination enters a 
 
 The shared source selection, upstream JSON-RPC request, and failover logic lives in `../../../utils/rpc.rs`. Future services and RPC handlers can reuse `utils::rpc::call` with their own method name and parameters.
 
-Set the Alchemy key in the process environment before starting the service:
+Set the Alchemy key in the process environment or in the project-root `.env` file before starting the service. Process environment variables take precedence over `.env` values:
 
 ```sh
 export ALCHEMY_API_KEY="your-key"
 cargo run
+```
+
+```dotenv
+ALCHEMY_API_KEY="your-key"
 ```
 
 To use a caller-provided RPC after Alchemy fails, include an HTTPS URL in the request header:

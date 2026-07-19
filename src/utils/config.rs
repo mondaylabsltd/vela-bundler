@@ -1,6 +1,7 @@
 use std::{
     env,
     fmt::{Display, Formatter},
+    io::ErrorKind,
     net::SocketAddr,
     str::FromStr,
     thread,
@@ -61,6 +62,8 @@ impl std::error::Error for ConfigError {}
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
+        load_dotenv()?;
+
         let available_cores = thread::available_parallelism()
             .map(|cores| cores.get())
             .unwrap_or(1);
@@ -103,6 +106,14 @@ impl Config {
                 parallel_job_concurrency,
             },
         })
+    }
+}
+
+fn load_dotenv() -> Result<(), ConfigError> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ConfigError(format!("could not load .env: {error}"))),
     }
 }
 
