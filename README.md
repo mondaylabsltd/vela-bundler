@@ -6,7 +6,8 @@ the background.
 
 The executor is enabled by default. Chain payment-asset metadata comes from Vela's controlled
 public directory; native-asset prices come from Binance and listed stablecoins are valued at
-1 USD. No per-chain asset or oracle configuration is required. Tempo is the exception by design:
+1 USD. Gnosis xDAI is fixed at 1 USD and does not use an exchange quote. No per-chain asset or
+oracle configuration is required. Tempo is the exception by design:
 it has no native gas coin, so Relay uses pathUSD directly and does not query either the chain
 directory or Binance for Tempo quotes.
 

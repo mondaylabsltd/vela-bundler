@@ -19,7 +19,7 @@ use crate::{
         },
     },
     utils::{
-        market::binance_usdt_price,
+        market::{binance_usdt_price, is_gnosis_chain},
         rpc::{self, PaymentAssets, StablecoinAsset},
         tempo,
     },
@@ -77,7 +77,7 @@ async fn quote(
         tracing::error!(chain_id, "could not load in-band gas quote chain metadata");
         RpcError::in_band_gas_quote_unavailable()
     })?;
-    let native_price = native_usd_price(&assets.native.symbol).await;
+    let native_price = native_usd_price(chain_id, &assets.native.symbol).await;
     let stablecoins = if native_price.is_some() {
         assets
             .stablecoins
@@ -390,7 +390,12 @@ fn power_of_ten(exponent: u32) -> BigUint {
     BigUint::from(10_u8).pow(exponent)
 }
 
-async fn native_usd_price(symbol: &str) -> Option<String> {
+async fn native_usd_price(chain_id: u64, symbol: &str) -> Option<String> {
+    // xDAI is the Gnosis native gas asset and is intentionally USD-pegged. Do not depend on an
+    // exchange ticker for a value that the protocol defines as one dollar.
+    if is_gnosis_chain(chain_id) {
+        return Some("1".into());
+    }
     let symbol = symbol.trim().to_ascii_uppercase();
     if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return None;
@@ -651,7 +656,8 @@ mod tests {
 
     use super::{
         MulticallCall, bytes32_quantity, compare_usd_balance_descending, decode_aggregate3,
-        encode_aggregate3, is_usd_stablecoin, normalize_usd_price, usd_balance_from_values,
+        encode_aggregate3, is_usd_stablecoin, native_usd_price, normalize_usd_price,
+        usd_balance_from_values,
     };
 
     #[test]
@@ -705,6 +711,16 @@ mod tests {
         assert_eq!(quotes[1].usd_balance.as_deref(), Some("2000"));
         assert_eq!(quotes[2].symbol, "XDAI");
         assert_eq!(quotes[2].usd_balance, None);
+    }
+
+    #[tokio::test]
+    async fn prices_gnosis_native_asset_at_one_usd_without_a_market_request() {
+        // The symbol is deliberately invalid: chain policy, rather than a Binance ticker,
+        // determines the Gnosis xDAI price.
+        assert_eq!(
+            native_usd_price(100, "not-a-ticker").await,
+            Some("1".into())
+        );
     }
 
     fn quote(

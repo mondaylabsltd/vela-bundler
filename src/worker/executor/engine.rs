@@ -25,7 +25,7 @@ use crate::{
     },
     utils::{
         config::ExecutorConfig,
-        market::binance_usdt_price,
+        market::{binance_usdt_price, is_gnosis_chain},
         rpc as chain_directory, tempo,
         vault::{
             derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
@@ -867,7 +867,7 @@ impl ExecutorEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let settlement = self
-            .evaluate_settlement(chain_assets, native_symbol, &survivors, &costs)
+            .evaluate_settlement(chain_id, chain_assets, native_symbol, &survivors, &costs)
             .await?;
         // Settlement evidence must come from the exact final handleOps simulation. Individual
         // simulations run against a different pre-state; a prior operation in this bundle can
@@ -924,7 +924,7 @@ impl ExecutorEngine {
             .checked_mul(U256::from(context.max_fee_per_gas))
             .ok_or_else(|| ExecutorItemError("bundle prefund overflow".into()))?;
         let top_up_max = self
-            .native_top_up_cap(native_symbol, chain_assets.native_decimals)
+            .native_top_up_cap(chain_id, native_symbol, chain_assets.native_decimals)
             .await;
         if self
             .ensure_relayer_funded(
@@ -1562,6 +1562,7 @@ impl ExecutorEngine {
 
     async fn evaluate_settlement(
         &self,
+        chain_id: u64,
         chain_assets: &ChainAssetConfig,
         native_symbol: &str,
         candidates: &[Candidate],
@@ -1577,7 +1578,7 @@ impl ExecutorEngine {
             .collect::<Vec<_>>();
         let native_usd_price =
             if has_stablecoin_payment(self.treasury_address, chain_assets, &inputs) {
-                Some(self.market_usd_price(native_symbol).await?)
+                Some(self.market_usd_price(chain_id, native_symbol).await?)
             } else {
                 None
             };
@@ -1590,7 +1591,16 @@ impl ExecutorEngine {
         .map_err(|error| ExecutorItemError(error.to_string()))
     }
 
-    async fn market_usd_price(&self, symbol: &str) -> Result<U256, ExecutorItemError> {
+    async fn market_usd_price(
+        &self,
+        chain_id: u64,
+        symbol: &str,
+    ) -> Result<U256, ExecutorItemError> {
+        // xDAI is the native Gnosis gas asset and is defined to be USD-pegged. This also keeps
+        // Gnosis stablecoin settlement and relayer funding independent of Binance availability.
+        if is_gnosis_chain(chain_id) {
+            return Ok(U256::from(USD_PRICE_SCALE));
+        }
         let symbol = symbol.trim().to_ascii_uppercase();
         if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(ExecutorItemError(
@@ -1621,9 +1631,14 @@ impl ExecutorEngine {
     /// Cap one native-token relayer top-up at 2 USD when Binance has a fresh quote. A network
     /// with no usable market price intentionally keeps the operator's static wei-denominated
     /// safety cap instead of blocking execution on the price service.
-    async fn native_top_up_cap(&self, native_symbol: &str, native_decimals: u32) -> U256 {
+    async fn native_top_up_cap(
+        &self,
+        chain_id: u64,
+        native_symbol: &str,
+        native_decimals: u32,
+    ) -> U256 {
         let fallback = U256::from(self.config.top_up_max_wei);
-        let Ok(price) = self.market_usd_price(native_symbol).await else {
+        let Ok(price) = self.market_usd_price(chain_id, native_symbol).await else {
             return fallback;
         };
         let Some(cap) = native_amount_for_usd_cap(native_decimals, price) else {
