@@ -4,6 +4,6 @@
 .env.*
 !.env.example
 .DS_Store
-dist
+dist/*
+!dist/vela-relay
 target
-

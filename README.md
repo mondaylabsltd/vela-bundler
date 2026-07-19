@@ -83,6 +83,9 @@ Intel/AMD64 and ARM64 where the platform supports it. The same workflow publishe
 Linux Docker images (`linux/amd64` and `linux/arm64`) to
 `${DOCKERHUB_USERNAME}/vela-relay`.
 
+Each Docker image packages the exact matching Linux executable produced for the GitHub Release;
+the workflow does not compile Rust a second time inside Docker.
+
 For Docker Hub publishing, configure the repository Actions settings:
 
 - Variable: `DOCKERHUB_USERNAME`

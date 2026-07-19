@@ -38,7 +38,8 @@ docker compose up -d --no-build
 ## Docker Hub publishing
 
 When a `v*` tag is pushed, the release workflow publishes `linux/amd64` and `linux/arm64`
-images to Docker Hub. Configure these repository settings before creating the tag:
+images to Docker Hub. It packages the native Linux release artifacts instead of recompiling Rust
+inside Docker. Configure these repository settings before creating the tag:
 
 - Actions variable: `DOCKERHUB_USERNAME` — the Docker Hub namespace.
 - Actions secret: `DOCKERHUB_TOKEN` — a Docker Hub access token with push permission.

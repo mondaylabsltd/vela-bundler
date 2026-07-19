@@ -1,0 +1,25 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        curl \
+    && groupadd --gid 10001 vela \
+    && useradd --uid 10001 --gid vela --create-home --shell /usr/sbin/nologin vela \
+    && rm -rf /var/lib/apt/lists/*
+
+# The release workflow supplies the matching native Linux executable at this path.
+COPY --chmod=0555 dist/vela-relay /usr/local/bin/vela-relay
+
+USER vela
+
+ENV VELA_RELAY_LISTEN_ADDR=0.0.0.0:4567
+
+EXPOSE 4567
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:4567/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/vela-relay"]

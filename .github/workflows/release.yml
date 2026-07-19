@@ -101,18 +101,74 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  docker:
-    name: Publish Docker image
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+  docker-build:
+    name: Build Docker image (${{ matrix.name }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     env:
       IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/vela-relay
+      SOURCE_TAG: build-${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Download matching Linux executable
+        uses: actions/download-artifact@v4
+        with:
+          name: vela-relay-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/artifact
 
+      - name: Extract Linux executable
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/artifact/vela-relay-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C dist
+          chmod 0555 dist/vela-relay
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Assemble and push native Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.release
+          push: true
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.SOURCE_TAG }}-${{ matrix.arch }}
+          provenance: false
+
+  docker-manifest:
+    name: Publish Docker multi-arch manifest
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/vela-relay
+      SOURCE_TAG: build-${{ github.sha }}
+    steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -132,20 +188,23 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=vela-relay-image
-          cache-to: type=gha,mode=max,scope=vela-relay-image
+      - name: Create and push multi-arch manifests
+        env:
+          TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              docker buildx imagetools create \
+                --tag "$tag" \
+                "${IMAGE_NAME}:${SOURCE_TAG}-amd64" \
+                "${IMAGE_NAME}:${SOURCE_TAG}-arm64"
+            fi
+          done <<< "$TAGS"
 
   publish:
     name: Publish GitHub Release
-    needs: [build, docker]
+    needs: [build, docker-manifest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
