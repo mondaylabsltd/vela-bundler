@@ -28,7 +28,7 @@ pub struct UserOperationQueue {
     topic: Identifier,
     topic_name: String,
     enqueue_timeout: Duration,
-    topology_provisioner: Option<ChainTopologyProvisioner>,
+    topology_provisioner: ChainTopologyProvisioner,
 }
 
 #[derive(Clone)]
@@ -49,9 +49,9 @@ impl Display for UserOperationQueueError {
 impl std::error::Error for UserOperationQueueError {}
 
 impl UserOperationQueue {
-    /// Connects the message producer and, when configured, a separately privileged topology
-    /// provisioner. The latter creates a stream only when the first producer write for that
-    /// chain proves the stream or topic is absent.
+    /// Connects the message producer and a topology provisioner. The provisioner defaults to the
+    /// producer credentials, but can use separately privileged credentials in production. It
+    /// creates a stream only when the first producer write proves the stream or topic is absent.
     pub async fn connect(config: &IggyConfig) -> Result<Self, UserOperationQueueError> {
         let client = IggyClient::from_connection_string(&config.url)
             .map_err(|_| UserOperationQueueError("invalid Iggy connection configuration"))?;
@@ -60,20 +60,16 @@ impl UserOperationQueue {
             .await
             .map_err(|_| UserOperationQueueError("could not connect to Iggy"))?;
 
-        let topology_provisioner = match &config.provisioner_url {
-            Some(url) => {
-                let client = IggyClient::from_connection_string(url).map_err(|_| {
-                    UserOperationQueueError("invalid Iggy provisioner connection configuration")
-                })?;
-                client.connect().await.map_err(|_| {
-                    UserOperationQueueError("could not connect to Iggy topology provisioner")
-                })?;
-                Some(ChainTopologyProvisioner {
-                    client: Arc::new(client),
-                    provision_lock: Arc::new(tokio::sync::Mutex::new(())),
-                })
-            }
-            None => None,
+        let provisioner_client = IggyClient::from_connection_string(&config.provisioner_url)
+            .map_err(|_| {
+                UserOperationQueueError("invalid Iggy provisioner connection configuration")
+            })?;
+        provisioner_client.connect().await.map_err(|_| {
+            UserOperationQueueError("could not connect to Iggy topology provisioner")
+        })?;
+        let topology_provisioner = ChainTopologyProvisioner {
+            client: Arc::new(provisioner_client),
+            provision_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let topic: Identifier = config
@@ -83,7 +79,7 @@ impl UserOperationQueue {
             .map_err(|_| UserOperationQueueError("invalid Iggy topic name"))?;
         tracing::info!(
             topic = %config.topic,
-            automatic_topology_provisioning = topology_provisioner.is_some(),
+            automatic_topology_provisioning = true,
             "Iggy UserOperation queue connected"
         );
 
@@ -118,13 +114,9 @@ impl UserOperationQueue {
         match self.append(&stream, &payload).await {
             Ok(()) => Ok(()),
             Err(send_error) => {
-                let Some(provisioner) = &self.topology_provisioner else {
-                    return Err(send_error);
-                };
-
                 let topology_was_created = tokio::time::timeout(
                     self.enqueue_timeout,
-                    provisioner.ensure_chain_topic(
+                    self.topology_provisioner.ensure_chain_topic(
                         &stream,
                         &stream_name,
                         &self.topic,
@@ -313,7 +305,8 @@ mod tests {
             url: env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL"),
             consumer_url: env::var("VELA_RELAY_IGGY_CONSUMER_URL")
                 .unwrap_or_else(|_| env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL")),
-            provisioner_url: None,
+            provisioner_url: env::var("VELA_RELAY_IGGY_PROVISIONER_URL")
+                .unwrap_or_else(|_| env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL")),
             topic: "default".into(),
             enqueue_timeout: Duration::from_secs(5),
         })

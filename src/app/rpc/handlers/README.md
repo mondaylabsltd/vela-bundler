@@ -349,6 +349,20 @@ VELA_RELAY_IGGY_CONSUMER_URL='iggy+tcp://<consumer>:<password>@127.0.0.1:5100'
 A relay container on the same Compose network instead uses `iggy:3000`. Port `3010` is the Iggy
 HTTP API used by the web UI; it is not the executor transport.
 
+### Iggy configuration
+
+For local and single-identity deployments, only this Iggy setting is required:
+
+```sh
+VELA_RELAY_IGGY_URL='iggy+tcp://vela-relay:<password>@127.0.0.1:5100'
+```
+
+The relay uses that same connection for producing, consuming, and automatically creating a new
+`chain-{id}` stream and its `default` topic. `VELA_RELAY_IGGY_TOPIC` and
+`VELA_RELAY_IGGY_ENQUEUE_TIMEOUT_SECS` remain optional overrides with defaults of `default` and
+five seconds. Set `VELA_RELAY_IGGY_CONSUMER_URL` and/or `VELA_RELAY_IGGY_PROVISIONER_URL` only
+when production credentials are deliberately split by privilege.
+
 ### Worker executor
 
 The worker discovers all strictly named `chain-{u64}` streams at startup and every 15 seconds.

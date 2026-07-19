@@ -64,9 +64,9 @@ pub struct IggyConfig {
     /// Separately privileged consumer credentials. Defaults to `url` for local/backwards-
     /// compatible deployments, but production should grant only list/poll/group/offset access.
     pub consumer_url: String,
-    /// A separately-privileged Iggy connection that can create a chain stream and its topic when
-    /// it is first used.
-    pub provisioner_url: Option<String>,
+    /// Iggy credentials used to create a chain stream and topic when they are first used.
+    /// Defaults to `url`; deployments that split privileges can override it.
+    pub provisioner_url: String,
     pub topic: String,
     pub enqueue_timeout: Duration,
 }
@@ -428,9 +428,7 @@ fn parse_chain_assets(value: &str) -> Result<BTreeMap<u64, ExecutorChainAssets>,
                 "chain {chain_id} uses OP Stack L1 data fees, which the executor cost model does not yet support"
             )));
         }
-        if is_known_arbitrum_chain(chain_id)
-            && assets.cost_model != ExecutorCostModel::ArbNitro
-        {
+        if is_known_arbitrum_chain(chain_id) && assets.cost_model != ExecutorCostModel::ArbNitro {
             return Err(ConfigError(format!(
                 "chain {chain_id} must use the arbNitro executor cost model"
             )));
@@ -586,10 +584,11 @@ fn parse_trusted_rpc_urls(value: &str) -> Result<BTreeMap<u64, Vec<String>>, Con
 }
 
 fn iggy_config() -> Result<IggyConfig, ConfigError> {
-    let provisioner_url = optional_value("VELA_RELAY_IGGY_PROVISIONER_URL")?;
     let url = required_value("VELA_RELAY_IGGY_URL")?;
     let consumer_url =
         optional_value("VELA_RELAY_IGGY_CONSUMER_URL")?.unwrap_or_else(|| url.clone());
+    let provisioner_url =
+        optional_value("VELA_RELAY_IGGY_PROVISIONER_URL")?.unwrap_or_else(|| url.clone());
 
     Ok(IggyConfig {
         url,
