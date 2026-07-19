@@ -41,6 +41,7 @@ use crate::{
 use super::{
     abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash},
     cost::{allocate_bundle_gas, native_cost},
+    deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
@@ -74,6 +75,7 @@ pub(crate) struct ExecutorEngine {
     relayer_addresses: Arc<[Address]>,
     treasury_key: Arc<k256::SecretKey>,
     treasury_address: Address,
+    simulation_deployer: SimulationContractDeployer,
     directory_chain_assets: Arc<Mutex<HashMap<u64, ResolvedChainAssets>>>,
     market_http: Client,
     market_prices: Arc<Mutex<HashMap<String, CachedMarketPrice>>>,
@@ -196,17 +198,28 @@ impl ExecutorEngine {
             relayer_addresses.push(signer_address(&key));
             relayer_keys.push(key);
         }
-        let treasury_key = derive_treasury_secret_key(config.operator_secret.expose())
-            .map_err(|error| ExecutorBuildError(error.to_string()))?;
+        let treasury_key = Arc::new(
+            derive_treasury_secret_key(config.operator_secret.expose())
+                .map_err(|error| ExecutorBuildError(error.to_string()))?,
+        );
         let treasury_address = signer_address(&treasury_key);
+        let simulation_deployer = SimulationContractDeployer::new(
+            rpc.clone(),
+            store.clone(),
+            treasury_key.clone(),
+            treasury_address,
+            config.lease_ttl,
+            config.treasury_floor_wei,
+        );
         Ok(Self {
             config: Arc::new(config),
             rpc,
             store,
             relayer_keys: relayer_keys.into(),
             relayer_addresses: relayer_addresses.into(),
-            treasury_key: Arc::new(treasury_key),
+            treasury_key,
             treasury_address,
+            simulation_deployer,
             directory_chain_assets: Arc::new(Mutex::new(HashMap::new())),
             market_http,
             market_prices: Arc::new(Mutex::new(HashMap::new())),
@@ -776,6 +789,7 @@ impl ExecutorEngine {
             entry_point,
             relayer,
             self.treasury_address,
+            &self.simulation_deployer,
             &candidates
                 .iter()
                 .map(|candidate| &candidate.packed)
@@ -803,6 +817,20 @@ impl ExecutorEngine {
                         "single-operation simulation rejected UserOperation"
                     );
                     results[candidate.result_index] = Some(Ok(()));
+                }
+                SimulationVerdict::Pending(reason) => {
+                    self.record_executor_deferred(
+                        &candidate.hash_string,
+                        "simulation_deployment",
+                        reason,
+                    )
+                    .await;
+                    tracing::info!(
+                        chain_id,
+                        user_operation_hash = %candidate.hash_string,
+                        reason,
+                        "single-operation simulation is waiting for automatic contract deployment"
+                    );
                 }
                 SimulationVerdict::Transient(reason) => {
                     self.record_executor_deferred(&candidate.hash_string, "simulation", reason)
@@ -832,6 +860,7 @@ impl ExecutorEngine {
             entry_point,
             relayer,
             self.treasury_address,
+            &self.simulation_deployer,
             &survivors
                 .iter()
                 .map(|candidate| &candidate.packed)
@@ -855,6 +884,7 @@ impl ExecutorEngine {
                 entry_point,
                 relayer,
                 self.treasury_address,
+                &self.simulation_deployer,
                 &[survivors[0].packed.clone()],
                 &[survivors[0].hash],
             )
@@ -884,6 +914,17 @@ impl ExecutorEngine {
                     chain_id,
                     lane,
                     "final handleOps simulation reported an account nonce mismatch"
+                );
+                return Ok(());
+            }
+            SimulationVerdict::Pending(reason) => {
+                self.record_candidates_deferred(&survivors, "simulation_deployment", reason)
+                    .await;
+                tracing::info!(
+                    chain_id,
+                    lane,
+                    reason,
+                    "final handleOps simulation is waiting for automatic contract deployment"
                 );
                 return Ok(());
             }
@@ -1960,7 +2001,7 @@ impl ExecutorEngine {
                     "RPC returned a transaction hash different from the signed bytes".into(),
                 ))
             }
-            BroadcastOutcome::Ambiguous => {
+            BroadcastOutcome::Ambiguous(reason) => {
                 self.broadcast_seen
                     .lock()
                     .await
@@ -1977,12 +2018,13 @@ impl ExecutorEngine {
                         chain_id = intent.chain_id,
                         lane = intent.lane,
                         transaction_hash = %intent.transaction_hash,
+                        reason,
                         "ambiguous handleOps broadcast is not yet observable"
                     );
                     Ok(BundleBroadcastDisposition::Unknown)
                 }
             }
-            BroadcastOutcome::Rejected => {
+            BroadcastOutcome::Rejected(reason) => {
                 self.broadcast_seen
                     .lock()
                     .await
@@ -1999,6 +2041,7 @@ impl ExecutorEngine {
                     chain_id = intent.chain_id,
                     lane = intent.lane,
                     transaction_hash = %intent.transaction_hash,
+                    reason,
                     "rejected broadcast is unproven; retaining exact handleOps outbox"
                 );
                 Ok(BundleBroadcastDisposition::Unknown)
@@ -2618,9 +2661,17 @@ impl ExecutorEngine {
             .await
             .remove(&intent.transaction_hash);
         if !success {
-            return Err(ExecutorItemError(
-                "treasury relayer top-up transaction reverted".into(),
-            ));
+            tracing::error!(
+                chain_id = intent.chain_id,
+                relayer = %intent.relayer,
+                amount_wei = intent.amount_wei,
+                transaction_hash = %intent.transaction_hash,
+                "treasury relayer top-up transaction reverted"
+            );
+            return Err(ExecutorItemError(format!(
+                "treasury relayer top-up transaction reverted: {}",
+                intent.transaction_hash
+            )));
         }
         tracing::info!(
             chain_id = intent.chain_id,
@@ -2674,14 +2725,20 @@ impl ExecutorEngine {
                     "RPC returned a different funding transaction hash".into(),
                 ))
             }
-            BroadcastOutcome::Ambiguous => {
+            BroadcastOutcome::Ambiguous(reason) => {
                 self.broadcast_seen
                     .lock()
                     .await
                     .remove(&intent.transaction_hash);
+                tracing::debug!(
+                    chain_id = intent.chain_id,
+                    transaction_hash = %intent.transaction_hash,
+                    reason,
+                    "funding broadcast is ambiguous; retaining exact outbox"
+                );
                 Ok(())
             }
-            BroadcastOutcome::Rejected => {
+            BroadcastOutcome::Rejected(reason) => {
                 self.broadcast_seen
                     .lock()
                     .await
@@ -2696,6 +2753,7 @@ impl ExecutorEngine {
                     tracing::warn!(
                         chain_id = intent.chain_id,
                         transaction_hash = %intent.transaction_hash,
+                        reason,
                         "rejected broadcast is unproven; retaining exact funding outbox"
                     );
                 }

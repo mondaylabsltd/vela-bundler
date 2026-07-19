@@ -5,19 +5,27 @@ use serde_json::{Value, json};
 
 use super::{
     abi::{PackedOperation, handle_ops_calldata, pimlico_simulate_handle_op_calldata},
+    deployment::{SimulationContractDeployer, SimulationDeploymentState},
     rpc::{RpcBatchCall, RpcError, TrustedRpcClient},
 };
 
-const DETERMINISTIC_DEPLOYER: Address = address!("4e59b44847b379578588920ca78fbf26c0b4956c");
-const PIMLICO_SIMULATIONS_INIT_CODE_HASH: B256 =
+pub(super) const DETERMINISTIC_DEPLOYER: Address =
+    address!("4e59b44847b379578588920ca78fbf26c0b4956c");
+pub(super) const PIMLICO_SIMULATIONS_INIT_CODE_HASH: B256 =
     b256!("6d2eb1ee903947960a7faf13c49dc4b9deb468b3c7a6d19863c4d9b2bffd78d1");
-const ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH: B256 =
+pub(super) const ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH: B256 =
     b256!("5ec5a546872ae8196c7627fe2a5c89e0a23614070cbd474dbce5e97b82d40c94");
 
 #[derive(Clone, Copy, Debug)]
-struct PimlicoSimulationContracts {
-    pimlico: Address,
-    entry_point_v07: Address,
+pub(super) struct PimlicoSimulationContracts {
+    pub(super) pimlico: Address,
+    pub(super) entry_point_v07: Address,
+}
+
+enum PimlicoContractAvailability {
+    Ready(PimlicoSimulationContracts),
+    Missing(PimlicoSimulationContracts),
+    Unavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +54,7 @@ pub(super) enum SimulationVerdict<T> {
     Success(T),
     NonceMismatch,
     Rejected(&'static str),
+    Pending(&'static str),
     Transient(&'static str),
 }
 
@@ -54,14 +63,16 @@ pub(super) enum SimulationVerdict<T> {
 /// top-level `eth_simulateV1` error is a provider capability failure, never an op verdict.
 ///
 /// When `eth_simulateV1` is unavailable, a deployed Alto simulation pair is the preferred
-/// fallback because it works through ordinary `eth_call`. `debug_traceCall` remains a fallback
-/// for chains where the pair has not yet been deployed or a node cannot execute `eth_call`.
+/// fallback because it works through ordinary `eth_call`. If the pair is absent, the treasury
+/// deploys it durably through the canonical CREATE2 deployer and this batch waits for its receipt.
+/// `debug_traceCall` remains a fallback when automatic deployment is unavailable.
 pub(super) async fn simulate_individually(
     rpc: &TrustedRpcClient,
     chain_id: u64,
     entry_point: Address,
     relayer: Address,
     beneficiary: Address,
+    deployer: &SimulationContractDeployer,
     operations: &[PackedOperation],
     hashes: &[B256],
 ) -> Vec<SimulationVerdict<SimulationResult>> {
@@ -110,7 +121,24 @@ pub(super) async fn simulate_individually(
     if fallback_indexes.is_empty() {
         return verdicts;
     }
-    let pimlico_contracts = pimlico_contracts(rpc, chain_id, beneficiary).await;
+    let pimlico_contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
+        PimlicoContractAvailability::Ready(contracts) => Some(contracts),
+        PimlicoContractAvailability::Missing(contracts) => {
+            match deployer.ensure(chain_id, contracts).await {
+                SimulationDeploymentState::Ready => Some(contracts),
+                SimulationDeploymentState::Pending => {
+                    for index in fallback_indexes {
+                        verdicts[index] = SimulationVerdict::Pending(
+                            "Pimlico simulation-contract deployment is pending confirmation",
+                        );
+                    }
+                    return verdicts;
+                }
+                SimulationDeploymentState::Unavailable => None,
+            }
+        }
+        PimlicoContractAvailability::Unavailable => None,
+    };
     let mut trace_indexes = Vec::new();
     for index in fallback_indexes {
         let verdict = simulate_with_pimlico(
@@ -164,6 +192,7 @@ pub(super) async fn simulate_bundle(
     entry_point: Address,
     relayer: Address,
     beneficiary: Address,
+    deployer: &SimulationContractDeployer,
     operations: &[PackedOperation],
     hashes: &[B256],
 ) -> SimulationVerdict<SimulationResult> {
@@ -184,7 +213,22 @@ pub(super) async fn simulate_bundle(
     {
         Ok(value) => parse_simulation(value, entry_point, hashes),
         Err(_) => {
-            if let Some(contracts) = pimlico_contracts(rpc, chain_id, beneficiary).await {
+            let contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
+                PimlicoContractAvailability::Ready(contracts) => Some(contracts),
+                PimlicoContractAvailability::Missing(contracts) => {
+                    match deployer.ensure(chain_id, contracts).await {
+                        SimulationDeploymentState::Ready => Some(contracts),
+                        SimulationDeploymentState::Pending => {
+                            return SimulationVerdict::Pending(
+                                "Pimlico simulation-contract deployment is pending confirmation",
+                            );
+                        }
+                        SimulationDeploymentState::Unavailable => None,
+                    }
+                }
+                PimlicoContractAvailability::Unavailable => None,
+            };
+            if let Some(contracts) = contracts {
                 let verdict = simulate_bundle_with_eth_call(
                     rpc,
                     chain_id,
@@ -220,7 +264,7 @@ async fn pimlico_contracts(
     rpc: &TrustedRpcClient,
     chain_id: u64,
     treasury: Address,
-) -> Option<PimlicoSimulationContracts> {
+) -> PimlicoContractAvailability {
     let salt = keccak256(treasury.as_slice());
     let contracts = PimlicoSimulationContracts {
         pimlico: create2_address(
@@ -245,18 +289,21 @@ async fn pimlico_contracts(
         },
     ];
     let Ok(responses) = rpc.batch(chain_id, &calls).await else {
-        return None;
+        return PimlicoContractAvailability::Unavailable;
     };
-    responses
+    let Some(all_deployed) = responses
         .iter()
-        .all(|response| {
-            response
-                .as_ref()
-                .ok()
-                .and_then(Value::as_str)
-                .is_some_and(|code| code != "0x")
-        })
-        .then_some(contracts)
+        .map(|response| response.as_ref().ok().and_then(Value::as_str))
+        .collect::<Option<Vec<_>>>()
+        .map(|codes| codes.into_iter().all(|code| code != "0x"))
+    else {
+        return PimlicoContractAvailability::Unavailable;
+    };
+    if all_deployed {
+        PimlicoContractAvailability::Ready(contracts)
+    } else {
+        PimlicoContractAvailability::Missing(contracts)
+    }
 }
 
 async fn simulate_with_pimlico(

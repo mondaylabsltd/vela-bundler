@@ -1,5 +1,6 @@
 mod abi;
 mod cost;
+mod deployment;
 mod engine;
 mod receipt;
 mod rpc;

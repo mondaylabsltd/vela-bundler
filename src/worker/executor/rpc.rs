@@ -46,8 +46,8 @@ pub(super) enum RpcError {
 #[derive(Debug)]
 pub(super) enum BroadcastOutcome {
     Accepted(String),
-    Ambiguous,
-    Rejected,
+    Ambiguous(String),
+    Rejected(String),
 }
 
 impl Display for RpcError {
@@ -246,8 +246,8 @@ impl TrustedRpcClient {
     ) -> Result<BroadcastOutcome, RpcError> {
         let urls = self.urls_or_error(chain_id).await?;
         let raw_transaction = format!("0x{}", hex::encode(raw_transaction));
-        let mut saw_ambiguous = false;
-        let mut saw_rejection = false;
+        let mut ambiguous_diagnostics = Vec::new();
+        let mut rejection_diagnostics = Vec::new();
 
         for url in urls {
             if self.validate_chain(chain_id, &url).await.is_err() {
@@ -268,22 +268,25 @@ impl TrustedRpcClient {
                     (None, Some(error))
                         if error.is_already_known() || error.is_nonce_ambiguous() =>
                     {
-                        saw_ambiguous = true;
+                        ambiguous_diagnostics.push(error.diagnostic());
                     }
                     (None, Some(error)) if error.is_definitive_broadcast_rejection() => {
-                        saw_rejection = true;
+                        rejection_diagnostics.push(error.diagnostic());
                     }
-                    _ => saw_ambiguous = true,
+                    (None, Some(error)) => ambiguous_diagnostics.push(error.diagnostic()),
+                    _ => ambiguous_diagnostics.push("malformed RPC broadcast response".into()),
                 },
-                Err(_) => saw_ambiguous = true,
+                Err(error) => ambiguous_diagnostics.push(error.to_string()),
             }
         }
 
-        Ok(if saw_ambiguous || !saw_rejection {
-            BroadcastOutcome::Ambiguous
-        } else {
-            BroadcastOutcome::Rejected
-        })
+        Ok(
+            if !ambiguous_diagnostics.is_empty() || rejection_diagnostics.is_empty() {
+                BroadcastOutcome::Ambiguous(join_broadcast_diagnostics(ambiguous_diagnostics))
+            } else {
+                BroadcastOutcome::Rejected(join_broadcast_diagnostics(rejection_diagnostics))
+            },
+        )
     }
 
     async fn validate_chain(&self, chain_id: u64, url: &str) -> Result<(), RpcError> {
@@ -400,6 +403,15 @@ struct UpstreamError {
 }
 
 impl UpstreamError {
+    fn diagnostic(&self) -> String {
+        let code = self
+            .code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let message = self.message.as_deref().unwrap_or("upstream error");
+        format!("RPC code {code}: {}", truncate_diagnostic(message, 256))
+    }
+
     fn normalized_message(&self) -> String {
         self.message
             .as_deref()
@@ -441,6 +453,27 @@ impl UpstreamError {
             || message.contains("max fee per gas")
             || message.contains("transaction type not supported")
     }
+}
+
+fn join_broadcast_diagnostics(diagnostics: Vec<String>) -> String {
+    let mut unique = Vec::new();
+    for diagnostic in diagnostics {
+        if !unique.contains(&diagnostic) {
+            unique.push(diagnostic);
+        }
+    }
+    truncate_diagnostic(&unique.join("; "), 512)
+}
+
+fn truncate_diagnostic(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 impl UpstreamResponse {

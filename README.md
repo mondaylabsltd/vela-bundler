@@ -51,6 +51,13 @@ the greater of the next bundle prefund multiplied by `5` and the configured floa
 Binance supplies the native USD price, a single top-up is capped at USD 2; without a price the
 static `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead (10 native tokens by default).
 
+When a trusted node does not expose `eth_simulateV1`, Relay first uses the vendored Alto
+Pimlico/EntryPoint v0.7 simulation pair through `eth_call`. If that pair is absent, it is deployed
+lazily through the canonical CREATE2 deployer using the treasury signer: one durable deployment
+transaction is confirmed at a time, then the queued UserOperation is retried. This requires the
+canonical deployer at `0x4e59…4956c` to exist on the network; Tempo is excluded because it has no
+native-token EIP-1559 deployment path.
+
 ## Tempo (pathUSD gas)
 
 Tempo mainnet (`4217`) and Moderato (`42431`) are enabled without asset or oracle configuration.

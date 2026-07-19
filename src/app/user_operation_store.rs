@@ -22,6 +22,8 @@ const LEASE_KEY_PREFIX: &str = "vela:relay:lease:";
 const PREPARED_BUNDLE_KEY_PREFIX: &str = "vela:relay:prepared-bundle:";
 const PREPARED_BUNDLE_INDEX_KEY: &str = "vela:relay:prepared-bundle-index";
 const PREPARED_FUNDING_KEY_PREFIX: &str = "vela:relay:prepared-funding:";
+const PREPARED_SIMULATION_DEPLOYMENT_KEY_PREFIX: &str =
+    "vela:relay:prepared-simulation-deployment:";
 const MALFORMED_DEAD_LETTER_KEY_PREFIX: &str = "vela:relay:malformed-dead-letter:";
 const DELAYED_OPERATION_PAYLOAD_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-payload:";
 const DELAYED_OPERATION_KEY_PREFIX: &str = "vela:relay:delayed-user-operation:";
@@ -161,6 +163,22 @@ return redis.call('DEL', KEYS[1])
 
 const SAVE_PREPARED_FUNDING_SCRIPT: &str = r#"
 return redis.call('SET', KEYS[1], ARGV[1], 'NX') and 1 or 0
+"#;
+
+const SAVE_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT: &str = r#"
+return redis.call('SET', KEYS[1], ARGV[1], 'NX') and 1 or 0
+"#;
+
+const CLEAR_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT: &str = r#"
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  return 0
+end
+local intent = cjson.decode(raw)
+if intent['transactionHash'] ~= ARGV[1] then
+  return 0
+end
+return redis.call('DEL', KEYS[1])
 "#;
 
 const SAVE_DELAYED_OPERATION_SCRIPT: &str = r#"
@@ -394,6 +412,19 @@ pub struct PreparedFundingIntent {
     pub chain_id: u64,
     pub relayer: String,
     pub amount_wei: u128,
+    pub raw_transaction: String,
+    pub transaction_hash: String,
+    pub nonce: u64,
+}
+
+/// A signed canonical-CREATE2 deployment persisted before broadcast. One deployment intent is
+/// allowed per chain because it shares the treasury nonce with relayer top-ups.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedSimulationDeploymentIntent {
+    pub chain_id: u64,
+    pub contract: String,
+    pub contract_address: String,
     pub raw_transaction: String,
     pub transaction_hash: String,
     pub nonce: u64,
@@ -976,6 +1007,68 @@ impl UserOperationStatusStore {
         Ok(cleared == 1)
     }
 
+    /// Persists the exact bytes of an automatic simulation-contract deployment. The chain
+    /// treasury lease serializes writers; `SET NX` closes the crash window before broadcast.
+    pub async fn save_prepared_simulation_deployment_intent(
+        &self,
+        intent: &PreparedSimulationDeploymentIntent,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        validate_prepared_simulation_deployment_intent(intent)?;
+        let payload = serde_json::to_string(intent).map_err(|_| {
+            UserOperationStatusStoreError("could not serialize simulation deployment")
+        })?;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(SAVE_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT)
+            .arg(1)
+            .arg(prepared_simulation_deployment_key(intent.chain_id))
+            .arg(payload);
+        let saved: i64 = self.query(command).await?;
+        Ok(saved == 1)
+    }
+
+    pub async fn get_prepared_simulation_deployment_intent(
+        &self,
+        chain_id: u64,
+    ) -> Result<Option<PreparedSimulationDeploymentIntent>, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("GET");
+        command.arg(prepared_simulation_deployment_key(chain_id));
+        let payload: Option<String> = self.query(command).await?;
+        let intent = payload
+            .map(|payload| {
+                serde_json::from_str::<PreparedSimulationDeploymentIntent>(&payload).map_err(|_| {
+                    UserOperationStatusStoreError("stored simulation deployment is invalid")
+                })
+            })
+            .transpose()?;
+        if let Some(intent) = intent.as_ref() {
+            validate_prepared_simulation_deployment_intent(intent)?;
+            if intent.chain_id != chain_id {
+                return Err(UserOperationStatusStoreError(
+                    "stored simulation deployment has the wrong chain",
+                ));
+            }
+        }
+        Ok(intent)
+    }
+
+    /// Deletes a simulation deployment intent only when the exact signed transaction still owns
+    /// the chain outbox.
+    pub async fn clear_prepared_simulation_deployment_intent(
+        &self,
+        chain_id: u64,
+        transaction_hash: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(CLEAR_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT)
+            .arg(1)
+            .arg(prepared_simulation_deployment_key(chain_id))
+            .arg(transaction_hash);
+        let cleared: i64 = self.query(command).await?;
+        Ok(cleared == 1)
+    }
+
     /// Durably records a malformed Iggy message. The queue position is the idempotency key, so a
     /// redelivery returns `false` without duplicating the dead letter.
     #[allow(
@@ -1185,6 +1278,10 @@ fn prepared_bundle_key(chain_id: u64, lane: u8) -> String {
 
 fn prepared_funding_key(chain_id: u64) -> String {
     format!("{PREPARED_FUNDING_KEY_PREFIX}{chain_id}")
+}
+
+fn prepared_simulation_deployment_key(chain_id: u64) -> String {
+    format!("{PREPARED_SIMULATION_DEPLOYMENT_KEY_PREFIX}{chain_id}")
 }
 
 fn malformed_dead_letter_key(chain_id: u64, partition_id: u32, offset: u64) -> String {
@@ -1398,6 +1495,21 @@ fn validate_prepared_funding_intent(
     Ok(())
 }
 
+fn validate_prepared_simulation_deployment_intent(
+    intent: &PreparedSimulationDeploymentIntent,
+) -> Result<(), UserOperationStatusStoreError> {
+    if intent.contract.is_empty()
+        || intent.contract_address.is_empty()
+        || intent.raw_transaction.is_empty()
+        || intent.transaction_hash.is_empty()
+    {
+        return Err(UserOperationStatusStoreError(
+            "prepared simulation deployment fields must not be empty",
+        ));
+    }
+    Ok(())
+}
+
 fn malformed_dead_letter(
     chain_id: u64,
     partition_id: u32,
@@ -1457,18 +1569,21 @@ mod tests {
 
     use super::{
         CLAIM_DELAYED_OPERATIONS_SCRIPT, CLEAR_PREPARED_BUNDLE_SCRIPT,
-        CLEAR_PREPARED_FUNDING_SCRIPT, COMPLETE_DELAYED_OPERATION_SCRIPT,
-        DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation, LIST_PREPARED_BUNDLES_SCRIPT,
-        MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT, PREPARED_BUNDLE_INDEX_KEY,
-        PreparedBundleIntent, PreparedFundingIntent, RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT,
+        CLEAR_PREPARED_FUNDING_SCRIPT, CLEAR_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT,
+        COMPLETE_DELAYED_OPERATION_SCRIPT, DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation,
+        LIST_PREPARED_BUNDLES_SCRIPT, MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT,
+        PREPARED_BUNDLE_INDEX_KEY, PreparedBundleIntent, PreparedFundingIntent,
+        PreparedSimulationDeploymentIntent, RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT,
         RETRY_DELAYED_OPERATION_SCRIPT, SAVE_DELAYED_OPERATION_SCRIPT, SAVE_PREPARED_BUNDLE_SCRIPT,
-        SAVE_PREPARED_FUNDING_SCRIPT, UserOperationEvent, UserOperationStatusKind,
-        canonical_delayed_payload, delayed_operation_identifier,
-        deserialize_claimed_delayed_operations, deserialize_prepared_bundle_intents,
-        deserialize_stored_operations, duration_millis, lease_key, malformed_dead_letter,
-        malformed_dead_letter_key, partition_bundle_events, prepared_bundle_key,
-        prepared_funding_key, transition_is_allowed, truncate_diagnostic, validate_lease_identity,
+        SAVE_PREPARED_FUNDING_SCRIPT, SAVE_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT,
+        UserOperationEvent, UserOperationStatusKind, canonical_delayed_payload,
+        delayed_operation_identifier, deserialize_claimed_delayed_operations,
+        deserialize_prepared_bundle_intents, deserialize_stored_operations, duration_millis,
+        lease_key, malformed_dead_letter, malformed_dead_letter_key, partition_bundle_events,
+        prepared_bundle_key, prepared_funding_key, prepared_simulation_deployment_key,
+        transition_is_allowed, truncate_diagnostic, validate_lease_identity,
         validate_prepared_bundle_intent, validate_prepared_funding_intent,
+        validate_prepared_simulation_deployment_intent,
     };
 
     #[test]
@@ -1695,6 +1810,36 @@ mod tests {
         );
         assert!(CLEAR_PREPARED_FUNDING_SCRIPT.contains("intent['transactionHash'] ~= ARGV[1]"));
         assert!(SAVE_PREPARED_FUNDING_SCRIPT.contains("'SET', KEYS[1], ARGV[1], 'NX'"));
+    }
+
+    #[test]
+    fn simulation_deployment_outbox_is_chain_scoped_and_compare_deleted() {
+        let intent = PreparedSimulationDeploymentIntent {
+            chain_id: 1284,
+            contract: "PimlicoSimulations".into(),
+            contract_address: "0x1111111111111111111111111111111111111111".into(),
+            raw_transaction: "0x02aabb".into(),
+            transaction_hash: "0xdeployment".into(),
+            nonce: 7,
+        };
+
+        assert!(validate_prepared_simulation_deployment_intent(&intent).is_ok());
+        assert_eq!(
+            prepared_simulation_deployment_key(intent.chain_id),
+            "vela:relay:prepared-simulation-deployment:1284"
+        );
+        let encoded = serde_json::to_string(&intent).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PreparedSimulationDeploymentIntent>(&encoded).unwrap(),
+            intent
+        );
+        assert!(
+            SAVE_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT.contains("'SET', KEYS[1], ARGV[1], 'NX'")
+        );
+        assert!(
+            CLEAR_PREPARED_SIMULATION_DEPLOYMENT_SCRIPT
+                .contains("intent['transactionHash'] ~= ARGV[1]")
+        );
     }
 
     #[test]
