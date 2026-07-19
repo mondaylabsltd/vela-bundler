@@ -333,7 +333,7 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         settlement_markup_bps,
         relayer_float_min_wei,
         relayer_float_target_wei,
-        relayer_float_cost_multiplier: u64_value("VELA_RELAY_EXECUTOR_FLOAT_COST_MULTIPLIER", 15)?,
+        relayer_float_cost_multiplier: u64_value("VELA_RELAY_EXECUTOR_FLOAT_COST_MULTIPLIER", 100)?,
         treasury_floor_wei: u128_value(
             "VELA_RELAY_EXECUTOR_TREASURY_FLOOR_WEI",
             10_000_000_000_000_000,

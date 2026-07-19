@@ -45,6 +45,11 @@ optionally prepend an explicit trusted endpoint for a particular chain:
 VELA_RELAY_EXECUTOR_RPC_URLS={"42161":"https://your-rpc.example"}
 ```
 
+For native-gas chains, a low relayer balance triggers a durable treasury top-up. The target is
+the greater of the next bundle prefund multiplied by `100` and the configured float target. If
+Binance supplies the native USD price, a single top-up is capped at USD 2; without a price the
+existing `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead.
+
 ## Tempo (pathUSD gas)
 
 Tempo mainnet (`4217`) and Moderato (`42431`) are enabled without asset or oracle configuration.
