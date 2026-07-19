@@ -1,0 +1,9 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.DS_Store
+dist
+target
+
