@@ -770,8 +770,8 @@ enum SimulationUpstreamError {
 mod tests {
     use std::{
         sync::{
-            Arc,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -887,7 +887,10 @@ mod tests {
     async fn fails_over_immediately_after_a_rate_limited_rpc_response() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let limited_calls = Arc::new(AtomicUsize::new(0));
+        // This needs a mutex, rather than a relaxed atomic: the HTTP response tells the client
+        // that the handler finished, but it is not a Rust memory-ordering edge between test
+        // runtime threads. Locking here makes the post-response observation deterministic.
+        let limited_calls = Arc::new(Mutex::new(0_usize));
         let limited_calls_for_server = Arc::clone(&limited_calls);
         let server = tokio::spawn(async move {
             axum::serve(
@@ -898,7 +901,7 @@ mod tests {
                         post(move || {
                             let limited_calls = Arc::clone(&limited_calls_for_server);
                             async move {
-                                limited_calls.fetch_add(1, Ordering::Relaxed);
+                                *limited_calls.lock().unwrap() += 1;
                                 (StatusCode::TOO_MANY_REQUESTS, "rate limited")
                             }
                         }),
@@ -944,7 +947,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(second_result.value, json!("0x64"));
-        assert_eq!(limited_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*limited_calls.lock().unwrap(), 1);
         server.abort();
     }
 
