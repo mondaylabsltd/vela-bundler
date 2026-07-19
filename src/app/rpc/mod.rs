@@ -2,6 +2,7 @@ use axum::{Json, body::Bytes, extract::Path};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+mod handlers;
 pub mod types;
 
 use types::{
@@ -39,10 +40,15 @@ pub async fn handle(Path(chain_id): Path<u64>, body: Bytes) -> Json<RpcResponse<
         "bundler RPC request received"
     );
 
-    Json(RpcResponse::error(
-        request.id,
-        RpcError::backend_unavailable(),
-    ))
+    match method {
+        RpcMethod::SupportedEntryPoints => {
+            Json(handlers::supported_entry_points::handle(request.id))
+        }
+        _ => Json(RpcResponse::error(
+            request.id,
+            RpcError::backend_unavailable(),
+        )),
+    }
 }
 
 fn validate_call(method: &str, params: Value) -> Result<RpcMethod, RpcError> {
@@ -101,7 +107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_a_supported_method_before_the_backend_is_added() {
+    async fn returns_supported_entry_points() {
         let response = router()
             .oneshot(
                 Request::post("/1/rpc")
@@ -127,7 +133,10 @@ mod tests {
             .unwrap();
         let response: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(response["id"], 7);
-        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(
+            response["result"],
+            json!(["0x0000000071727De22E5E9d8BAf0edAc6f37da032"])
+        );
     }
 
     #[tokio::test]

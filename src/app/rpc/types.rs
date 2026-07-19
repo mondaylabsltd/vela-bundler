@@ -36,6 +36,15 @@ pub struct RpcResponse<T> {
 }
 
 impl<T> RpcResponse<T> {
+    pub fn result(id: Value, result: T) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
     pub fn error(id: Value, error: RpcError) -> Self {
         Self {
             jsonrpc: "2.0",
