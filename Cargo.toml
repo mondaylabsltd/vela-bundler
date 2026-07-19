@@ -3,6 +3,10 @@ name = "vela-relay"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "deploy-simulations"
+path = "src/bin/deploy_simulations.rs"
+
 [dependencies]
 alloy = { version = "2.2.0", features = ["essentials"] }
 axum = "0.8.9"
