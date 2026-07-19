@@ -1,6 +1,13 @@
-use axum::{Json, body::Bytes, extract::Path};
+use axum::{
+    Json,
+    body::Bytes,
+    extract::{Path, State},
+    http::{HeaderMap, HeaderName, HeaderValue},
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+use crate::app::AppState;
 
 mod handlers;
 pub mod types;
@@ -11,11 +18,20 @@ use types::{
     SendUserOperationParams,
 };
 
-pub async fn handle(Path(chain_id): Path<u64>, body: Bytes) -> Json<RpcResponse<Value>> {
+pub const RPC_DOMAIN_RESPONSE_HEADER: &str = "x-vela-rpc-domain";
+
+type RpcHttpResponse = (HeaderMap, Json<RpcResponse<Value>>);
+
+pub async fn handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain_id): Path<u64>,
+    body: Bytes,
+) -> RpcHttpResponse {
     let request = match serde_json::from_slice::<RpcRequest>(&body) {
         Ok(request) => request,
         Err(error) => {
-            return Json(RpcResponse::error(
+            return response(RpcResponse::error(
                 Value::Null,
                 RpcError::parse_error(error.to_string()),
             ));
@@ -23,7 +39,7 @@ pub async fn handle(Path(chain_id): Path<u64>, body: Bytes) -> Json<RpcResponse<
     };
 
     if request.jsonrpc != "2.0" {
-        return Json(RpcResponse::error(
+        return response(RpcResponse::error(
             request.id,
             RpcError::invalid_request("`jsonrpc` must be \"2.0\""),
         ));
@@ -31,7 +47,7 @@ pub async fn handle(Path(chain_id): Path<u64>, body: Bytes) -> Json<RpcResponse<
 
     let method = match validate_call(&request.method, request.params) {
         Ok(method) => method,
-        Err(error) => return Json(RpcResponse::error(request.id, error)),
+        Err(error) => return response(RpcResponse::error(request.id, error)),
     };
 
     tracing::info!(
@@ -40,15 +56,49 @@ pub async fn handle(Path(chain_id): Path<u64>, body: Bytes) -> Json<RpcResponse<
         "bundler RPC request received"
     );
 
+    let gas_price = state.gas_price();
+
     match method {
         RpcMethod::SupportedEntryPoints => {
-            Json(handlers::supported_entry_points::handle(request.id))
+            response(handlers::supported_entry_points::handle(request.id))
         }
-        _ => Json(RpcResponse::error(
+        RpcMethod::GetUserOperationGasPrice => {
+            let (response_body, rpc_domain) = handlers::user_operation_gas_price::handle(
+                request.id,
+                chain_id,
+                headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                gas_price,
+            )
+            .await;
+            response_with_rpc_domain(response_body, rpc_domain)
+        }
+        _ => response(RpcResponse::error(
             request.id,
             RpcError::backend_unavailable(),
         )),
     }
+}
+
+fn response(response: RpcResponse<Value>) -> RpcHttpResponse {
+    (HeaderMap::new(), Json(response))
+}
+
+fn response_with_rpc_domain(
+    response_body: RpcResponse<Value>,
+    rpc_domain: Option<String>,
+) -> RpcHttpResponse {
+    let mut headers = HeaderMap::new();
+
+    if let Some(rpc_domain) = rpc_domain {
+        match HeaderValue::try_from(rpc_domain.as_str()) {
+            Ok(value) => {
+                headers.insert(HeaderName::from_static(RPC_DOMAIN_RESPONSE_HEADER), value);
+            }
+            Err(error) => tracing::warn!(?error, "could not add RPC domain response header"),
+        }
+    }
+
+    (headers, Json(response_body))
 }
 
 fn validate_call(method: &str, params: Value) -> Result<RpcMethod, RpcError> {
@@ -100,10 +150,15 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use super::{handle, validate_call};
+    use super::{
+        RPC_DOMAIN_RESPONSE_HEADER, RpcResponse, handle, response_with_rpc_domain, validate_call,
+    };
+    use crate::app::AppState;
 
     fn router() -> Router {
-        Router::new().route("/{chain_id}/rpc", post(handle))
+        Router::new()
+            .route("/{chain_id}/rpc", post(handle))
+            .with_state(AppState::new(&[]))
     }
 
     #[tokio::test]
@@ -165,6 +220,16 @@ mod tests {
         let response: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(response["id"], "request-1");
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn adds_the_selected_rpc_domain_to_the_response_header() {
+        let (headers, _) = response_with_rpc_domain(
+            RpcResponse::result(Value::Null, Value::Null),
+            Some("rpc.example.com".into()),
+        );
+
+        assert_eq!(headers[RPC_DOMAIN_RESPONSE_HEADER], "rpc.example.com");
     }
 
     #[test]

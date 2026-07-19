@@ -96,6 +96,14 @@ impl RpcError {
         Self::new(-32000, "bundler backend is not configured", None)
     }
 
+    pub fn gas_price_unavailable() -> Self {
+        Self::new(-32000, "all gas price RPC sources failed", None)
+    }
+
+    pub fn gas_price_timeout() -> Self {
+        Self::new(-32000, "gas price RPC request timed out", None)
+    }
+
     fn new(code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             code,

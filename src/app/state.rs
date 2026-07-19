@@ -3,8 +3,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::gas_price::GasPriceManager;
+
 #[derive(Clone)]
 pub struct AppState {
+    gas_price: GasPriceManager,
     readiness: Readiness,
 }
 
@@ -17,6 +20,7 @@ pub struct Readiness {
 impl AppState {
     pub fn new(expected_jobs: &[&'static str]) -> Self {
         Self {
+            gas_price: GasPriceManager::default(),
             readiness: Readiness {
                 expected_jobs: Arc::from(expected_jobs),
                 ready_jobs: Arc::new(Mutex::new(HashSet::new())),
@@ -26,6 +30,10 @@ impl AppState {
 
     pub fn readiness(&self) -> Readiness {
         self.readiness.clone()
+    }
+
+    pub fn gas_price(&self) -> GasPriceManager {
+        self.gas_price.clone()
     }
 }
 

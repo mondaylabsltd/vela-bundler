@@ -1,4 +1,5 @@
 mod app;
+mod gas_price;
 mod utils;
 mod worker;
 
