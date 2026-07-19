@@ -1,4 +1,8 @@
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -8,6 +12,7 @@ use tower_http::{
 };
 
 mod handlers;
+mod rpc;
 pub mod state;
 
 pub use state::{AppState, Readiness};
@@ -21,6 +26,7 @@ pub fn router(config: &HttpConfig, state: AppState) -> Router {
         .route("/healthz", get(system::liveness))
         .route("/readyz", get(system::readiness))
         .route("/version", get(system::version))
+        .route("/{chain_id}/rpc", post(rpc::handle))
         .layer(
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::new())
