@@ -37,6 +37,15 @@ sol! {
         );
     }
 
+    interface IPimlicoSimulations {
+        function simulateHandleOp(
+            address entryPointSimulation,
+            address payable entryPoint,
+            PackedUserOperation[] calldata queuedUserOps,
+            PackedUserOperation calldata targetUserOp
+        );
+    }
+
     interface IQuoterV2 {
         struct QuoteExactInputSingleParams {
             address tokenIn;
@@ -194,6 +203,24 @@ pub(super) fn handle_ops_calldata(
     .into()
 }
 
+/// Encodes Alto's deployed `PimlicoSimulations.simulateHandleOp` call for one EntryPoint v0.7
+/// operation. A successful `eth_call` proves validation and the account call without requiring
+/// `eth_simulateV1` or a debug namespace on the RPC endpoint.
+pub(super) fn pimlico_simulate_handle_op_calldata(
+    entry_point_simulation: Address,
+    entry_point: Address,
+    operation: &PackedOperation,
+) -> Bytes {
+    IPimlicoSimulations::simulateHandleOpCall {
+        entryPointSimulation: entry_point_simulation,
+        entryPoint: entry_point,
+        queuedUserOps: Vec::new(),
+        targetUserOp: operation.packed.clone(),
+    }
+    .abi_encode()
+    .into()
+}
+
 /// Encodes EntryPoint v0.7 `getNonce(sender, key)` for the keyed nonce carried by a UserOperation.
 /// The low 64 bits are the sequence; the upper 192 bits select the nonce key.
 pub(super) fn get_nonce_calldata(sender: Address, user_operation_nonce: U256) -> Bytes {
@@ -274,7 +301,8 @@ mod tests {
     };
 
     use super::{
-        IEntryPoint, PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash,
+        IEntryPoint, PackedOperation, get_nonce_calldata, handle_ops_calldata,
+        pimlico_simulate_handle_op_calldata, user_operation_hash,
     };
     use crate::app::rpc::types::{UserOperation, UserOperationV0_7};
 
@@ -351,6 +379,19 @@ mod tests {
 
         assert_eq!(&encoded[..4], &IEntryPoint::handleOpsCall::SELECTOR);
         assert_eq!(hex::encode(&encoded[..4]), "765e827f");
+    }
+
+    #[test]
+    fn encodes_the_pimlico_v07_single_operation_simulation_selector() {
+        let operation = PackedOperation::try_from(&operation()).unwrap();
+        let encoded = pimlico_simulate_handle_op_calldata(
+            address!("e050ef4de2109ecded19dcc3d3f2120121d47ec5"),
+            address!("0000000071727de22e5e9d8baf0edac6f37da032"),
+            &operation,
+        );
+
+        // `simulateHandleOp(address,address,PackedUserOperation[],PackedUserOperation)`.
+        assert_eq!(&encoded[..4], &[0xf1, 0x14, 0x30, 0x43]);
     }
 
     #[test]

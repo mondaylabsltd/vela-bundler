@@ -1,12 +1,24 @@
 use std::str::FromStr;
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{Address, B256, Bytes, U256, address, b256, keccak256};
 use serde_json::{Value, json};
 
 use super::{
-    abi::{PackedOperation, handle_ops_calldata},
+    abi::{PackedOperation, handle_ops_calldata, pimlico_simulate_handle_op_calldata},
     rpc::{RpcBatchCall, RpcError, TrustedRpcClient},
 };
+
+const DETERMINISTIC_DEPLOYER: Address = address!("4e59b44847b379578588920ca78fbf26c0b4956c");
+const PIMLICO_SIMULATIONS_INIT_CODE_HASH: B256 =
+    b256!("6d2eb1ee903947960a7faf13c49dc4b9deb468b3c7a6d19863c4d9b2bffd78d1");
+const ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH: B256 =
+    b256!("5ec5a546872ae8196c7627fe2a5c89e0a23614070cbd474dbce5e97b82d40c94");
+
+#[derive(Clone, Copy, Debug)]
+struct PimlicoSimulationContracts {
+    pimlico: Address,
+    entry_point_v07: Address,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct SimulatedLog {
@@ -41,10 +53,9 @@ pub(super) enum SimulationVerdict<T> {
 /// one-operation `handleOps`, which proves both EntryPoint validation and the account call. A
 /// top-level `eth_simulateV1` error is a provider capability failure, never an op verdict.
 ///
-/// Some otherwise usable EVM nodes do not expose `eth_simulateV1` but do expose
-/// `debug_traceCall` with call-tracer logs. That is a safe fallback because it preserves the same
-/// evidence this executor requires: outer gas used, EntryPoint UserOperationEvent, and payment
-/// transfer logs. An `eth_call`-only fallback would not provide that evidence.
+/// When `eth_simulateV1` is unavailable, a deployed Alto simulation pair is the preferred
+/// fallback because it works through ordinary `eth_call`. `debug_traceCall` remains a fallback
+/// for chains where the pair has not yet been deployed or a node cannot execute `eth_call`.
 pub(super) async fn simulate_individually(
     rpc: &TrustedRpcClient,
     chain_id: u64,
@@ -62,7 +73,7 @@ pub(super) async fn simulate_individually(
             params: simulate_params(
                 relayer,
                 entry_point,
-                handle_ops_calldata(&[operation.packed.clone()], beneficiary),
+                handle_ops_calldata(std::slice::from_ref(&operation.packed), beneficiary),
             ),
         })
         .collect::<Vec<_>>();
@@ -74,7 +85,7 @@ pub(super) async fn simulate_individually(
                 .zip(hashes)
                 .map(|(response, expected_hash)| match response {
                     Ok(value) => parse_simulation(value, entry_point, &[*expected_hash]),
-                    Err(RpcError::Reverted) => {
+                    Err(RpcError::Reverted { .. }) => {
                         // `eth_simulateV1` reports a real call verdict inside `result`. A top-level
                         // error means the RPC could not perform the method, even if its message says
                         // revert.
@@ -99,7 +110,28 @@ pub(super) async fn simulate_individually(
     if fallback_indexes.is_empty() {
         return verdicts;
     }
-    let trace_calls = fallback_indexes
+    let pimlico_contracts = pimlico_contracts(rpc, chain_id, beneficiary).await;
+    let mut trace_indexes = Vec::new();
+    for index in fallback_indexes {
+        let verdict = simulate_with_pimlico(
+            rpc,
+            chain_id,
+            entry_point,
+            operations[index].clone(),
+            hashes[index],
+            pimlico_contracts,
+        )
+        .await;
+        if matches!(verdict, SimulationVerdict::Transient(_)) {
+            trace_indexes.push(index);
+        } else {
+            verdicts[index] = verdict;
+        }
+    }
+    if trace_indexes.is_empty() {
+        return verdicts;
+    }
+    let trace_calls = trace_indexes
         .iter()
         .map(|index| RpcBatchCall {
             method: "debug_traceCall",
@@ -110,22 +142,16 @@ pub(super) async fn simulate_individually(
             ),
         })
         .collect::<Vec<_>>();
-    let trace_responses = match rpc.batch(chain_id, &trace_calls).await {
-        Ok(responses) => responses,
-        Err(_) => {
-            for index in fallback_indexes {
-                verdicts[index] = SimulationVerdict::Transient(
-                    "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
-                );
-            }
-            return verdicts;
-        }
-    };
-    for (index, response) in fallback_indexes.into_iter().zip(trace_responses) {
-        verdicts[index] = match response {
-            Ok(value) => parse_trace_simulation(value, entry_point, &[hashes[index]]),
-            Err(_) => SimulationVerdict::Transient(
-                "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
+    let trace_responses = rpc.batch(chain_id, &trace_calls).await;
+    for (position, index) in trace_indexes.into_iter().enumerate() {
+        verdicts[index] = match trace_responses
+            .as_ref()
+            .ok()
+            .and_then(|responses| responses.get(position))
+        {
+            Some(Ok(value)) => parse_trace_simulation(value.clone(), entry_point, &[hashes[index]]),
+            _ => SimulationVerdict::Transient(
+                "no trusted executor RPC supports eth_simulateV1, deployed Pimlico eth_call, or debug_traceCall",
             ),
         };
     }
@@ -157,20 +183,215 @@ pub(super) async fn simulate_bundle(
         .await
     {
         Ok(value) => parse_simulation(value, entry_point, hashes),
-        Err(_) => match rpc
-            .call(
-                chain_id,
-                "debug_traceCall",
-                debug_trace_params(relayer, entry_point, calldata),
-            )
-            .await
-        {
-            Ok(value) => parse_trace_simulation(value, entry_point, hashes),
-            Err(_) => SimulationVerdict::Transient(
-                "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
+        Err(_) => {
+            if let Some(contracts) = pimlico_contracts(rpc, chain_id, beneficiary).await {
+                let verdict = simulate_bundle_with_eth_call(
+                    rpc,
+                    chain_id,
+                    entry_point,
+                    relayer,
+                    calldata.clone(),
+                    hashes,
+                    contracts,
+                )
+                .await;
+                if !matches!(verdict, SimulationVerdict::Transient(_)) {
+                    return verdict;
+                }
+            }
+            match rpc
+                .call(
+                    chain_id,
+                    "debug_traceCall",
+                    debug_trace_params(relayer, entry_point, calldata),
+                )
+                .await
+            {
+                Ok(value) => parse_trace_simulation(value, entry_point, hashes),
+                Err(_) => SimulationVerdict::Transient(
+                    "no trusted executor RPC supports eth_simulateV1, deployed Pimlico eth_call, or debug_traceCall",
+                ),
+            }
+        }
+    }
+}
+
+async fn pimlico_contracts(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    treasury: Address,
+) -> Option<PimlicoSimulationContracts> {
+    let salt = keccak256(treasury.as_slice());
+    let contracts = PimlicoSimulationContracts {
+        pimlico: create2_address(
+            DETERMINISTIC_DEPLOYER,
+            salt,
+            PIMLICO_SIMULATIONS_INIT_CODE_HASH,
+        ),
+        entry_point_v07: create2_address(
+            DETERMINISTIC_DEPLOYER,
+            salt,
+            ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH,
+        ),
+    };
+    let calls = [
+        RpcBatchCall {
+            method: "eth_getCode",
+            params: json!([contracts.pimlico.to_string(), "latest"]),
+        },
+        RpcBatchCall {
+            method: "eth_getCode",
+            params: json!([contracts.entry_point_v07.to_string(), "latest"]),
+        },
+    ];
+    let Ok(responses) = rpc.batch(chain_id, &calls).await else {
+        return None;
+    };
+    responses
+        .iter()
+        .all(|response| {
+            response
+                .as_ref()
+                .ok()
+                .and_then(Value::as_str)
+                .is_some_and(|code| code != "0x")
+        })
+        .then_some(contracts)
+}
+
+async fn simulate_with_pimlico(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    operation: PackedOperation,
+    hash: B256,
+    contracts: Option<PimlicoSimulationContracts>,
+) -> SimulationVerdict<SimulationResult> {
+    let Some(contracts) = contracts else {
+        return SimulationVerdict::Transient(
+            "no trusted executor RPC supports eth_simulateV1, debug_traceCall, or deployed Pimlico simulations",
+        );
+    };
+    let data =
+        pimlico_simulate_handle_op_calldata(contracts.entry_point_v07, entry_point, &operation);
+    match rpc
+        .simulate(
+            chain_id,
+            "eth_call",
+            json!([{
+                "to": contracts.pimlico.to_string(),
+                "data": format!("0x{}", hex::encode(data)),
+            }, "latest"]),
+        )
+        .await
+    {
+        // `simulateHandleOp` reverts for an invalid EntryPoint validation or account call. It has
+        // no logs by design, but individual verdicts are used only to decide bundle membership.
+        Ok(_) => SimulationVerdict::Success(SimulationResult {
+            gas_used: U256::ZERO,
+            events: vec![SimulatedUserOperation {
+                user_operation_hash: hash,
+                success: true,
+                actual_gas_used: U256::ZERO,
+            }],
+            logs: Vec::new(),
+        }),
+        Err(RpcError::Reverted { message, data }) => {
+            if revert_reports_nonce_mismatch(&message, data.as_deref()) {
+                SimulationVerdict::NonceMismatch
+            } else {
+                SimulationVerdict::Rejected(
+                    "Pimlico eth_call simulation reverted during EntryPoint validation or execution",
+                )
+            }
+        }
+        Err(_) => SimulationVerdict::Transient(
+            "Pimlico eth_call simulation is unavailable on trusted executor RPCs",
+        ),
+    }
+}
+
+async fn simulate_bundle_with_eth_call(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    relayer: Address,
+    calldata: Bytes,
+    hashes: &[B256],
+    _contracts: PimlicoSimulationContracts,
+) -> SimulationVerdict<SimulationResult> {
+    // The individual Pimlico calls have already proven validation and account execution. The
+    // standard `eth_estimateGas` here executes the exact final `handleOps` bundle, catching
+    // inter-operation state conflicts without requiring a debug namespace.
+    match rpc
+        .simulate(
+            chain_id,
+            "eth_estimateGas",
+            json!([{
+                "from": relayer.to_string(),
+                "to": entry_point.to_string(),
+                "data": format!("0x{}", hex::encode(calldata)),
+            }, "latest"]),
+        )
+        .await
+    {
+        Ok(value) => match value.as_str().and_then(parse_u256) {
+            Some(gas_used) => SimulationVerdict::Success(SimulationResult {
+                gas_used,
+                // `eth_estimateGas` does not return logs or per-operation gas. Preserve each
+                // expected hash so allocation charges the full outer estimate evenly rather than
+                // crediting an unverified operation.
+                events: hashes
+                    .iter()
+                    .copied()
+                    .map(|user_operation_hash| SimulatedUserOperation {
+                        user_operation_hash,
+                        success: true,
+                        actual_gas_used: U256::ZERO,
+                    })
+                    .collect(),
+                logs: Vec::new(),
+            }),
+            None => SimulationVerdict::Transient(
+                "Pimlico eth_call fallback returned an invalid eth_estimateGas quantity",
             ),
         },
+        Err(RpcError::Reverted { .. }) => SimulationVerdict::Rejected(
+            "final handleOps bundle reverted during eth_estimateGas fallback",
+        ),
+        Err(_) => SimulationVerdict::Transient(
+            "Pimlico eth_call fallback could not estimate the final handleOps bundle",
+        ),
     }
+}
+
+fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> Address {
+    let mut preimage = Vec::with_capacity(85);
+    preimage.push(0xff);
+    preimage.extend_from_slice(deployer.as_slice());
+    preimage.extend_from_slice(salt.as_slice());
+    preimage.extend_from_slice(init_code_hash.as_slice());
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash.as_slice()[12..])
+}
+
+fn revert_reports_nonce_mismatch(message: &str, data: Option<&str>) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("aa25") || message.contains("invalid account nonce") {
+        return true;
+    }
+    let Some(data) = data.and_then(|data| data.strip_prefix("0x")) else {
+        return false;
+    };
+    let Ok(bytes) = hex::decode(data) else {
+        return false;
+    };
+    bytes
+        .windows("aa25".len())
+        .any(|window| window.eq_ignore_ascii_case(b"aa25"))
+        || bytes
+            .windows("invalid account nonce".len())
+            .any(|window| window.eq_ignore_ascii_case(b"invalid account nonce"))
 }
 
 fn simulate_params(from: Address, entry_point: Address, calldata: Bytes) -> Value {
@@ -429,7 +650,11 @@ mod tests {
     use alloy::primitives::{address, b256};
     use serde_json::json;
 
-    use super::{SimulationVerdict, parse_simulation, parse_trace_simulation};
+    use super::{
+        DETERMINISTIC_DEPLOYER, ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH,
+        PIMLICO_SIMULATIONS_INIT_CODE_HASH, SimulationVerdict, create2_address, parse_simulation,
+        parse_trace_simulation, revert_reports_nonce_mismatch,
+    };
 
     #[test]
     fn ignores_forged_events_from_non_entry_point_addresses() {
@@ -555,6 +780,41 @@ mod tests {
         assert!(matches!(
             parse_trace_simulation(trace, entry_point, &[hash]),
             SimulationVerdict::Success(_)
+        ));
+    }
+
+    #[test]
+    fn derives_the_deployed_monad_pimlico_addresses_from_the_treasury_salt() {
+        let treasury = address!("ee2cca98ecbff34663591a925968fa4db5a1f0dd");
+        let salt = alloy::primitives::keccak256(treasury.as_slice());
+        assert_eq!(
+            create2_address(
+                DETERMINISTIC_DEPLOYER,
+                salt,
+                PIMLICO_SIMULATIONS_INIT_CODE_HASH
+            ),
+            address!("002ea30f431a34736439e98275b10350112de6ae")
+        );
+        assert_eq!(
+            create2_address(
+                DETERMINISTIC_DEPLOYER,
+                salt,
+                ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH,
+            ),
+            address!("e050ef4de2109ecded19dcc3d3f2120121d47ec5")
+        );
+    }
+
+    #[test]
+    fn recognizes_a_nonce_mismatch_embedded_in_pimlico_revert_data() {
+        let error_data = "0x65c8fd4d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000194141323520696e76616c6964206163636f756e74206e6f6e636500000000000000";
+        assert!(revert_reports_nonce_mismatch(
+            "execution reverted",
+            Some(error_data)
+        ));
+        assert!(!revert_reports_nonce_mismatch(
+            "execution reverted",
+            Some("0x65c8fd4d")
         ));
     }
 }

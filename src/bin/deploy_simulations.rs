@@ -341,6 +341,7 @@ async fn eip1559_fees(
     Ok((priority, max_fee))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_eip1559(
     secret_key: &k256::SecretKey,
     chain_id: u64,

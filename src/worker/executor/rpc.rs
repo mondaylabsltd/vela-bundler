@@ -36,7 +36,10 @@ pub(super) enum RpcError {
     NoTrustedRpc(u64),
     WrongChain,
     Unavailable,
-    Reverted,
+    Reverted {
+        message: String,
+        data: Option<String>,
+    },
     InvalidResponse,
 }
 
@@ -58,7 +61,7 @@ impl Display for RpcError {
             }
             Self::WrongChain => formatter.write_str("trusted RPC returned the wrong chain ID"),
             Self::Unavailable => formatter.write_str("trusted RPC is temporarily unavailable"),
-            Self::Reverted => formatter.write_str("EVM execution reverted"),
+            Self::Reverted { .. } => formatter.write_str("EVM execution reverted"),
             Self::InvalidResponse => {
                 formatter.write_str("trusted RPC returned an invalid response")
             }
@@ -129,7 +132,7 @@ impl TrustedRpcClient {
                 Ok(response) => match response.into_result_and_error() {
                     (Some(result), None) => return Ok(result),
                     (None, Some(error)) if error.is_execution_revert() => {
-                        return Err(RpcError::Reverted);
+                        return Err(error.into_revert());
                     }
                     _ => continue,
                 },
@@ -393,6 +396,7 @@ struct UpstreamResponse {
 struct UpstreamError {
     code: Option<i64>,
     message: Option<String>,
+    data: Option<Value>,
 }
 
 impl UpstreamError {
@@ -408,6 +412,13 @@ impl UpstreamError {
         self.code == Some(3)
             || message.contains("execution reverted")
             || message.contains("failedop")
+    }
+
+    fn into_revert(self) -> RpcError {
+        RpcError::Reverted {
+            message: self.message.unwrap_or_default(),
+            data: revert_data(&self.data),
+        }
     }
 
     fn is_already_known(&self) -> bool {
@@ -446,7 +457,17 @@ impl UpstreamResponse {
 fn definitive_batch_result(response: UpstreamResponse) -> Option<Result<Value, RpcError>> {
     match response.into_result_and_error() {
         (Some(result), None) => Some(Ok(result)),
-        (None, Some(error)) if error.is_execution_revert() => Some(Err(RpcError::Reverted)),
+        (None, Some(error)) if error.is_execution_revert() => Some(Err(error.into_revert())),
+        _ => None,
+    }
+}
+
+fn revert_data(value: &Option<Value>) -> Option<String> {
+    match value.as_ref()? {
+        Value::String(value) => Some(value.clone()),
+        Value::Object(object) => ["data", "result", "returnData"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str).map(str::to_owned)),
         _ => None,
     }
 }
@@ -460,10 +481,12 @@ mod tests {
         let ambiguous = UpstreamError {
             code: Some(-32000),
             message: Some("nonce too low".into()),
+            data: None,
         };
         let definitive = UpstreamError {
             code: Some(-32000),
             message: Some("insufficient funds for gas * price + value".into()),
+            data: None,
         };
 
         assert!(ambiguous.is_nonce_ambiguous());
