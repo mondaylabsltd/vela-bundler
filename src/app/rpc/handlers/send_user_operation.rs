@@ -8,7 +8,7 @@ use crate::{
         types::{RpcError, RpcResponse, SendUserOperationParams, UserOperation, UserOperationV0_7},
     },
     app::{AppState, QueuedUserOperation, StoredUserOperation},
-    utils::{config::ExecutorChainAssets, rpc},
+    utils::rpc,
 };
 
 const ZERO_GAS_FEE: u128 = 0;
@@ -230,15 +230,8 @@ async fn validate_in_band_submission(
     let recipient = state
         .settlement_recipient()
         .ok_or_else(RpcError::backend_unavailable)?;
-    let has_minimum_payment = if let Some(policy) = state.executor_chain_assets(chain_id) {
-        // The operator policy is the execution trust root. Keeping this path entirely local
-        // avoids one public metadata request plus one ERC-20 decimals RPC for every admission.
-        configured_policy_has_minimum_payment(call_data, recipient, policy)?
-    } else {
-        // Unconfigured chains retain dynamic discovery so arbitrary chain streams can still be
-        // admitted. The executor will not consume them until an operator policy is supplied.
-        fallback_has_minimum_payment(chain_id, user_rpc_url, call_data, recipient).await?
-    };
+    let has_minimum_payment =
+        fallback_has_minimum_payment(chain_id, user_rpc_url, call_data, recipient).await?;
 
     if has_minimum_payment {
         return Ok(());
@@ -247,41 +240,6 @@ async fn validate_in_band_submission(
     Err(RpcError::user_operation_rejected(
         "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin",
     ))
-}
-
-fn configured_policy_has_minimum_payment(
-    call_data: &str,
-    recipient: &str,
-    policy: &ExecutorChainAssets,
-) -> Result<bool, RpcError> {
-    let reimbursement = in_band_settlement::parse_reimbursement(
-        call_data,
-        recipient,
-        policy
-            .stablecoins
-            .iter()
-            .map(|stablecoin| stablecoin.address.clone()),
-    );
-    let native_minimum = in_band_settlement::minimum_native_amount(policy.native_decimals)
-        .ok_or_else(RpcError::estimation_unavailable)?;
-    if reimbursement.native >= native_minimum {
-        return Ok(true);
-    }
-
-    for stablecoin in &policy.stablecoins {
-        let amount = reimbursement
-            .stablecoins
-            .get(&stablecoin.address.to_ascii_lowercase())
-            .copied()
-            .unwrap_or_default();
-        let minimum = in_band_settlement::minimum_stablecoin_amount(stablecoin.decimals)
-            .ok_or_else(RpcError::estimation_unavailable)?;
-        if amount >= minimum {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 async fn fallback_has_minimum_payment(
@@ -552,26 +510,16 @@ fn keccak256(value: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
-
     use serde_json::json;
 
     use super::{
         ExistingAdmissionAction, PreparedUserOperation, existing_admission_action, quantity,
-        validate_in_band_submission,
     };
-    use crate::{
-        app::{
-            AppState, StoredUserOperation,
-            rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7},
-        },
-        utils::config::{
-            ExecutorChainAssets, ExecutorCostModel, ExecutorOracle, ExecutorStablecoin,
-        },
+    use crate::app::{
+        StoredUserOperation,
+        rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7},
     };
 
-    const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
-    const STABLECOIN: &str = "0x2222222222222222222222222222222222222222";
     const ENTRY_POINT: &str = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
     const LOCAL_POLICY_CHAIN: u64 = 9_999_999_991;
 
@@ -688,67 +636,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn explicit_operator_policy_avoids_metadata_and_erc20_decimals_rpc() {
-        let mut operation = match user_operation() {
-            UserOperation::V0_7(operation) => operation,
-            UserOperation::V0_6(_) => unreachable!(),
-        };
-        operation.call_data = safe_stablecoin_payment(10_000);
-        let state = AppState::with_settlement_recipient(&[], Some(RECIPIENT.into()))
-            .with_executor_chain_assets(Arc::new(BTreeMap::from([(
-                LOCAL_POLICY_CHAIN,
-                chain_policy(),
-            )])));
-
-        // This synthetic chain has no public metadata endpoint. Success proves admission used
-        // the local six-decimal policy rather than attempting either metadata or token RPC.
-        assert!(
-            validate_in_band_submission(
-                LOCAL_POLICY_CHAIN,
-                None,
-                &state,
-                &UserOperation::V0_7(operation.clone()),
-            )
-            .await
-            .is_ok()
-        );
-
-        operation.call_data = safe_stablecoin_payment(9_999);
-        assert!(
-            validate_in_band_submission(
-                LOCAL_POLICY_CHAIN,
-                None,
-                &state,
-                &UserOperation::V0_7(operation),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    fn chain_policy() -> ExecutorChainAssets {
-        ExecutorChainAssets {
-            cost_model: ExecutorCostModel::Eip1559,
-            native_decimals: 18,
-            native_usd_oracle: Some(ExecutorOracle {
-                address: "0x3333333333333333333333333333333333333333".into(),
-                decimals: 8,
-                max_age_seconds: 3_600,
-            }),
-            stablecoins: vec![ExecutorStablecoin {
-                address: STABLECOIN.into(),
-                decimals: 6,
-                symbol: Some("USDC".into()),
-                usd_oracle: ExecutorOracle {
-                    address: "0x4444444444444444444444444444444444444444".into(),
-                    decimals: 8,
-                    max_age_seconds: 86_400,
-                },
-            }],
-        }
-    }
-
     fn stored_admission(user_operation: UserOperation, admitted: bool) -> StoredUserOperation {
         StoredUserOperation {
             status: UserOperationStatusKind::Queued,
@@ -763,57 +650,6 @@ mod tests {
             block_number: None,
             receipt: None,
             event: None,
-        }
-    }
-
-    fn safe_stablecoin_payment(amount: u128) -> String {
-        let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
-        transfer.extend(word_address(RECIPIENT));
-        transfer.extend(word_u128(amount));
-
-        let mut transaction = vec![0];
-        transaction.extend(address_bytes(STABLECOIN));
-        transaction.extend(word_u128(0));
-        transaction.extend(word_u128(transfer.len() as u128));
-        transaction.extend(transfer);
-
-        let mut multisend = vec![0x8d, 0x80, 0xff, 0x0a];
-        multisend.extend(word_u128(32));
-        multisend.extend(word_u128(transaction.len() as u128));
-        multisend.extend(transaction);
-        pad_function_arguments(&mut multisend);
-
-        let mut call_data = vec![0x7b, 0xb3, 0x74, 0x28];
-        call_data.extend(word_address("0x38869bf66a61cf6bdb996a6ae40d5853fd43b526"));
-        call_data.extend(word_u128(0));
-        call_data.extend(word_u128(128));
-        call_data.extend(word_u128(1));
-        call_data.extend(word_u128(multisend.len() as u128));
-        call_data.extend(multisend);
-        pad_function_arguments(&mut call_data);
-        format!("0x{}", hex::encode(call_data))
-    }
-
-    fn address_bytes(value: &str) -> Vec<u8> {
-        hex::decode(value.strip_prefix("0x").unwrap()).unwrap()
-    }
-
-    fn word_address(value: &str) -> Vec<u8> {
-        let mut word = vec![0; 12];
-        word.extend(address_bytes(value));
-        word
-    }
-
-    fn word_u128(value: u128) -> Vec<u8> {
-        let mut word = vec![0; 16];
-        word.extend(value.to_be_bytes());
-        word
-    }
-
-    fn pad_function_arguments(call_data: &mut Vec<u8>) {
-        let remainder = (call_data.len() - 4) % 32;
-        if remainder != 0 {
-            call_data.resize(call_data.len() + 32 - remainder, 0);
         }
     }
 }

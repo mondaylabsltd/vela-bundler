@@ -3,8 +3,6 @@ mod gas_price;
 mod utils;
 mod worker;
 
-use std::sync::Arc;
-
 use crate::{
     utils::{AppError, config::Config},
     worker::{BackgroundWorker, UserOperationExecution},
@@ -36,7 +34,6 @@ async fn run(config: Config) -> Result<(), AppError> {
         worker::JOB_NAMES,
         config.settlement_recipient.clone(),
     )
-    .with_executor_chain_assets(Arc::new(config.executor.chain_assets.clone()))
     .with_user_operation_queue(user_operation_queue)
     .with_user_operation_status_store(user_operation_status_store);
     let app = app::router(&config.http, state.clone());

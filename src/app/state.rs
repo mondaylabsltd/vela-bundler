@@ -1,9 +1,9 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
-use crate::{gas_price::GasPriceManager, utils::config::ExecutorChainAssets};
+use crate::gas_price::GasPriceManager;
 
 use super::{queue::UserOperationQueue, user_operation_store::UserOperationStatusStore};
 
@@ -12,9 +12,6 @@ pub struct AppState {
     gas_price: GasPriceManager,
     readiness: Readiness,
     settlement_recipient: Option<String>,
-    /// Immutable operator-owned payment policy. Public chain metadata remains a fallback only
-    /// for chains that are not explicitly present here.
-    executor_chain_assets: Arc<BTreeMap<u64, ExecutorChainAssets>>,
     user_operation_queue: Option<UserOperationQueue>,
     user_operation_status_store: Option<UserOperationStatusStore>,
 }
@@ -37,18 +34,9 @@ impl AppState {
                 ready_jobs: Arc::new(Mutex::new(HashSet::new())),
             },
             settlement_recipient,
-            executor_chain_assets: Arc::new(BTreeMap::new()),
             user_operation_queue: None,
             user_operation_status_store: None,
         }
-    }
-
-    pub fn with_executor_chain_assets(
-        mut self,
-        executor_chain_assets: Arc<BTreeMap<u64, ExecutorChainAssets>>,
-    ) -> Self {
-        self.executor_chain_assets = executor_chain_assets;
-        self
     }
 
     pub fn with_user_operation_queue(mut self, user_operation_queue: UserOperationQueue) -> Self {
@@ -74,10 +62,6 @@ impl AppState {
 
     pub fn settlement_recipient(&self) -> Option<&str> {
         self.settlement_recipient.as_deref()
-    }
-
-    pub fn executor_chain_assets(&self, chain_id: u64) -> Option<&ExecutorChainAssets> {
-        self.executor_chain_assets.get(&chain_id)
     }
 
     pub fn user_operation_queue(&self) -> Option<UserOperationQueue> {

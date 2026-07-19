@@ -8,37 +8,25 @@ use alloy::primitives::{Address, B256, Bytes, U256, address, aliases::U512, kecc
 const EXECUTE_USER_OP_SELECTOR: [u8; 4] = [0x7b, 0xb3, 0x74, 0x28];
 const MULTISEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-pub(crate) const LATEST_ROUND_DATA_SELECTOR: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8c];
 const TRUSTED_MULTISEND: Address = address!("38869bf66a61cf6bdb996a6ae40d5853fd43b526");
 
 pub(crate) const MIN_NATIVE_FRACTION_DECIMALS: u32 = 5;
 pub(crate) const MIN_STABLE_FRACTION_DECIMALS: u32 = 2;
+pub(crate) const USD_PRICE_DECIMALS: u32 = 8;
 
-/// Operator-owned asset policy for one chain.
-///
-/// Chain-registry metadata can help populate this structure, but must never be
-/// accepted as the trust root for the stablecoin or contract allowlists.
+/// Settlement assets loaded from the controlled chain directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChainAssetConfig {
     pub(crate) native_decimals: u32,
     /// Required reimbursement ratio in basis points; 20_000 means 2x cost.
     pub(crate) settlement_markup_bps: u64,
-    pub(crate) native_usd_oracle: Option<OracleConfig>,
     pub(crate) stablecoins: BTreeMap<Address, StablecoinConfig>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OracleConfig {
-    pub(crate) address: Address,
-    pub(crate) decimals: u32,
-    pub(crate) max_age_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StablecoinConfig {
     pub(crate) symbol: String,
     pub(crate) decimals: u32,
-    pub(crate) usd_oracle: OracleConfig,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,12 +40,6 @@ pub(crate) struct SettlementInput<'a> {
 pub(crate) struct Reimbursement {
     pub(crate) native: U256,
     pub(crate) stablecoins: BTreeMap<Address, U256>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OracleRound {
-    pub(crate) answer: U256,
-    pub(crate) updated_at: u64,
 }
 
 /// Minimal simulation-log view used to confirm that the statically parsed
@@ -108,8 +90,7 @@ impl BatchSettlementEvaluation {
 pub(crate) enum SettlementError {
     InvalidConfiguration(&'static str),
     ArithmeticOverflow,
-    MissingOraclePrice(Address),
-    InvalidOracleRound(Address, &'static str),
+    MissingNativeUsdPrice,
 }
 
 impl Display for SettlementError {
@@ -117,12 +98,7 @@ impl Display for SettlementError {
         match self {
             Self::InvalidConfiguration(message) => formatter.write_str(message),
             Self::ArithmeticOverflow => formatter.write_str("settlement arithmetic overflow"),
-            Self::MissingOraclePrice(oracle) => {
-                write!(formatter, "missing USD oracle price for {oracle}")
-            }
-            Self::InvalidOracleRound(oracle, reason) => {
-                write!(formatter, "invalid USD oracle round for {oracle}: {reason}")
-            }
+            Self::MissingNativeUsdPrice => formatter.write_str("missing Binance native USD price"),
         }
     }
 }
@@ -238,7 +214,7 @@ pub(crate) fn evaluate_batch(
     recipient: Address,
     config: &ChainAssetConfig,
     inputs: &[SettlementInput<'_>],
-    oracle_prices: &BTreeMap<Address, U256>,
+    native_usd_price: Option<U256>,
 ) -> Result<BatchSettlementEvaluation, SettlementError> {
     validate_config(config)?;
     let native_floor = minimum_amount(config.native_decimals, MIN_NATIVE_FRACTION_DECIMALS)?;
@@ -271,7 +247,7 @@ pub(crate) fn evaluate_batch(
             marked_cost,
             native_floor,
             config,
-            oracle_prices,
+            native_usd_price,
         ) {
             Ok(evaluation) => operations.push(evaluation),
             Err(SettlementError::ArithmeticOverflow) => operations.push(SettlementEvaluation {
@@ -289,160 +265,13 @@ pub(crate) fn evaluate_batch(
     Ok(BatchSettlementEvaluation { operations })
 }
 
-/// Returns only the operator-configured feeds needed by the stablecoins actually present in this
-/// batch. Native-only settlement performs no oracle RPC.
-pub(crate) fn required_oracle_feeds(
-    recipient: Address,
-    config: &ChainAssetConfig,
-    inputs: &[SettlementInput<'_>],
-) -> Result<BTreeMap<Address, OracleConfig>, SettlementError> {
-    validate_config(config)?;
-    let allowlist = config.stablecoins.keys().copied().collect::<BTreeSet<_>>();
-    let mut used_stablecoins = BTreeSet::new();
-
-    for input in inputs {
-        if let Ok(reimbursement) = parse_reimbursement(input.call_data, recipient, &allowlist) {
-            used_stablecoins.extend(reimbursement.stablecoins.keys().copied());
-        }
-    }
-
-    if used_stablecoins.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let native_oracle = config
-        .native_usd_oracle
-        .ok_or(SettlementError::InvalidConfiguration(
-            "native USD oracle is required for stablecoin settlement",
-        ))?;
-    let mut feeds = BTreeMap::new();
-    insert_oracle_config(&mut feeds, native_oracle)?;
-
-    for stablecoin in used_stablecoins {
-        let asset = config
-            .stablecoins
-            .get(&stablecoin)
-            .expect("used stablecoin came from the trusted allowlist");
-        insert_oracle_config(&mut feeds, asset.usd_oracle)?;
-    }
-
-    Ok(feeds)
-}
-
-fn insert_oracle_config(
-    feeds: &mut BTreeMap<Address, OracleConfig>,
-    oracle: OracleConfig,
-) -> Result<(), SettlementError> {
-    if feeds
-        .insert(oracle.address, oracle)
-        .is_some_and(|existing| existing != oracle)
-    {
-        return Err(SettlementError::InvalidConfiguration(
-            "one oracle address has conflicting metadata",
-        ));
-    }
-    Ok(())
-}
-
-/// Strictly decodes Chainlink AggregatorV3 `latestRoundData()` and rejects incomplete, negative,
-/// future, or stale rounds. Feed decimals are operator policy and are intentionally not queried.
-pub(crate) fn decode_latest_round_data(
-    oracle: Address,
-    response: &[u8],
-    now_unix_seconds: u64,
-    max_age_seconds: u64,
-) -> Result<OracleRound, SettlementError> {
-    if response.len() != 5 * 32 {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "response is not five ABI words",
-        ));
-    }
-    let round_id = read_uint80_word(response, 0).ok_or(SettlementError::InvalidOracleRound(
-        oracle,
-        "roundId is not uint80",
-    ))?;
-    if round_id.is_zero() {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "roundId is zero",
-        ));
-    }
-    if response[32] & 0x80 != 0 {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "answer is negative",
-        ));
-    }
-    let answer = read_u256_word(response, 32).expect("fixed oracle answer word");
-    if answer.is_zero() {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "answer is zero",
-        ));
-    }
-    let started_at = read_u64_word(response, 64).ok_or(SettlementError::InvalidOracleRound(
-        oracle,
-        "startedAt exceeds uint64",
-    ))?;
-    let updated_at = read_u64_word(response, 96).ok_or(SettlementError::InvalidOracleRound(
-        oracle,
-        "updatedAt exceeds uint64",
-    ))?;
-    let answered_in_round = read_uint80_word(response, 128).ok_or(
-        SettlementError::InvalidOracleRound(oracle, "answeredInRound is not uint80"),
-    )?;
-    if started_at == 0 || updated_at < started_at {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "round timestamps are incomplete",
-        ));
-    }
-    if answered_in_round < round_id {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "answeredInRound precedes roundId",
-        ));
-    }
-    let round = OracleRound { answer, updated_at };
-    validate_oracle_freshness(oracle, round, now_unix_seconds, max_age_seconds)?;
-    Ok(round)
-}
-
-pub(crate) fn validate_oracle_freshness(
-    oracle: Address,
-    round: OracleRound,
-    now_unix_seconds: u64,
-    max_age_seconds: u64,
-) -> Result<(), SettlementError> {
-    if round.answer.is_zero() {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "cached answer is zero",
-        ));
-    }
-    if round.updated_at > now_unix_seconds {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "updatedAt is in the future",
-        ));
-    }
-    if now_unix_seconds - round.updated_at > max_age_seconds {
-        return Err(SettlementError::InvalidOracleRound(
-            oracle,
-            "round is stale",
-        ));
-    }
-    Ok(())
-}
-
 fn evaluate_one(
     reimbursement: Reimbursement,
     gas_native_cost: U256,
     marked_cost: U256,
     native_floor: U256,
     config: &ChainAssetConfig,
-    oracle_prices: &BTreeMap<Address, U256>,
+    native_usd_price: Option<U256>,
 ) -> Result<SettlementEvaluation, SettlementError> {
     let has_native = !reimbursement.native.is_zero();
     match (has_native, reimbursement.stablecoins.len()) {
@@ -471,22 +300,11 @@ fn evaluate_one(
                     .ok_or(SettlementError::InvalidConfiguration(
                         "parsed stablecoin is not in the trusted asset policy",
                     ))?;
-            let native_oracle =
-                config
-                    .native_usd_oracle
-                    .ok_or(SettlementError::InvalidConfiguration(
-                        "native USD oracle is required for stablecoin settlement",
-                    ))?;
-            let native_price = oracle_price(oracle_prices, native_oracle.address)?;
-            let stable_price = oracle_price(oracle_prices, asset.usd_oracle.address)?;
-            let converted = native_to_stable_ceil(
+            let converted = native_to_usd_stable_ceil(
                 marked_cost,
                 config.native_decimals,
-                native_oracle.decimals,
-                native_price,
+                native_usd_price.ok_or(SettlementError::MissingNativeUsdPrice)?,
                 asset.decimals,
-                asset.usd_oracle.decimals,
-                stable_price,
             )?;
             let stable_floor = minimum_amount(asset.decimals, MIN_STABLE_FRACTION_DECIMALS)?;
             let required_amount = converted.max(stable_floor);
@@ -519,47 +337,27 @@ fn evaluate_one(
     }
 }
 
-fn oracle_price(
-    prices: &BTreeMap<Address, U256>,
-    oracle: Address,
-) -> Result<U256, SettlementError> {
-    prices
-        .get(&oracle)
-        .copied()
-        .filter(|price| !price.is_zero())
-        .ok_or(SettlementError::MissingOraclePrice(oracle))
-}
-
-pub(crate) fn native_to_stable_ceil(
+pub(crate) fn native_to_usd_stable_ceil(
     native_amount: U256,
     native_decimals: u32,
-    native_oracle_decimals: u32,
     native_usd_price: U256,
     stable_decimals: u32,
-    stable_oracle_decimals: u32,
-    stable_usd_price: U256,
 ) -> Result<U256, SettlementError> {
-    if native_usd_price.is_zero() || stable_usd_price.is_zero() {
+    if native_usd_price.is_zero() {
         return Err(SettlementError::ArithmeticOverflow);
     }
-    let numerator_exponent = stable_decimals
-        .checked_add(stable_oracle_decimals)
-        .ok_or(SettlementError::ArithmeticOverflow)?;
     let denominator_exponent = native_decimals
-        .checked_add(native_oracle_decimals)
+        .checked_add(USD_PRICE_DECIMALS)
         .ok_or(SettlementError::ArithmeticOverflow)?;
-    let common_exponent = numerator_exponent.min(denominator_exponent);
-    let numerator_scale = checked_pow10_u512(numerator_exponent - common_exponent)
-        .ok_or(SettlementError::ArithmeticOverflow)?;
-    let denominator_scale = checked_pow10_u512(denominator_exponent - common_exponent)
-        .ok_or(SettlementError::ArithmeticOverflow)?;
+    let numerator_scale =
+        checked_pow10_u512(stable_decimals).ok_or(SettlementError::ArithmeticOverflow)?;
+    let denominator_scale =
+        checked_pow10_u512(denominator_exponent).ok_or(SettlementError::ArithmeticOverflow)?;
     let numerator = widen_u256(native_amount)
         .checked_mul(widen_u256(native_usd_price))
         .and_then(|value| value.checked_mul(numerator_scale))
         .ok_or(SettlementError::ArithmeticOverflow)?;
-    let denominator = widen_u256(stable_usd_price)
-        .checked_mul(denominator_scale)
-        .ok_or(SettlementError::ArithmeticOverflow)?;
+    let denominator = denominator_scale;
     if denominator.is_zero() {
         return Err(SettlementError::ArithmeticOverflow);
     }
@@ -600,16 +398,6 @@ fn validate_config(config: &ChainAssetConfig) -> Result<(), SettlementError> {
         ));
     }
     minimum_amount(config.native_decimals, MIN_NATIVE_FRACTION_DECIMALS)?;
-    if !config.stablecoins.is_empty() && config.native_usd_oracle.is_none() {
-        return Err(SettlementError::InvalidConfiguration(
-            "native USD oracle is required when stablecoins are enabled",
-        ));
-    }
-    let mut oracle_configs = BTreeMap::new();
-    if let Some(oracle) = config.native_usd_oracle {
-        validate_oracle_config(oracle)?;
-        insert_oracle_config(&mut oracle_configs, oracle)?;
-    }
     for asset in config.stablecoins.values() {
         minimum_amount(asset.decimals, MIN_STABLE_FRACTION_DECIMALS)?;
         if asset.symbol.trim().is_empty() {
@@ -617,17 +405,6 @@ fn validate_config(config: &ChainAssetConfig) -> Result<(), SettlementError> {
                 "stablecoin symbol cannot be empty",
             ));
         }
-        validate_oracle_config(asset.usd_oracle)?;
-        insert_oracle_config(&mut oracle_configs, asset.usd_oracle)?;
-    }
-    Ok(())
-}
-
-fn validate_oracle_config(oracle: OracleConfig) -> Result<(), SettlementError> {
-    if oracle.decimals > 38 || oracle.max_age_seconds == 0 {
-        return Err(SettlementError::InvalidConfiguration(
-            "oracle decimals must not exceed 38 and max age must be non-zero",
-        ));
     }
     Ok(())
 }
@@ -688,19 +465,6 @@ fn read_u256_word(data: &[u8], offset: usize) -> Option<U256> {
     Some(U256::from_be_slice(
         data.get(offset..offset.checked_add(32)?)?,
     ))
-}
-
-fn read_uint80_word(data: &[u8], offset: usize) -> Option<U256> {
-    let word = data.get(offset..offset.checked_add(32)?)?;
-    if word[..22].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    Some(U256::from_be_slice(word))
-}
-
-fn read_u64_word(data: &[u8], offset: usize) -> Option<u64> {
-    let value = read_u256_word(data, offset)?;
-    u64::try_from(value).ok()
 }
 
 fn read_usize_word(data: &[u8], offset: usize) -> Option<usize> {
@@ -782,16 +546,13 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address, keccak256};
 
     use super::{
-        ChainAssetConfig, OracleConfig, ReimbursementParseError, SettlementInput, SettlementLog,
-        SettlementRejection, StablecoinConfig, decode_latest_round_data, evaluate_batch,
-        native_to_stable_ceil, parse_reimbursement, required_oracle_feeds,
-        verify_stable_transfer_logs,
+        ChainAssetConfig, ReimbursementParseError, SettlementInput, SettlementLog,
+        SettlementRejection, StablecoinConfig, evaluate_batch, native_to_usd_stable_ceil,
+        parse_reimbursement, verify_stable_transfer_logs,
     };
 
     const RECIPIENT: Address = address!("1111111111111111111111111111111111111111");
     const STABLECOIN: Address = address!("2222222222222222222222222222222222222222");
-    const NATIVE_ORACLE: Address = address!("3333333333333333333333333333333333333333");
-    const STABLE_ORACLE: Address = address!("4444444444444444444444444444444444444444");
     const SENDER: Address = address!("6666666666666666666666666666666666666666");
 
     #[test]
@@ -865,7 +626,7 @@ mod tests {
                     gas_native_cost: U256::from(100u64),
                 },
             ],
-            &BTreeMap::new(),
+            None,
         )
         .unwrap();
 
@@ -896,7 +657,7 @@ mod tests {
                     gas_native_cost: U256::from(3u8),
                 },
             ],
-            &BTreeMap::new(),
+            None,
         )
         .unwrap();
 
@@ -966,7 +727,7 @@ mod tests {
                     gas_native_cost: U256::ZERO,
                 },
             ],
-            &BTreeMap::new(),
+            None,
         )
         .unwrap();
         assert!(!native_result.operations[0].accepted());
@@ -990,7 +751,7 @@ mod tests {
                     gas_native_cost: U256::ZERO,
                 },
             ],
-            &oracle_prices(2_000_00000000, 1_00000000),
+            Some(U256::from(2_000_00000000u64)),
         )
         .unwrap();
         assert_eq!(
@@ -1005,101 +766,20 @@ mod tests {
     fn converts_native_cost_to_stable_units_with_ceiling_rounding() {
         // 0.001 ETH at $2,000/ETH costs $2, so a 6-decimal $1 stable requires 2_000_000 units.
         assert_eq!(
-            native_to_stable_ceil(
+            native_to_usd_stable_ceil(
                 U256::from(1_000_000_000_000_000u64),
                 18,
-                8,
                 U256::from(2_000_00000000u64),
                 6,
-                8,
-                U256::from(1_00000000u64),
             )
             .unwrap(),
             U256::from(2_000_000u64)
         );
 
-        // The exact rational result is 1/3 base unit and must round up in the bundler's favour.
+        // The exact rational result is one billionth of a base unit and must round up.
         assert_eq!(
-            native_to_stable_ceil(U256::ONE, 0, 0, U256::ONE, 0, 0, U256::from(3u8),).unwrap(),
+            native_to_usd_stable_ceil(U256::ONE, 0, U256::ONE, 0).unwrap(),
             U256::ONE
-        );
-    }
-
-    #[test]
-    fn fails_closed_on_oracle_conversion_overflow() {
-        assert!(native_to_stable_ceil(U256::MAX, 0, 0, U256::MAX, 38, 38, U256::ONE,).is_err());
-    }
-
-    #[test]
-    fn decodes_only_positive_complete_and_fresh_oracle_rounds() {
-        let now = 1_000u64;
-        let valid = oracle_response(7, U256::from(2_000_00000000u64), 900, 950, 7);
-        let round = decode_latest_round_data(NATIVE_ORACLE, &valid, now, 100).unwrap();
-        assert_eq!(round.answer, U256::from(2_000_00000000u64));
-        assert_eq!(round.updated_at, 950);
-
-        assert!(
-            decode_latest_round_data(
-                NATIVE_ORACLE,
-                &oracle_response(7, U256::from(2_000_00000000u64), 800, 899, 7),
-                now,
-                100,
-            )
-            .is_err()
-        );
-        assert!(
-            decode_latest_round_data(
-                NATIVE_ORACLE,
-                &oracle_response(7, U256::from(2_000_00000000u64), 900, 950, 6),
-                now,
-                100,
-            )
-            .is_err()
-        );
-        assert!(
-            decode_latest_round_data(
-                NATIVE_ORACLE,
-                &oracle_response(7, U256::ZERO, 900, 950, 7),
-                now,
-                100,
-            )
-            .is_err()
-        );
-        let mut negative = oracle_response(7, U256::ONE, 900, 950, 7);
-        negative[32] = 0xff;
-        assert!(decode_latest_round_data(NATIVE_ORACLE, &negative, now, 100).is_err());
-    }
-
-    #[test]
-    fn fetches_oracles_only_for_stablecoin_payments() {
-        let config = config_with_stable(18, 6);
-        let native = safe_multisend(&[Entry::native(RECIPIENT, U256::ONE)]);
-        assert!(
-            required_oracle_feeds(
-                RECIPIENT,
-                &config,
-                &[SettlementInput {
-                    call_data: &native,
-                    gas_native_cost: U256::ONE,
-                }],
-            )
-            .unwrap()
-            .is_empty()
-        );
-
-        let stable = safe_multisend(&[Entry::erc20(STABLECOIN, RECIPIENT, U256::ONE)]);
-        let feeds = required_oracle_feeds(
-            RECIPIENT,
-            &config,
-            &[SettlementInput {
-                call_data: &stable,
-                gas_native_cost: U256::ONE,
-            }],
-        )
-        .unwrap();
-        assert_eq!(
-            feeds.keys().copied().collect::<Vec<_>>(),
-            [NATIVE_ORACLE, STABLE_ORACLE]
         );
     }
 
@@ -1117,7 +797,7 @@ mod tests {
                 call_data: &mixed,
                 gas_native_cost: U256::ZERO,
             }],
-            &oracle_prices(2_000_00000000, 1_00000000),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1130,7 +810,6 @@ mod tests {
         ChainAssetConfig {
             native_decimals,
             settlement_markup_bps: 20_000,
-            native_usd_oracle: None,
             stablecoins: BTreeMap::new(),
         }
     }
@@ -1139,51 +818,14 @@ mod tests {
         ChainAssetConfig {
             native_decimals,
             settlement_markup_bps: 20_000,
-            native_usd_oracle: Some(OracleConfig {
-                address: NATIVE_ORACLE,
-                decimals: 8,
-                max_age_seconds: 3_600,
-            }),
             stablecoins: BTreeMap::from([(
                 STABLECOIN,
                 StablecoinConfig {
                     symbol: "USDC".into(),
                     decimals: stable_decimals,
-                    usd_oracle: OracleConfig {
-                        address: STABLE_ORACLE,
-                        decimals: 8,
-                        max_age_seconds: 86_400,
-                    },
                 },
             )]),
         }
-    }
-
-    fn oracle_prices(native: u64, stable: u64) -> BTreeMap<Address, U256> {
-        BTreeMap::from([
-            (NATIVE_ORACLE, U256::from(native)),
-            (STABLE_ORACLE, U256::from(stable)),
-        ])
-    }
-
-    fn oracle_response(
-        round_id: u64,
-        answer: U256,
-        started_at: u64,
-        updated_at: u64,
-        answered_in_round: u64,
-    ) -> Vec<u8> {
-        let mut response = Vec::with_capacity(160);
-        for value in [
-            U256::from(round_id),
-            answer,
-            U256::from(started_at),
-            U256::from(updated_at),
-            U256::from(answered_in_round),
-        ] {
-            response.extend_from_slice(&value.to_be_bytes::<32>());
-        }
-        response
     }
 
     fn transfer_log(token: Address, from: Address, to: Address, amount: U256) -> SettlementLog {

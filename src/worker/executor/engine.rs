@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::{Display, Formatter},
     future::Future,
     str::FromStr,
@@ -11,6 +11,8 @@ use std::{
 };
 
 use alloy::primitives::{Address, B256, Bytes, U256};
+use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -23,7 +25,7 @@ use crate::{
         rpc::types::{UserOperation, UserOperationStatusKind},
     },
     utils::{
-        config::{ExecutorChainAssets, ExecutorConfig, ExecutorOracle},
+        config::ExecutorConfig,
         rpc as chain_directory,
         vault::{
             derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
@@ -42,21 +44,23 @@ use super::{
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
-        ChainAssetConfig, LATEST_ROUND_DATA_SELECTOR, OracleConfig, OracleRound, SettlementInput,
-        SettlementLog, StablecoinConfig, decode_latest_round_data, evaluate_batch,
-        required_oracle_feeds, validate_oracle_freshness, verify_stable_transfer_logs,
+        ChainAssetConfig, SettlementInput, SettlementLog, StablecoinConfig, USD_PRICE_DECIMALS,
+        evaluate_batch, parse_reimbursement, verify_stable_transfer_logs,
     },
     simulation::{SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{TransactionPlan, sign_eip1559, signer_address},
 };
 
-const ORACLE_CACHE_TTL: Duration = Duration::from_secs(30);
 const BROADCAST_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const TOP_UP_BUDGET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const TOP_UP_GAS_LIMIT: u64 = 21_000;
 const RECEIPT_RECONCILE_FAILURE_DELAY: Duration = Duration::from_secs(1);
 const DELAYED_CLAIM_BATCH_SIZE: usize = 100;
 const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
+const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
+const USD_PRICE_SCALE: u64 = 100_000_000;
+const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
+const BINANCE_TICKER_URL: &str = "https://api.binance.com/api/v3/ticker/price?symbol=";
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -69,16 +73,27 @@ pub(crate) struct ExecutorEngine {
     relayer_addresses: Arc<[Address]>,
     treasury_key: Arc<k256::SecretKey>,
     treasury_address: Address,
-    chain_assets: Arc<BTreeMap<u64, ChainAssetConfig>>,
-    directory_chain_assets: Arc<Mutex<HashMap<u64, ChainAssetConfig>>>,
-    oracle_cache: Arc<Mutex<HashMap<(u64, Address), CachedOracleRound>>>,
+    directory_chain_assets: Arc<Mutex<HashMap<u64, ResolvedChainAssets>>>,
+    market_http: Client,
+    market_prices: Arc<Mutex<HashMap<String, CachedMarketPrice>>>,
     broadcast_seen: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
+#[derive(Clone)]
+struct ResolvedChainAssets {
+    assets: ChainAssetConfig,
+    native_symbol: String,
+}
+
 #[derive(Clone, Debug)]
-struct CachedOracleRound {
-    fetched_at: Instant,
-    round: OracleRound,
+struct CachedMarketPrice {
+    expires_at: Instant,
+    price: U256,
+}
+
+#[derive(Deserialize)]
+struct BinanceTicker {
+    price: String,
 }
 
 #[derive(Debug)]
@@ -163,6 +178,13 @@ impl ExecutorEngine {
     ) -> Result<Self, ExecutorBuildError> {
         let rpc = TrustedRpcClient::new(&config)
             .map_err(|error| ExecutorBuildError(error.to_string()))?;
+        let market_http = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(config.rpc_timeout)
+            .build()
+            .map_err(|error| {
+                ExecutorBuildError(format!("could not create market data client: {error}"))
+            })?;
         let mut relayer_keys = Vec::with_capacity(config.pool_width);
         let mut relayer_addresses = Vec::with_capacity(config.pool_width);
         for index in 0..config.pool_width {
@@ -174,15 +196,6 @@ impl ExecutorEngine {
         let treasury_key = derive_treasury_secret_key(config.operator_secret.expose())
             .map_err(|error| ExecutorBuildError(error.to_string()))?;
         let treasury_address = signer_address(&treasury_key);
-        let chain_assets = config
-            .chain_assets
-            .iter()
-            .map(|(chain_id, assets)| {
-                chain_asset_config(assets, config.settlement_markup_bps)
-                    .map(|assets| (*chain_id, assets))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-
         Ok(Self {
             config: Arc::new(config),
             rpc,
@@ -191,9 +204,9 @@ impl ExecutorEngine {
             relayer_addresses: relayer_addresses.into(),
             treasury_key: Arc::new(treasury_key),
             treasury_address,
-            chain_assets: Arc::new(chain_assets),
             directory_chain_assets: Arc::new(Mutex::new(HashMap::new())),
-            oracle_cache: Arc::new(Mutex::new(HashMap::new())),
+            market_http,
+            market_prices: Arc::new(Mutex::new(HashMap::new())),
             broadcast_seen: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -522,7 +535,8 @@ impl ExecutorEngine {
                 self.execute_with_lane_lease(
                     chain_id,
                     lane,
-                    &chain_assets,
+                    &chain_assets.assets,
+                    &chain_assets.native_symbol,
                     candidates,
                     &mut results,
                     &lease_scope,
@@ -540,10 +554,10 @@ impl ExecutorEngine {
         finish_results(results, "UserOperation execution was deferred")
     }
 
-    async fn chain_assets_for(&self, chain_id: u64) -> Result<ChainAssetConfig, ExecutorItemError> {
-        if let Some(assets) = self.chain_assets.get(&chain_id) {
-            return Ok(assets.clone());
-        }
+    async fn chain_assets_for(
+        &self,
+        chain_id: u64,
+    ) -> Result<ResolvedChainAssets, ExecutorItemError> {
         if let Some(assets) = self
             .directory_chain_assets
             .lock()
@@ -554,19 +568,79 @@ impl ExecutorEngine {
             return Ok(assets);
         }
 
-        let assets = chain_directory::executor_chain_assets(chain_id)
-            .await
-            .map_err(|_| {
-                ExecutorItemError("could not load executor policy from chain directory".into())
-            })?
-            .ok_or_else(|| ExecutorItemError("chain directory has no executor policy".into()))?;
-        let assets = chain_asset_config(&assets, self.config.settlement_markup_bps)
-            .map_err(|error| ExecutorItemError(error.to_string()))?;
+        let assets = self.directory_usd_stable_assets(chain_id).await?;
         self.directory_chain_assets
             .lock()
             .await
             .insert(chain_id, assets.clone());
         Ok(assets)
+    }
+
+    async fn directory_usd_stable_assets(
+        &self,
+        chain_id: u64,
+    ) -> Result<ResolvedChainAssets, ExecutorItemError> {
+        let metadata = chain_directory::payment_assets(chain_id)
+            .await
+            .map_err(|_| {
+                ExecutorItemError("could not load payment assets from chain directory".into())
+            })?;
+        let mut stablecoins = metadata
+            .stablecoins
+            .into_iter()
+            .filter_map(|stablecoin| {
+                Address::from_str(&stablecoin.contract)
+                    .ok()
+                    .map(|address| (address, stablecoin.symbol, stablecoin.decimals))
+            })
+            .collect::<Vec<_>>();
+        let missing_decimals = stablecoins
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (address, _, decimals))| {
+                decimals.is_none().then_some((index, *address))
+            })
+            .collect::<Vec<_>>();
+        if !missing_decimals.is_empty() {
+            let calls = missing_decimals
+                .iter()
+                .map(|(_, address)| RpcBatchCall {
+                    method: "eth_call",
+                    params: json!([{
+                        "to": address.to_string(),
+                        "data": format!("0x{}", hex::encode(ERC20_DECIMALS_SELECTOR)),
+                    }, "latest"]),
+                })
+                .collect::<Vec<_>>();
+            let responses = self
+                .rpc
+                .batch(chain_id, &calls)
+                .await
+                .map_err(rpc_item_error)?;
+            for (response_index, (stable_index, _)) in missing_decimals.into_iter().enumerate() {
+                let decimals = response_abi_u256(&responses, response_index, "ERC-20 decimals")
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|decimals| *decimals <= 38);
+                stablecoins[stable_index].2 = decimals;
+            }
+        }
+
+        let stablecoins = stablecoins
+            .into_iter()
+            .filter_map(|(address, symbol, decimals)| {
+                let decimals = decimals?;
+                Some((address, StablecoinConfig { symbol, decimals }))
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok(ResolvedChainAssets {
+            assets: ChainAssetConfig {
+                native_decimals: metadata.native.decimals,
+                settlement_markup_bps: self.config.settlement_markup_bps,
+                stablecoins,
+            },
+            native_symbol: metadata.native.symbol,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -575,6 +649,7 @@ impl ExecutorEngine {
         chain_id: u64,
         lane: u8,
         chain_assets: &ChainAssetConfig,
+        native_symbol: &str,
         mut candidates: Vec<Candidate>,
         results: &mut [Option<Result<(), UserOperationHandlerError>>],
         lease_scope: &str,
@@ -757,7 +832,7 @@ impl ExecutorEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let settlement = self
-            .evaluate_settlement(chain_id, chain_assets, &survivors, &costs)
+            .evaluate_settlement(chain_assets, native_symbol, &survivors, &costs)
             .await?;
         // Settlement evidence must come from the exact final handleOps simulation. Individual
         // simulations run against a different pre-state; a prior operation in this bundle can
@@ -1184,8 +1259,8 @@ impl ExecutorEngine {
 
     async fn evaluate_settlement(
         &self,
-        chain_id: u64,
         chain_assets: &ChainAssetConfig,
+        native_symbol: &str,
         candidates: &[Candidate],
         costs: &[U256],
     ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
@@ -1197,90 +1272,58 @@ impl ExecutorEngine {
                 gas_native_cost: *cost,
             })
             .collect::<Vec<_>>();
-        let feeds = required_oracle_feeds(self.treasury_address, chain_assets, &inputs)
-            .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let prices = self.oracle_prices(chain_id, &feeds).await?;
-        evaluate_batch(self.treasury_address, chain_assets, &inputs, &prices)
-            .map_err(|error| ExecutorItemError(error.to_string()))
+        let native_usd_price =
+            if has_stablecoin_payment(self.treasury_address, chain_assets, &inputs) {
+                Some(self.market_usd_price(native_symbol).await?)
+            } else {
+                None
+            };
+        evaluate_batch(
+            self.treasury_address,
+            chain_assets,
+            &inputs,
+            native_usd_price,
+        )
+        .map_err(|error| ExecutorItemError(error.to_string()))
     }
 
-    async fn oracle_prices(
-        &self,
-        chain_id: u64,
-        feeds: &BTreeMap<Address, OracleConfig>,
-    ) -> Result<BTreeMap<Address, U256>, ExecutorItemError> {
-        if feeds.is_empty() {
-            return Ok(BTreeMap::new());
+    async fn market_usd_price(&self, symbol: &str) -> Result<U256, ExecutorItemError> {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(ExecutorItemError(
+                "native currency symbol is invalid".into(),
+            ));
         }
-        let fetched_now = Instant::now();
-        let unix_now = unix_seconds()?;
-        let mut prices = BTreeMap::new();
-        let mut missing = Vec::new();
+        let now = Instant::now();
+        if let Some(cached) = self.market_prices.lock().await.get(&symbol).cloned()
+            && cached.expires_at > now
         {
-            let mut cache = self.oracle_cache.lock().await;
-            cache.retain(|_, cached| {
-                fetched_now.saturating_duration_since(cached.fetched_at) < ORACLE_CACHE_TTL
-            });
-            for (&address, &config) in feeds {
-                if let Some(cached) = cache.get(&(chain_id, address))
-                    && validate_oracle_freshness(
-                        address,
-                        cached.round,
-                        unix_now,
-                        config.max_age_seconds,
-                    )
-                    .is_ok()
-                {
-                    prices.insert(address, cached.round.answer);
-                } else {
-                    cache.remove(&(chain_id, address));
-                    missing.push((address, config));
-                }
-            }
+            return Ok(cached.price);
         }
-
-        if missing.is_empty() {
-            return Ok(prices);
-        }
-        let calls = missing
-            .iter()
-            .map(|(address, _)| RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": address.to_string(),
-                    "data": format!("0x{}", hex::encode(LATEST_ROUND_DATA_SELECTOR)),
-                }, "latest"]),
-            })
-            .collect::<Vec<_>>();
-        let responses = self
-            .rpc
-            .batch(chain_id, &calls)
+        let url = format!("{BINANCE_TICKER_URL}{symbol}USDT");
+        let ticker = self
+            .market_http
+            .get(url)
+            .send()
             .await
-            .map_err(rpc_item_error)?;
-        let mut fetched = Vec::with_capacity(missing.len());
-        for (index, (address, config)) in missing.into_iter().enumerate() {
-            let bytes = response_value(&responses, index, "oracle latestRoundData")?
-                .as_str()
-                .and_then(parse_hex_bytes)
-                .ok_or_else(|| {
-                    ExecutorItemError(format!("USD oracle {address} returned invalid ABI bytes"))
-                })?;
-            let round = decode_latest_round_data(address, &bytes, unix_now, config.max_age_seconds)
-                .map_err(|error| ExecutorItemError(error.to_string()))?;
-            prices.insert(address, round.answer);
-            fetched.push((address, round));
-        }
-        let mut cache = self.oracle_cache.lock().await;
-        for (address, round) in fetched {
-            cache.insert(
-                (chain_id, address),
-                CachedOracleRound {
-                    fetched_at: fetched_now,
-                    round,
-                },
-            );
-        }
-        Ok(prices)
+            .map_err(|_| ExecutorItemError("Binance native USD price request failed".into()))?
+            .error_for_status()
+            .map_err(|_| ExecutorItemError("Binance native USD price request failed".into()))?
+            .json::<BinanceTicker>()
+            .await
+            .map_err(|_| {
+                ExecutorItemError("Binance native USD price response is invalid".into())
+            })?;
+        let price = parse_market_usd_price(&ticker.price)
+            .ok_or_else(|| ExecutorItemError("Binance native USD price is invalid".into()))?;
+        self.market_prices.lock().await.insert(
+            symbol,
+            CachedMarketPrice {
+                expires_at: now + BINANCE_PRICE_TTL,
+                price,
+            },
+        );
+        Ok(price)
     }
 
     async fn resume_bundle_intent(
@@ -2093,48 +2136,19 @@ impl UserOperationHandler for ExecutorEngine {
     }
 }
 
-fn chain_asset_config(
-    assets: &ExecutorChainAssets,
-    settlement_markup_bps: u64,
-) -> Result<ChainAssetConfig, ExecutorBuildError> {
-    let native_usd_oracle = assets
-        .native_usd_oracle
-        .as_ref()
-        .map(oracle_config)
-        .transpose()?;
-    let stablecoins = assets
+fn has_stablecoin_payment(
+    recipient: Address,
+    chain_assets: &ChainAssetConfig,
+    inputs: &[SettlementInput<'_>],
+) -> bool {
+    let allowlist = chain_assets
         .stablecoins
-        .iter()
-        .map(|stablecoin| {
-            let address = Address::from_str(&stablecoin.address)
-                .map_err(|_| ExecutorBuildError("invalid stablecoin address".into()))?;
-            Ok((
-                address,
-                StablecoinConfig {
-                    symbol: stablecoin
-                        .symbol
-                        .clone()
-                        .unwrap_or_else(|| stablecoin.address.clone()),
-                    decimals: stablecoin.decimals,
-                    usd_oracle: oracle_config(&stablecoin.usd_oracle)?,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, ExecutorBuildError>>()?;
-    Ok(ChainAssetConfig {
-        native_decimals: assets.native_decimals,
-        settlement_markup_bps,
-        native_usd_oracle,
-        stablecoins,
-    })
-}
-
-fn oracle_config(oracle: &ExecutorOracle) -> Result<OracleConfig, ExecutorBuildError> {
-    Ok(OracleConfig {
-        address: Address::from_str(&oracle.address)
-            .map_err(|_| ExecutorBuildError("invalid USD oracle address".into()))?,
-        decimals: oracle.decimals,
-        max_age_seconds: oracle.max_age_seconds,
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    inputs.iter().any(|input| {
+        parse_reimbursement(input.call_data, recipient, &allowlist)
+            .is_ok_and(|reimbursement| !reimbursement.stablecoins.is_empty())
     })
 }
 
@@ -2339,6 +2353,46 @@ fn parse_quantity(value: &str) -> Option<U256> {
     U256::from_str_radix(digits, 16).ok()
 }
 
+/// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
+/// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
+fn parse_market_usd_price(value: &str) -> Option<U256> {
+    let value = value.trim();
+    let mut parts = value.split('.');
+    let whole = parts.next()?;
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let scale = U256::from(USD_PRICE_SCALE);
+    let whole = U256::from_str(whole).ok()?.checked_mul(scale)?;
+    let kept = &fraction[..fraction.len().min(USD_PRICE_DECIMALS as usize)];
+    let fraction = if kept.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_str(kept)
+            .ok()?
+            .checked_mul(U256::from(10u8).pow(U256::from(USD_PRICE_DECIMALS - kept.len() as u32)))?
+    };
+    let mut price = whole.checked_add(fraction)?;
+    if value
+        .split_once('.')
+        .is_some_and(|(_, fraction)| fraction.len() > USD_PRICE_DECIMALS as usize)
+        && value.split_once('.').is_some_and(|(_, fraction)| {
+            fraction[USD_PRICE_DECIMALS as usize..]
+                .bytes()
+                .any(|byte| byte != b'0')
+        })
+    {
+        price = price.checked_add(U256::ONE)?;
+    }
+    (!price.is_zero()).then_some(price)
+}
+
 fn parse_hex_bytes(value: &str) -> Option<Bytes> {
     let digits = value.strip_prefix("0x")?;
     if !digits.len().is_multiple_of(2) {
@@ -2392,13 +2446,6 @@ fn unique_token(prefix: &str) -> String {
     format!("{prefix}:{}:{timestamp}:{counter}", std::process::id())
 }
 
-fn unix_seconds() -> Result<u64, ExecutorItemError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|_| ExecutorItemError("system clock is before the Unix epoch".into()))
-}
-
 fn is_tempo_chain(chain_id: u64) -> bool {
     matches!(chain_id, 4_217 | 42_431)
 }
@@ -2410,7 +2457,7 @@ mod tests {
 
     use super::{
         AdmissionAction, ExecutorItemError, RpcError, admission_action, parse_hex_bytes,
-        parse_quantity, response_quantity, validate_raw_transaction,
+        parse_market_usd_price, parse_quantity, response_quantity, validate_raw_transaction,
     };
 
     #[test]
@@ -2420,6 +2467,21 @@ mod tests {
         assert_eq!(parse_quantity("0xABC"), Some(U256::from(0xabcu16)));
         for invalid in ["", "0x", "2a", "0x00", "0xgg"] {
             assert_eq!(parse_quantity(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn parses_binance_native_usd_prices_with_bundler_favourable_rounding() {
+        assert_eq!(
+            parse_market_usd_price("3024.12"),
+            Some(U256::from(302_412_000_000u64))
+        );
+        assert_eq!(
+            parse_market_usd_price("1.0000000001"),
+            Some(U256::from(100_000_001u64))
+        );
+        for invalid in ["", "0", "-1", "1e3", "1.2.3"] {
+            assert_eq!(parse_market_usd_price(invalid), None, "{invalid}");
         }
     }
 

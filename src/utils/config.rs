@@ -9,8 +9,6 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: SocketAddr,
@@ -85,7 +83,6 @@ pub struct ExecutorConfig {
     pub operator_secret: SecretString,
     pub alchemy_api_key: Option<SecretString>,
     pub trusted_rpc_urls: BTreeMap<u64, Vec<String>>,
-    pub chain_assets: BTreeMap<u64, ExecutorChainAssets>,
     pub consumer_group_prefix: String,
     pub pool_width: usize,
     pub stream_discovery_interval: Duration,
@@ -106,43 +103,6 @@ pub struct ExecutorConfig {
     pub treasury_floor_wei: u128,
     pub top_up_max_wei: u128,
     pub top_up_daily_max_wei: u128,
-}
-
-/// Operator-controlled metadata used on the money path. Public chain metadata may still be used
-/// by read-only APIs, but it is never a token allowlist for transaction execution.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutorChainAssets {
-    pub cost_model: ExecutorCostModel,
-    #[serde(default = "default_native_decimals")]
-    pub native_decimals: u32,
-    pub native_usd_oracle: Option<ExecutorOracle>,
-    #[serde(default)]
-    pub stablecoins: Vec<ExecutorStablecoin>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutorStablecoin {
-    pub address: String,
-    pub decimals: u32,
-    pub symbol: Option<String>,
-    pub usd_oracle: ExecutorOracle,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutorOracle {
-    pub address: String,
-    pub decimals: u32,
-    pub max_age_seconds: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExecutorCostModel {
-    Eip1559,
-    ArbNitro,
 }
 
 #[derive(Clone)]
@@ -170,10 +130,6 @@ impl Debug for ExecutorConfig {
             .field(
                 "trusted_rpc_chain_ids",
                 &self.trusted_rpc_urls.keys().collect::<Vec<_>>(),
-            )
-            .field(
-                "chain_asset_ids",
-                &self.chain_assets.keys().collect::<Vec<_>>(),
             )
             .field("consumer_group_prefix", &self.consumer_group_prefix)
             .field("pool_width", &self.pool_width)
@@ -297,10 +253,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         Some(value) => parse_trusted_rpc_urls(&value)?,
         None => BTreeMap::new(),
     };
-    let chain_assets = match optional_value("VELA_RELAY_EXECUTOR_CHAIN_ASSETS")? {
-        Some(value) => parse_chain_assets(&value)?,
-        None => BTreeMap::new(),
-    };
     if enabled && trusted_rpc_urls.is_empty() && alchemy_api_key.is_none() {
         return Err(ConfigError(
             "VELA_RELAY_EXECUTOR_ENABLED requires VELA_RELAY_EXECUTOR_RPC_URLS or ALCHEMY_API_KEY"
@@ -357,7 +309,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         operator_secret,
         alchemy_api_key,
         trusted_rpc_urls,
-        chain_assets,
         consumer_group_prefix: value_or("VELA_RELAY_IGGY_CONSUMER_GROUP_PREFIX", "vela-relay-v1")?,
         pool_width,
         stream_discovery_interval: Duration::from_secs(u64_value(
@@ -394,137 +345,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         top_up_max_wei,
         top_up_daily_max_wei,
     })
-}
-
-fn parse_chain_assets(value: &str) -> Result<BTreeMap<u64, ExecutorChainAssets>, ConfigError> {
-    let values =
-        serde_json::from_str::<BTreeMap<String, ExecutorChainAssets>>(value).map_err(|error| {
-            ConfigError(format!("invalid VELA_RELAY_EXECUTOR_CHAIN_ASSETS: {error}"))
-        })?;
-    let mut result = BTreeMap::new();
-
-    for (chain_id, assets) in values {
-        let chain_id = chain_id.parse::<u64>().map_err(|error| {
-            ConfigError(format!(
-                "invalid chain ID in VELA_RELAY_EXECUTOR_CHAIN_ASSETS: {error}"
-            ))
-        })?;
-        if chain_id == 0 {
-            return Err(ConfigError(
-                "chain ID 0 is not valid in VELA_RELAY_EXECUTOR_CHAIN_ASSETS".into(),
-            ));
-        }
-        if assets.native_decimals > 38 {
-            return Err(ConfigError(format!(
-                "nativeDecimals for chain {chain_id} must not exceed 38"
-            )));
-        }
-        if is_known_op_stack_chain(chain_id) {
-            return Err(ConfigError(format!(
-                "chain {chain_id} uses OP Stack L1 data fees, which the executor cost model does not yet support"
-            )));
-        }
-        if is_known_arbitrum_chain(chain_id) && assets.cost_model != ExecutorCostModel::ArbNitro {
-            return Err(ConfigError(format!(
-                "chain {chain_id} must use the arbNitro executor cost model"
-            )));
-        }
-        if !assets.stablecoins.is_empty() && assets.native_usd_oracle.is_none() {
-            return Err(ConfigError(format!(
-                "chain {chain_id} must configure nativeUsdOracle when stablecoins are enabled"
-            )));
-        }
-        if let Some(oracle) = &assets.native_usd_oracle {
-            validate_executor_oracle(chain_id, "nativeUsdOracle", oracle)?;
-        }
-        let mut stablecoin_addresses = std::collections::BTreeSet::new();
-        for stablecoin in &assets.stablecoins {
-            validate_address(&stablecoin.address).map_err(|_| {
-                ConfigError(format!(
-                    "invalid stablecoin address for chain {chain_id} in VELA_RELAY_EXECUTOR_CHAIN_ASSETS"
-                ))
-            })?;
-            if stablecoin.decimals > 38 {
-                return Err(ConfigError(format!(
-                    "stablecoin decimals for chain {chain_id} must not exceed 38"
-                )));
-            }
-            if stablecoin
-                .symbol
-                .as_deref()
-                .is_some_and(|symbol| symbol.trim().is_empty())
-            {
-                return Err(ConfigError(format!(
-                    "stablecoin symbol for chain {chain_id} must not be empty"
-                )));
-            }
-            if !stablecoin_addresses.insert(stablecoin.address.to_ascii_lowercase()) {
-                return Err(ConfigError(format!(
-                    "duplicate stablecoin address for chain {chain_id}"
-                )));
-            }
-            validate_executor_oracle(chain_id, "stablecoin usdOracle", &stablecoin.usd_oracle)?;
-        }
-        result.insert(chain_id, assets);
-    }
-
-    Ok(result)
-}
-
-const fn default_native_decimals() -> u32 {
-    18
-}
-
-fn validate_executor_oracle(
-    chain_id: u64,
-    label: &str,
-    oracle: &ExecutorOracle,
-) -> Result<(), ConfigError> {
-    validate_address(&oracle.address).map_err(|_| {
-        ConfigError(format!(
-            "invalid {label} address for chain {chain_id} in VELA_RELAY_EXECUTOR_CHAIN_ASSETS"
-        ))
-    })?;
-    if oracle.decimals > 38 {
-        return Err(ConfigError(format!(
-            "{label} decimals for chain {chain_id} must not exceed 38"
-        )));
-    }
-    if oracle.max_age_seconds == 0 {
-        return Err(ConfigError(format!(
-            "{label} maxAgeSeconds for chain {chain_id} must be greater than zero"
-        )));
-    }
-    Ok(())
-}
-
-fn is_known_op_stack_chain(chain_id: u64) -> bool {
-    matches!(
-        chain_id,
-        10 | 420
-            | 8453
-            | 84531
-            | 84532
-            | 34443
-            | 919
-            | 1135
-            | 4202
-            | 130
-            | 1301
-            | 480
-            | 4801
-            | 1868
-            | 1946
-            | 57073
-            | 763373
-            | 7_777_777
-            | 11155420
-            | 999_999_999
-    )
-}
-
-fn is_known_arbitrum_chain(chain_id: u64) -> bool {
-    matches!(chain_id, 42161 | 42170 | 421614)
 }
 
 fn parse_trusted_rpc_urls(value: &str) -> Result<BTreeMap<u64, Vec<String>>, ConfigError> {
@@ -768,140 +588,4 @@ fn settlement_recipient() -> Result<Option<String>, ConfigError> {
     }
 
     Ok(Some(derived_recipient))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ExecutorCostModel, parse_chain_assets};
-
-    #[test]
-    fn parses_explicit_money_path_policy() {
-        let policies = parse_chain_assets(
-            r#"{
-                "42161": {
-                    "costModel": "arbNitro",
-                    "nativeDecimals": 18,
-                    "nativeUsdOracle": {
-                        "address": "0x2222222222222222222222222222222222222222",
-                        "decimals": 8,
-                        "maxAgeSeconds": 3600
-                    },
-                    "stablecoins": [{
-                        "address": "0x1111111111111111111111111111111111111111",
-                        "decimals": 6,
-                        "symbol": "USDC",
-                        "usdOracle": {
-                            "address": "0x3333333333333333333333333333333333333333",
-                            "decimals": 8,
-                            "maxAgeSeconds": 86400
-                        }
-                    }]
-                }
-            }"#,
-        )
-        .expect("valid executor chain policy");
-
-        let stablecoin = &policies[&42_161].stablecoins[0];
-        assert_eq!(policies[&42_161].cost_model, ExecutorCostModel::ArbNitro);
-        assert_eq!(stablecoin.usd_oracle.decimals, 8);
-        assert_eq!(stablecoin.usd_oracle.max_age_seconds, 86_400);
-    }
-
-    #[test]
-    fn rejects_stablecoins_without_native_oracle() {
-        let result = parse_chain_assets(
-            r#"{
-                "1": {
-                    "costModel": "eip1559",
-                    "stablecoins": [{
-                        "address": "0x1111111111111111111111111111111111111111",
-                        "decimals": 6,
-                        "usdOracle": {
-                            "address": "0x3333333333333333333333333333333333333333",
-                            "decimals": 8,
-                            "maxAgeSeconds": 3600
-                        }
-                    }]
-                }
-            }"#,
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn rejects_duplicate_stablecoins_and_invalid_oracle_freshness() {
-        let invalid_age = parse_chain_assets(
-            r#"{
-                "1": {
-                    "costModel": "eip1559",
-                    "nativeUsdOracle": {
-                        "address": "0x2222222222222222222222222222222222222222",
-                        "decimals": 8,
-                        "maxAgeSeconds": 0
-                    },
-                    "stablecoins": [{
-                        "address": "0x1111111111111111111111111111111111111111",
-                        "decimals": 6,
-                        "usdOracle": {
-                            "address": "0x3333333333333333333333333333333333333333",
-                            "decimals": 8,
-                            "maxAgeSeconds": 3600
-                        }
-                    }]
-                }
-            }"#,
-        );
-        assert!(invalid_age.is_err());
-
-        let duplicate_token = parse_chain_assets(
-            r#"{
-                "1": {
-                    "costModel": "eip1559",
-                    "nativeUsdOracle": {
-                        "address": "0x2222222222222222222222222222222222222222",
-                        "decimals": 8,
-                        "maxAgeSeconds": 3600
-                    },
-                    "stablecoins": [
-                        {
-                            "address": "0x1111111111111111111111111111111111111111",
-                            "decimals": 6,
-                            "usdOracle": {
-                                "address": "0x3333333333333333333333333333333333333333",
-                                "decimals": 8,
-                                "maxAgeSeconds": 3600
-                            }
-                        },
-                        {
-                            "address": "0x1111111111111111111111111111111111111111",
-                            "decimals": 6,
-                            "usdOracle": {
-                                "address": "0x4444444444444444444444444444444444444444",
-                                "decimals": 8,
-                                "maxAgeSeconds": 3600
-                            }
-                        }
-                    ]
-                }
-            }"#,
-        );
-        assert!(duplicate_token.is_err());
-    }
-
-    #[test]
-    fn rejects_known_op_stack_chain_without_l1_fee_model() {
-        assert!(
-            parse_chain_assets(
-                r#"{
-                    "8453": {
-                        "costModel": "eip1559",
-                        "nativeDecimals": 18,
-                        "stablecoins": []
-                    }
-                }"#,
-            )
-            .is_err()
-        );
-    }
 }
