@@ -1,4 +1,8 @@
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::{StatusCode, header},
+};
 use serde::Serialize;
 
 use crate::app::AppState;
@@ -15,6 +19,13 @@ pub struct VersionInfo {
     version: &'static str,
 }
 
+#[derive(Serialize)]
+pub struct HealthInfo {
+    service: &'static str,
+    runtime: &'static str,
+    status: &'static str,
+}
+
 pub async fn index() -> Json<ServiceInfo> {
     Json(ServiceInfo {
         name: env!("CARGO_PKG_NAME"),
@@ -24,6 +35,17 @@ pub async fn index() -> Json<ServiceInfo> {
 
 pub async fn liveness() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+pub async fn health() -> ([(header::HeaderName, &'static str); 1], Json<HealthInfo>) {
+    (
+        [(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
+        Json(HealthInfo {
+            service: "vela-bundler",
+            runtime: "tokio",
+            status: "ok",
+        }),
+    )
 }
 
 pub async fn readiness(State(state): State<AppState>) -> StatusCode {

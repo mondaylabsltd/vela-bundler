@@ -25,6 +25,8 @@ static FAILED_RPCS: OnceLock<FailedRpcCache> = OnceLock::new();
 pub struct RpcCallResult {
     pub value: Value,
     pub domain: String,
+    /// Safe for API responses: API keys, query strings, and untrusted path components are hidden.
+    pub rpc_url: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -292,6 +294,7 @@ async fn first_result(
                 return Some(RpcCallResult {
                     value: result,
                     domain: rpc_domain(url),
+                    rpc_url: response_rpc_url(url),
                 });
             }
             Err(error) => {
@@ -343,6 +346,7 @@ async fn first_simulation_result(
                 return Ok(Some(RpcCallResult {
                     value: result,
                     domain: rpc_domain(url),
+                    rpc_url: response_rpc_url(url),
                 }));
             }
             Err(SimulationUpstreamError::Reverted(error)) => {
@@ -501,6 +505,25 @@ fn rpc_domain(value: &str) -> String {
         .unwrap_or_else(|| "<unknown>".into())
 }
 
+fn response_rpc_url(value: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return "<unknown>".into();
+    };
+    let Some(host) = url.host_str() else {
+        return "<unknown>".into();
+    };
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+
+    if host.ends_with(".alchemy.com") && url.path().starts_with("/v2/") {
+        return format!("{}://{host}{port}/v2/***", url.scheme());
+    }
+
+    format!("{}://{host}{port}/***", url.scheme())
+}
+
 fn parse_address(value: &str) -> Option<String> {
     let value = value.trim();
     let is_address = value.len() == 42
@@ -629,7 +652,8 @@ mod tests {
 
     use super::{
         FailedRpcCache, SimulationUpstreamError, fetch_result, fetch_simulation_result,
-        first_result, first_simulation_result, parse_rpc_url, redacted_rpc_url, rpc_domain,
+        first_result, first_simulation_result, parse_rpc_url, redacted_rpc_url, response_rpc_url,
+        rpc_domain,
     };
 
     #[test]
@@ -655,6 +679,18 @@ mod tests {
         assert_eq!(
             rpc_domain("https://eth-mainnet.g.alchemy.com/v2/secret?another=secret"),
             "eth-mainnet.g.alchemy.com"
+        );
+    }
+
+    #[test]
+    fn exposes_only_the_safe_rpc_endpoint_prefix() {
+        assert_eq!(
+            response_rpc_url("https://arb-mainnet.g.alchemy.com/v2/secret?another=secret"),
+            "https://arb-mainnet.g.alchemy.com/v2/***"
+        );
+        assert_eq!(
+            response_rpc_url("https://rpc.example.com/private/path?key=secret"),
+            "https://rpc.example.com/***"
         );
     }
 
@@ -717,22 +753,29 @@ mod tests {
             format!("http://{address}/limited"),
             format!("http://{address}"),
         ];
+        let chain_id = 1_000_000u64 + u64::from(address.port());
         let client = reqwest::Client::new();
-        assert_eq!(
-            fetch_result(&client, &urls[1], "eth_gasPrice", &json!([])).await,
-            Ok(json!("0x64"))
-        );
+        let mut direct_result = fetch_result(&client, &urls[1], "eth_gasPrice", &json!([])).await;
+        for _ in 0..2 {
+            if direct_result.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            direct_result = fetch_result(&client, &urls[1], "eth_gasPrice", &json!([])).await;
+        }
+        assert_eq!(direct_result, Ok(json!("0x64")));
         let started = Instant::now();
 
-        let result = first_result(&client, 1, "test", &urls, "eth_gasPrice", &json!([]))
+        let result = first_result(&client, chain_id, "test", &urls, "eth_gasPrice", &json!([]))
             .await
             .unwrap();
         assert_eq!(result.value, json!("0x64"));
         assert_eq!(result.domain, "127.0.0.1");
         assert!(started.elapsed() < Duration::from_secs(1));
-        let second_result = first_result(&client, 1, "test", &urls, "eth_gasPrice", &json!([]))
-            .await
-            .unwrap();
+        let second_result =
+            first_result(&client, chain_id, "test", &urls, "eth_gasPrice", &json!([]))
+                .await
+                .unwrap();
         assert_eq!(second_result.value, json!("0x64"));
         assert_eq!(limited_calls.load(Ordering::Relaxed), 1);
         server.abort();
@@ -769,6 +812,8 @@ mod tests {
             .await
             .unwrap();
         });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let client = reqwest::Client::new();
         let result = first_simulation_result(
@@ -816,13 +861,18 @@ mod tests {
             .unwrap();
         });
 
-        let result = fetch_simulation_result(
-            &reqwest::Client::new(),
-            &format!("http://{address}"),
-            "eth_call",
-            &json!([]),
-        )
-        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}");
+        let mut result = fetch_simulation_result(&client, &url, "eth_call", &json!([])).await;
+        for _ in 0..2 {
+            if !matches!(&result, Err(SimulationUpstreamError::Unavailable(_))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            result = fetch_simulation_result(&client, &url, "eth_call", &json!([])).await;
+        }
 
         assert!(matches!(result, Err(SimulationUpstreamError::Reverted(_))));
         server.abort();

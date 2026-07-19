@@ -120,6 +120,10 @@ impl RpcError {
         )
     }
 
+    pub fn mempool_full() -> Self {
+        Self::new(-32000, "bundler mempool is full", None)
+    }
+
     fn new(code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             code,

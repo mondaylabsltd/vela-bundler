@@ -263,15 +263,72 @@ fn revert_reason(data: &Value) -> Option<String> {
         _ => return None,
     };
     let bytes = in_band_settlement::decode_hex(data).ok()?;
-    if bytes.get(..4)? != [0x08, 0xc3, 0x79, 0xa0] {
-        return None;
+    decode_revert_bytes(&bytes)
+}
+
+fn decode_revert_bytes(bytes: &[u8]) -> Option<String> {
+    const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+    const FAILED_OP_SELECTOR: [u8; 4] = [0x22, 0x02, 0x66, 0xb6];
+    const FAILED_OP_WITH_REVERT_SELECTOR: [u8; 4] = [0x65, 0xc8, 0xfd, 0x4d];
+    const CALL_PHASE_REVERTED_SELECTOR: [u8; 4] = [0x46, 0x2c, 0x71, 0xb2];
+
+    let selector = bytes.get(..4)?;
+    if selector == ERROR_STRING_SELECTOR {
+        return abi_string(bytes, 4, 4);
+    }
+    if selector == PANIC_SELECTOR {
+        return read_u128_word(bytes, 4).map(panic_reason);
+    }
+    if selector == FAILED_OP_SELECTOR {
+        let operation_index = read_u128_word(bytes, 4)?;
+        let reason = abi_string(bytes, 4, 36)?;
+        return Some(format!("FailedOp({operation_index}): {reason}"));
+    }
+    if selector == FAILED_OP_WITH_REVERT_SELECTOR {
+        let operation_index = read_u128_word(bytes, 4)?;
+        let reason = abi_string(bytes, 4, 36)?;
+        let inner = abi_bytes(bytes, 4, 68)
+            .and_then(decode_revert_bytes)
+            .unwrap_or_else(|| "inner call reverted".into());
+        return Some(format!(
+            "FailedOpWithRevert({operation_index}): {reason}; {inner}"
+        ));
+    }
+    if selector == CALL_PHASE_REVERTED_SELECTOR {
+        return abi_bytes(bytes, 4, 4)
+            .and_then(decode_revert_bytes)
+            .map(|reason| format!("CallPhaseReverted: {reason}"));
     }
 
-    let offset = read_usize_word(&bytes, 4)?;
-    let start = 4usize.checked_add(offset)?;
-    let length = read_usize_word(&bytes, start)?;
-    let reason = bytes.get(start.checked_add(32)?..start.checked_add(32)?.checked_add(length)?)?;
-    String::from_utf8(reason.to_vec()).ok()
+    None
+}
+
+fn abi_string(bytes: &[u8], arguments_start: usize, offset_position: usize) -> Option<String> {
+    String::from_utf8(abi_bytes(bytes, arguments_start, offset_position)?.to_vec()).ok()
+}
+
+fn abi_bytes(bytes: &[u8], arguments_start: usize, offset_position: usize) -> Option<&[u8]> {
+    let offset = read_usize_word(bytes, offset_position)?;
+    let start = arguments_start.checked_add(offset)?;
+    let length = read_usize_word(bytes, start)?;
+    bytes.get(start.checked_add(32)?..start.checked_add(32)?.checked_add(length)?)
+}
+
+fn panic_reason(code: u128) -> String {
+    let description = match code {
+        0x01 => "assertion failed",
+        0x11 => "arithmetic overflow or underflow",
+        0x12 => "division or modulo by zero",
+        0x21 => "invalid enum conversion",
+        0x22 => "invalid storage byte array",
+        0x31 => "empty array pop",
+        0x32 => "array index out of bounds",
+        0x41 => "memory allocation overflow",
+        0x51 => "invalid internal function",
+        _ => return format!("Solidity panic 0x{code:x}"),
+    };
+    format!("Solidity panic 0x{code:x}: {description}")
 }
 
 #[derive(Debug)]
@@ -571,7 +628,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SimulationUserOperation, parse_validation_pre_op_gas, quantity_word, with_percent_buffer,
+        SimulationUserOperation, parse_validation_pre_op_gas, quantity_word, revert_reason,
+        with_percent_buffer,
     };
     use crate::app::rpc::types::{EstimatableUserOperation, EstimatableUserOperationV0_7};
 
@@ -621,6 +679,18 @@ mod tests {
         ));
 
         assert_eq!(parse_validation_pre_op_gas(&result).unwrap(), 123);
+    }
+
+    #[test]
+    fn decodes_entry_point_failed_op_reasons() {
+        let data = json!(
+            "0x220266b600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000001a4141323520696e76616c6964206163636f756e74206e6f6e6365000000000000"
+        );
+
+        assert_eq!(
+            revert_reason(&data),
+            Some("FailedOp(0): AA25 invalid account nonce".into())
+        );
     }
 
     #[test]

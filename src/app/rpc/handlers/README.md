@@ -2,7 +2,7 @@
 
 ## `eth_supportedEntryPoints`
 
-Call `POST /{chainId}/rpc` with the following request body:
+Call `POST /{chainId}` with the following request body:
 
 ```json
 {
@@ -27,7 +27,7 @@ The address list is defined by the `SUPPORTED_ENTRY_POINTS` constant in `support
 
 ## `pimlico_getUserOperationGasPrice`
 
-Call `POST /{chainId}/rpc` with the following request body:
+Call `POST /{chainId}` with the following request body:
 
 ```json
 {
@@ -97,7 +97,7 @@ ALCHEMY_API_KEY="your-key"
 To use a caller-provided RPC before Alchemy and fallback sources, include an HTTPS URL in the request header:
 
 ```sh
-curl http://127.0.0.1:4567/1/rpc \
+curl http://127.0.0.1:4567/1 \
   -H 'content-type: application/json' \
   -H 'x-vela-rpc-url: https://your-rpc.example.com' \
   --data '{"jsonrpc":"2.0","method":"pimlico_getUserOperationGasPrice","params":[],"id":1}'
@@ -163,13 +163,56 @@ The response contains the v0.7 gas fields, including zero-valued paymaster limit
 }
 ```
 
-## Tempo submission guard
+## `eth_sendUserOperation`
 
-Before the still-unconfigured submission backend is reached, `eth_sendUserOperation` applies the Tempo admission rules for chain IDs `4217` and `42431`:
+The relay currently uses in-band settlement for every chain. It does not accept the normal
+ERC-4337 native-prefund route.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "eth_sendUserOperation",
+  "params": [
+    {
+      "sender": "0x1111111111111111111111111111111111111111",
+      "nonce": "0x0",
+      "callData": "0x...",
+      "callGasLimit": "0x5208",
+      "verificationGasLimit": "0x10000",
+      "preVerificationGas": "0x1000",
+      "maxFeePerGas": "0x0",
+      "maxPriorityFeePerGas": "0x0",
+      "signature": "0x..."
+    },
+    "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+  ],
+  "id": 1
+}
+```
+
+The handler accepts the unpacked EntryPoint v0.7 format and returns the canonical EntryPoint
+`userOpHash` when it queues the operation:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "0x..."
+}
+```
+
+Admission is intentionally small and deterministic:
 
 - `maxFeePerGas` and `maxPriorityFeePerGas` must both be exactly `0x0`.
-- The signed Safe calldata must be `executeUserOp` delegating to the canonical Safe MultiSend contract.
-- The batch must transfer to the configured settlement recipient either at least `0.00001` native coin or at least `$0.01` of one stablecoin listed in that chain's `stables` metadata.
+- The Safe calldata must be `executeUserOp` delegating to the canonical Safe MultiSend contract.
+- The batch must transfer to the configured settlement recipient either at least `0.00001` native coin or at least `0.01` of one stablecoin listed in that chain's `stables` metadata.
 - Stablecoin amounts are converted to smallest units using the token's on-chain `decimals()` result. Transfers in unlisted tokens are ignored.
+- The operation must have valid v0.7 structural fields and a non-empty signature. EIP-7702 authorization is not enabled yet.
 
-The guard reads the encoded calls rather than accepting a wallet-supplied reimbursement amount. It therefore cannot credit a transfer-shaped payload that does not execute against the Safe.
+The reimbursement is decoded from the signed calls, not from a wallet-supplied amount. A
+transfer-shaped payload does not count unless it is actually nested under the trusted Safe
+MultiSend delegatecall.
+
+Accepted operations are held in a bounded, process-local queue until the bundling worker is
+connected. They are not persistent across process restarts, and this first admission step does
+not perform on-chain signature simulation or submit an outer transaction yet.

@@ -39,6 +39,10 @@ impl Error for VaultError {}
 pub fn derive_address(operator_secret: &str) -> Result<String, VaultError> {
     let ikm = parse_operator_secret(operator_secret)?;
     let private_key = derive_private_key(&ikm)?;
+    ethereum_address(private_key)
+}
+
+fn ethereum_address(private_key: SecretKey) -> Result<String, VaultError> {
     let public_key = private_key.public_key().to_encoded_point(false);
     let digest = Keccak256::digest(&public_key.as_bytes()[1..]);
 

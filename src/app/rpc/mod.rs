@@ -12,6 +12,8 @@ use crate::app::AppState;
 mod handlers;
 pub mod types;
 
+pub(crate) use handlers::supported_entry_points::SUPPORTED_ENTRY_POINTS;
+
 use types::{
     EstimateUserOperationGasParams, GetUserOperationByHashParams, GetUserOperationReceiptParams,
     GetUserOperationStatusParams, RpcError, RpcMethod, RpcRequest, RpcResponse,
@@ -198,7 +200,7 @@ mod tests {
 
     fn router() -> Router {
         Router::new()
-            .route("/{chain_id}/rpc", post(handle))
+            .route("/{chain_id}", post(handle))
             .with_state(AppState::with_settlement_recipient(&[], None))
     }
 
@@ -206,7 +208,7 @@ mod tests {
     async fn returns_supported_entry_points() {
         let response = router()
             .oneshot(
-                Request::post("/1/rpc")
+                Request::post("/1")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -239,7 +241,7 @@ mod tests {
     async fn rejects_invalid_method_parameters_with_a_json_rpc_error() {
         let response = router()
             .oneshot(
-                Request::post("/1/rpc")
+                Request::post("/1")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -261,6 +263,51 @@ mod tests {
         let response: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(response["id"], "request-1");
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn rejects_native_prefund_user_operations_before_any_upstream_call() {
+        let response = router()
+            .oneshot(
+                Request::post("/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 8,
+                            "method": "eth_sendUserOperation",
+                            "params": [
+                                {
+                                    "sender": "0x1111111111111111111111111111111111111111",
+                                    "nonce": "0x0",
+                                    "callData": "0x",
+                                    "callGasLimit": "0x5208",
+                                    "verificationGasLimit": "0x10000",
+                                    "preVerificationGas": "0x1000",
+                                    "maxFeePerGas": "0x1",
+                                    "maxPriorityFeePerGas": "0x0",
+                                    "signature": "0x1234"
+                                },
+                                "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(
+            response["error"]["data"],
+            "in-band UserOperations must set maxFeePerGas and maxPriorityFeePerGas to 0x0"
+        );
     }
 
     #[test]
