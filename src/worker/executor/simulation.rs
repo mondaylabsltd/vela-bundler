@@ -40,6 +40,11 @@ pub(super) enum SimulationVerdict<T> {
 /// Runs every candidate in isolation in one JSON-RPC HTTP batch. Each simulation executes a
 /// one-operation `handleOps`, which proves both EntryPoint validation and the account call. A
 /// top-level `eth_simulateV1` error is a provider capability failure, never an op verdict.
+///
+/// Some otherwise usable EVM nodes do not expose `eth_simulateV1` but do expose
+/// `debug_traceCall` with call-tracer logs. That is a safe fallback because it preserves the same
+/// evidence this executor requires: outer gas used, EntryPoint UserOperationEvent, and payment
+/// transfer logs. An `eth_call`-only fallback would not provide that evidence.
 pub(super) async fn simulate_individually(
     rpc: &TrustedRpcClient,
     chain_id: u64,
@@ -62,29 +67,69 @@ pub(super) async fn simulate_individually(
         })
         .collect::<Vec<_>>();
 
-    let responses = match rpc.batch(chain_id, &calls).await {
-        Ok(responses) => responses,
-        Err(_) => {
-            return hashes
+    let mut verdicts: Vec<SimulationVerdict<SimulationResult>> =
+        match rpc.batch(chain_id, &calls).await {
+            Ok(responses) => responses
+                .into_iter()
+                .zip(hashes)
+                .map(|(response, expected_hash)| match response {
+                    Ok(value) => parse_simulation(value, entry_point, &[*expected_hash]),
+                    Err(RpcError::Reverted) => {
+                        // `eth_simulateV1` reports a real call verdict inside `result`. A top-level
+                        // error means the RPC could not perform the method, even if its message says
+                        // revert.
+                        SimulationVerdict::Transient("individual simulation method unavailable")
+                    }
+                    Err(_) => SimulationVerdict::Transient("individual simulation RPC unavailable"),
+                })
+                .collect(),
+            Err(_) => hashes
                 .iter()
                 .map(|_| SimulationVerdict::Transient("individual simulation RPC unavailable"))
-                .collect();
+                .collect(),
+        };
+
+    let fallback_indexes = verdicts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, verdict)| {
+            matches!(verdict, SimulationVerdict::Transient(_)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if fallback_indexes.is_empty() {
+        return verdicts;
+    }
+    let trace_calls = fallback_indexes
+        .iter()
+        .map(|index| RpcBatchCall {
+            method: "debug_traceCall",
+            params: debug_trace_params(
+                relayer,
+                entry_point,
+                handle_ops_calldata(&[operations[*index].packed.clone()], beneficiary),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let trace_responses = match rpc.batch(chain_id, &trace_calls).await {
+        Ok(responses) => responses,
+        Err(_) => {
+            for index in fallback_indexes {
+                verdicts[index] = SimulationVerdict::Transient(
+                    "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
+                );
+            }
+            return verdicts;
         }
     };
-
-    responses
-        .into_iter()
-        .zip(hashes)
-        .map(|(response, expected_hash)| match response {
-            Ok(value) => parse_simulation(value, entry_point, &[*expected_hash]),
-            Err(RpcError::Reverted) => {
-                // `eth_simulateV1` reports a real call verdict inside `result`. A top-level error
-                // means the RPC could not perform the method, even if its message says revert.
-                SimulationVerdict::Transient("individual simulation method unavailable")
-            }
-            Err(_) => SimulationVerdict::Transient("individual simulation RPC unavailable"),
-        })
-        .collect()
+    for (index, response) in fallback_indexes.into_iter().zip(trace_responses) {
+        verdicts[index] = match response {
+            Ok(value) => parse_trace_simulation(value, entry_point, &[hashes[index]]),
+            Err(_) => SimulationVerdict::Transient(
+                "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
+            ),
+        };
+    }
+    verdicts
 }
 
 pub(super) async fn simulate_bundle(
@@ -107,12 +152,24 @@ pub(super) async fn simulate_bundle(
         .call(
             chain_id,
             "eth_simulateV1",
-            simulate_params(relayer, entry_point, calldata),
+            simulate_params(relayer, entry_point, calldata.clone()),
         )
         .await
     {
         Ok(value) => parse_simulation(value, entry_point, hashes),
-        Err(_) => SimulationVerdict::Transient("bundle execution simulation unavailable"),
+        Err(_) => match rpc
+            .call(
+                chain_id,
+                "debug_traceCall",
+                debug_trace_params(relayer, entry_point, calldata),
+            )
+            .await
+        {
+            Ok(value) => parse_trace_simulation(value, entry_point, hashes),
+            Err(_) => SimulationVerdict::Transient(
+                "no trusted executor RPC supports eth_simulateV1 or debug_traceCall",
+            ),
+        },
     }
 }
 
@@ -130,6 +187,21 @@ fn simulate_params(from: Address, entry_point: Address, calldata: Bytes) -> Valu
             "traceTransfers": false,
         },
         "latest"
+    ])
+}
+
+fn debug_trace_params(from: Address, entry_point: Address, calldata: Bytes) -> Value {
+    json!([
+        {
+            "from": from.to_string(),
+            "to": entry_point.to_string(),
+            "data": format!("0x{}", hex::encode(calldata)),
+        },
+        "latest",
+        {
+            "tracer": "callTracer",
+            "tracerConfig": { "withLog": true },
+        }
     ])
 }
 
@@ -176,6 +248,86 @@ fn parse_simulation(
         Some(logs) => logs,
         None => return SimulationVerdict::Transient("simulation returned malformed logs"),
     };
+    simulation_from_logs(gas_used, logs, entry_point, expected_hashes)
+}
+
+fn parse_trace_simulation(
+    value: Value,
+    entry_point: Address,
+    expected_hashes: &[B256],
+) -> SimulationVerdict<SimulationResult> {
+    if trace_reports_failure(&value) {
+        return if trace_reports_nonce_mismatch(&value) {
+            SimulationVerdict::NonceMismatch
+        } else {
+            SimulationVerdict::Rejected("handleOps reverted during debug trace simulation")
+        };
+    }
+    let Some(gas_used) = value
+        .get("gasUsed")
+        .and_then(Value::as_str)
+        .and_then(parse_u256)
+    else {
+        return SimulationVerdict::Transient("debug trace response has no gasUsed");
+    };
+    let Some(logs) = trace_logs(&value) else {
+        return SimulationVerdict::Transient("debug trace returned malformed logs");
+    };
+    simulation_from_logs(gas_used, logs, entry_point, expected_hashes)
+}
+
+fn trace_reports_failure(trace: &Value) -> bool {
+    trace
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| !error.is_empty())
+        || trace
+            .get("revertReason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+}
+
+fn trace_reports_nonce_mismatch(trace: &Value) -> bool {
+    ["error", "revertReason"]
+        .into_iter()
+        .filter_map(|field| trace.get(field).and_then(Value::as_str))
+        .any(|message| {
+            let message = message.to_ascii_lowercase();
+            message.contains("aa25") || message.contains("invalid account nonce")
+        })
+}
+
+fn trace_logs(trace: &Value) -> Option<Vec<SimulatedLog>> {
+    let own_logs = match trace.get("logs") {
+        Some(logs) => logs
+            .as_array()?
+            .iter()
+            .map(parse_log)
+            .collect::<Option<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let child_logs = match trace.get("calls") {
+        Some(calls) => calls
+            .as_array()?
+            .iter()
+            .map(trace_logs)
+            .collect::<Option<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    Some(
+        own_logs
+            .into_iter()
+            .chain(child_logs.into_iter().flatten())
+            .collect(),
+    )
+}
+
+fn simulation_from_logs(
+    gas_used: U256,
+    logs: Vec<SimulatedLog>,
+    entry_point: Address,
+    expected_hashes: &[B256],
+) -> SimulationVerdict<SimulationResult> {
     let event_signature =
         keccak256(b"UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)");
     let events = logs
@@ -277,7 +429,7 @@ mod tests {
     use alloy::primitives::{address, b256};
     use serde_json::json;
 
-    use super::{SimulationVerdict, parse_simulation};
+    use super::{SimulationVerdict, parse_simulation, parse_trace_simulation};
 
     #[test]
     fn ignores_forged_events_from_non_entry_point_addresses() {
@@ -376,6 +528,33 @@ mod tests {
         assert!(matches!(
             parse_simulation(unrelated, entry_point, &[hash]),
             SimulationVerdict::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn accepts_a_nested_entry_point_event_from_debug_trace_call() {
+        let entry_point = address!("1111111111111111111111111111111111111111");
+        let hash = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let signature = alloy::primitives::keccak256(
+            b"UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)",
+        );
+        let word = |value: u64| format!("{value:064x}");
+        let trace = json!({
+            "type": "CALL",
+            "gasUsed": "0x120",
+            "calls": [{
+                "type": "CALL",
+                "logs": [{
+                    "address": entry_point.to_string(),
+                    "topics": [signature.to_string(), hash.to_string()],
+                    "data": format!("0x{}{}{}{}", word(0), word(1), word(10), word(9)),
+                }]
+            }]
+        });
+
+        assert!(matches!(
+            parse_trace_simulation(trace, entry_point, &[hash]),
+            SimulationVerdict::Success(_)
         ));
     }
 }

@@ -65,9 +65,10 @@ defaults to pathUSD; a different fee token is rejected until it has an explicit 
 policy.
 
 The executor derives the relayer's required pathUSD float from the declared UserOperation gas
-limits, verifies the final `eth_simulateV1` execution and the exact pathUSD transfer log, then
-submits `handleOps` in a signed `0x76` transaction. If the relayer float is low, the treasury
-automatically sends a durable pathUSD top-up through a separate self-paying `0x76` transaction.
+limits, verifies the final execution and exact pathUSD transfer log with `eth_simulateV1` (or a
+trusted `debug_traceCall` fallback), then submits `handleOps` in a signed `0x76` transaction. If
+the relayer float is low, the treasury automatically sends a durable pathUSD top-up through a
+separate self-paying `0x76` transaction.
 
 Tempo uses the same automatic controlled-directory RPC resolution. No Tempo-specific RPC
 configuration is needed. Add an explicit endpoint only when you want it tried ahead of the
