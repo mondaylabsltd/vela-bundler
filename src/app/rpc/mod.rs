@@ -15,9 +15,9 @@ pub mod types;
 pub(crate) use handlers::supported_entry_points::SUPPORTED_ENTRY_POINTS;
 
 use types::{
-    EstimateUserOperationGasParams, GetUserOperationByHashParams, GetUserOperationReceiptParams,
-    GetUserOperationStatusParams, RpcError, RpcMethod, RpcRequest, RpcResponse,
-    SendUserOperationParams,
+    EstimateUserOperationGasParams, GetInBandGasQuoteParams, GetUserOperationByHashParams,
+    GetUserOperationReceiptParams, GetUserOperationStatusParams, RpcError, RpcMethod, RpcRequest,
+    RpcResponse, SendUserOperationParams,
 };
 
 pub const RPC_DOMAIN_RESPONSE_HEADER: &str = "x-vela-rpc-domain";
@@ -70,6 +70,26 @@ pub async fn handle(
                 chain_id,
                 headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
                 gas_price,
+            )
+            .await;
+            response_with_rpc_domain(response_body, rpc_domain)
+        }
+        RpcMethod::GetInBandGasQuote => {
+            let params = match serde_json::from_value::<GetInBandGasQuoteParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return response(RpcResponse::error(
+                        request.id,
+                        RpcError::invalid_params(error.to_string()),
+                    ));
+                }
+            };
+            let (response_body, rpc_domain) = handlers::in_band_gas_quote::handle(
+                request.id,
+                chain_id,
+                headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                &state,
+                params,
             )
             .await;
             response_with_rpc_domain(response_body, rpc_domain)
@@ -163,6 +183,9 @@ fn validate_call(method: &str, params: Value) -> Result<RpcMethod, RpcError> {
         }
         RpcMethod::GetUserOperationStatus => {
             parse_params::<GetUserOperationStatusParams>(params)?;
+        }
+        RpcMethod::GetInBandGasQuote => {
+            parse_params::<GetInBandGasQuoteParams>(params)?;
         }
     }
 
@@ -342,5 +365,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(method.as_str(), "eth_sendUserOperation");
+    }
+
+    #[test]
+    fn accepts_the_in_band_gas_quote_request_shape() {
+        assert!(
+            validate_call(
+                "vela_getInBandGasQuote",
+                json!([{
+                    "safeAddress": "0x14fB1fB21751E29F7Ec48dC450017552E3D1eA5c",
+                }])
+            )
+            .is_ok()
+        );
+        assert!(validate_call("vela_getInBandGasQuote", json!([])).is_err());
     }
 }

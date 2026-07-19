@@ -103,6 +103,58 @@ curl http://127.0.0.1:4567/1 \
   --data '{"jsonrpc":"2.0","method":"pimlico_getUserOperationGasPrice","params":[],"id":1}'
 ```
 
+## `vela_getInBandGasQuote`
+
+This Vela extension returns the assets that a Safe can use to reimburse an in-band UserOperation.
+Call `POST /{chainId}` with one `safeAddress` parameter:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "vela_getInBandGasQuote",
+  "params": [{
+    "safeAddress": "0x14fB1fB21751E29F7Ec48dC450017552E3D1eA5c"
+  }],
+  "id": 1
+}
+```
+
+Each quote identifies the configured settlement recipient, the asset, the user's current balance,
+and its USD valuation. `eth_sendUserOperation` still enforces a minimum in-band reimbursement of
+`0.00001` native coin or `0.01` USD stablecoin.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [{
+    "recipient": "0xee2cca98ecbff34663591a925968fa4db5a1f0dd",
+    "asset": "native",
+    "feeToken": null,
+    "decimals": 18,
+    "symbol": "ETH",
+    "balance": "0x0",
+    "usdPrice": "3000.12",
+    "usdBalance": "0"
+  }]
+}
+```
+
+Chain native-currency and stablecoin metadata is loaded from the Ethereum Data registry and cached
+for one hour. A 60-second Binance `{nativeSymbol}USDT` price cache supplies the native USD price.
+The native asset is always returned; if that price is unavailable, `usdPrice` and `usdBalance` are
+`null` and no stablecoin quote is returned. Stablecoins are restricted to USD-pegged symbols and
+use `"1"` as their USD price.
+
+After metadata and price resolution, the handler makes one EVM `eth_call` to the canonical
+Multicall3 contract. That call reads the Safe's native balance plus every eligible ERC-20
+`decimals()` and `balanceOf(safeAddress)`, reducing the chain-read fan-out to one request.
+Successful responses include `x-vela-rpc-domain`, and the standard caller RPC → Alchemy →
+Ethereum Data failover order applies.
+
+`usdBalance` is the Safe's balance converted to USD as an exact decimal string. Quotes are ordered
+by this value from largest to smallest; assets without a price return `null` and sort last.
+
 ## Settlement vault
 
 When `OPERATOR_SECRET` is configured, the settlement recipient is derived with the same HKDF-SHA256 treasury derivation as `vela-bundler`: salt `vela-bundler-dedicated-eoa-v1`, info `treasury`, and a secp256k1 Ethereum address. The derived address is chain-independent and is used as the settlement vault recipient.
@@ -143,9 +195,13 @@ The relay supports the unpacked EntryPoint v0.7 UserOperation format for the con
 
 The relay does not forward this bundler-specific method to a normal EVM RPC. It injects the EntryPoint v0.7 simulation code through the standard `eth_call` state-override parameter, then estimates the account execution phase with `eth_estimateGas` using the EntryPoint as `from`.
 
-During simulation, the copied operation uses one wei gas-fee fields and a temporary sender balance. The submitted operation is never modified. This is required for Tempo's signed zero-fee operations: `maxFeePerGas` and `maxPriorityFeePerGas` remain zero in the original request, so no native EntryPoint prefund is required.
+All supported chains use in-band settlement. `maxFeePerGas` and `maxPriorityFeePerGas` must therefore both be `0x0`; the simulation encodes the same zero values and never substitutes a native EntryPoint fee. The submitted operation is never modified.
 
-An RPC that rejects state overrides, times out, or is rate limited is cooled down and the next configured source is tried. A genuine EVM revert is returned as a UserOperation simulation error without cooling down that RPC. Successful responses include the selected simulation source in `x-vela-rpc-domain`.
+Estimation does not require or validate an in-band reimbursement transfer. It estimates the gas
+used by the supplied UserOperation and its `callData`; reimbursement admission is performed only
+by `eth_sendUserOperation`.
+
+An RPC that rejects state overrides, times out, or is rate limited is cooled down and the next configured source is tried. A genuine EVM revert is returned as a UserOperation simulation error without cooling down that RPC. `FailedOp`, `FailedOpWithRevert`, Solidity panic, and nested gateway revert data are decoded into the JSON-RPC error `data` field. Successful responses include the selected simulation source in `x-vela-rpc-domain`.
 
 The response contains the v0.7 gas fields, including zero-valued paymaster limits when no paymaster is present:
 

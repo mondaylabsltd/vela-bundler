@@ -104,6 +104,10 @@ impl RpcError {
         Self::new(-32000, "gas price RPC request timed out", None)
     }
 
+    pub fn in_band_gas_quote_unavailable() -> Self {
+        Self::new(-32000, "in-band gas quote is temporarily unavailable", None)
+    }
+
     pub fn user_operation_rejected(details: impl Into<String>) -> Self {
         Self::new(
             -32500,
@@ -142,6 +146,7 @@ pub enum RpcMethod {
     SupportedEntryPoints,
     GetUserOperationGasPrice,
     GetUserOperationStatus,
+    GetInBandGasQuote,
 }
 
 impl RpcMethod {
@@ -154,6 +159,7 @@ impl RpcMethod {
             "eth_supportedEntryPoints" => Ok(Self::SupportedEntryPoints),
             "pimlico_getUserOperationGasPrice" => Ok(Self::GetUserOperationGasPrice),
             "pimlico_getUserOperationStatus" => Ok(Self::GetUserOperationStatus),
+            "vela_getInBandGasQuote" => Ok(Self::GetInBandGasQuote),
             _ => Err(RpcError::method_not_found(value)),
         }
     }
@@ -167,6 +173,7 @@ impl RpcMethod {
             Self::SupportedEntryPoints => "eth_supportedEntryPoints",
             Self::GetUserOperationGasPrice => "pimlico_getUserOperationGasPrice",
             Self::GetUserOperationStatus => "pimlico_getUserOperationStatus",
+            Self::GetInBandGasQuote => "vela_getInBandGasQuote",
         }
     }
 }
@@ -241,6 +248,15 @@ impl RpcMethodSpec for GetUserOperationStatus {
     const METHOD: &'static str = "pimlico_getUserOperationStatus";
 }
 
+pub struct GetInBandGasQuote;
+
+impl RpcMethodSpec for GetInBandGasQuote {
+    type Params = GetInBandGasQuoteParams;
+    type Result = Vec<InBandGasQuote>;
+
+    const METHOD: &'static str = "vela_getInBandGasQuote";
+}
+
 pub struct NoParams;
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +277,25 @@ pub struct GetUserOperationByHashParams(pub UserOperationHash);
 
 #[derive(Debug, Deserialize)]
 pub struct GetUserOperationStatusParams(pub UserOperationHash);
+
+#[derive(Debug, Deserialize)]
+pub struct GetInBandGasQuoteParams(pub [InBandGasQuoteRequest; 1]);
+
+impl GetInBandGasQuoteParams {
+    pub fn safe_address(self) -> Address {
+        self.0
+            .into_iter()
+            .next()
+            .expect("a one-element params array always contains a request")
+            .safe_address
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InBandGasQuoteRequest {
+    pub safe_address: Address,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -448,6 +483,26 @@ pub struct UserOperationGasPrice {
     pub slow: GasPriceTier,
     pub standard: GasPriceTier,
     pub fast: GasPriceTier,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InBandGasQuote {
+    pub recipient: Address,
+    pub asset: InBandGasQuoteAsset,
+    pub fee_token: Option<Address>,
+    pub decimals: u32,
+    pub symbol: String,
+    pub balance: Quantity,
+    pub usd_price: Option<String>,
+    pub usd_balance: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InBandGasQuoteAsset {
+    Native,
+    Erc20,
 }
 
 #[derive(Debug, Serialize)]

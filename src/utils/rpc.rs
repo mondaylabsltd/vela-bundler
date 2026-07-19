@@ -17,9 +17,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const FAILED_RPC_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_FAILED_RPC_ENTRIES: usize = 1_024;
+const CHAIN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_CHAIN_METADATA_CACHE_ENTRIES: usize = 512;
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static FAILED_RPCS: OnceLock<FailedRpcCache> = OnceLock::new();
+static CHAIN_METADATA_CACHE: OnceLock<Mutex<HashMap<u64, CachedChainMetadata>>> = OnceLock::new();
 
 #[derive(Debug, PartialEq)]
 pub struct RpcCallResult {
@@ -46,6 +49,24 @@ pub struct RpcRevert {
 pub struct SettlementAssets {
     pub native_decimals: u32,
     pub stablecoins: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentAssets {
+    pub native: NativeAsset,
+    pub stablecoins: Vec<StablecoinAsset>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeAsset {
+    pub symbol: String,
+    pub decimals: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StablecoinAsset {
+    pub symbol: String,
+    pub contract: String,
 }
 
 pub async fn call(
@@ -151,22 +172,49 @@ pub async fn call_simulation(
 }
 
 pub async fn settlement_assets(chain_id: u64) -> Result<SettlementAssets, ()> {
+    let assets = payment_assets(chain_id).await?;
+
+    Ok(SettlementAssets {
+        native_decimals: assets.native.decimals,
+        stablecoins: assets
+            .stablecoins
+            .into_iter()
+            .map(|stable| stable.contract)
+            .collect(),
+    })
+}
+
+/// Return native and stablecoin metadata for an in-band payment quote.
+///
+/// Chain metadata is shared with RPC fallback resolution and cached for one hour because it
+/// changes far less frequently than account balances or gas prices.
+pub async fn payment_assets(chain_id: u64) -> Result<PaymentAssets, ()> {
     let metadata = fetch_chain_metadata(http_client(), chain_id)
         .await
         .map_err(|error| {
-            tracing::warn!(%error, "could not fetch chain metadata for in-band settlement");
+            tracing::warn!(%error, "could not fetch chain metadata for in-band payments");
         })?;
+    let native_currency = metadata.native_currency.ok_or_else(|| {
+        tracing::warn!(
+            chain_id,
+            "chain metadata does not declare a native currency"
+        );
+    })?;
 
-    Ok(SettlementAssets {
-        native_decimals: metadata
-            .native_currency
-            .as_ref()
-            .map(|currency| currency.decimals)
-            .unwrap_or(18),
+    Ok(PaymentAssets {
+        native: NativeAsset {
+            symbol: native_currency.symbol,
+            decimals: native_currency.decimals,
+        },
         stablecoins: metadata
             .stables
             .into_iter()
-            .filter_map(|stable| parse_address(&stable.contract))
+            .filter_map(|stable| {
+                parse_address(&stable.contract).map(|contract| StablecoinAsset {
+                    symbol: stable.symbol,
+                    contract,
+                })
+            })
             .collect(),
     })
 }
@@ -229,8 +277,13 @@ async fn fetch_fallback_rpc_urls(client: &Client, chain_id: u64) -> Result<Vec<S
 }
 
 async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMetadata, String> {
+    let now = Instant::now();
+    if let Some(metadata) = cached_chain_metadata(chain_id, now) {
+        return Ok(metadata);
+    }
+
     let url = format!("{RPC_LIST_URL}{chain_id}.json");
-    client
+    let metadata = client
         .get(url)
         .send()
         .await
@@ -239,7 +292,44 @@ async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMet
         .map_err(|error| format!("metadata request failed: {error}"))?
         .json::<ChainMetadata>()
         .await
-        .map_err(|error| format!("invalid chain metadata: {error}"))
+        .map_err(|error| format!("invalid chain metadata: {error}"))?;
+
+    store_chain_metadata(chain_id, metadata.clone(), now);
+    Ok(metadata)
+}
+
+fn cached_chain_metadata(chain_id: u64, now: Instant) -> Option<ChainMetadata> {
+    let mut cache = chain_metadata_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| entry.expires_at > now);
+    cache.get(&chain_id).map(|entry| entry.metadata.clone())
+}
+
+fn store_chain_metadata(chain_id: u64, metadata: ChainMetadata, now: Instant) {
+    let mut cache = chain_metadata_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| entry.expires_at > now);
+    if !cache.contains_key(&chain_id) && cache.len() >= MAX_CHAIN_METADATA_CACHE_ENTRIES {
+        tracing::warn!(
+            max_entries = MAX_CHAIN_METADATA_CACHE_ENTRIES,
+            "chain metadata cache is full; skipped cache entry"
+        );
+        return;
+    }
+
+    cache.insert(
+        chain_id,
+        CachedChainMetadata {
+            metadata,
+            expires_at: now + CHAIN_METADATA_CACHE_TTL,
+        },
+    );
+}
+
+fn chain_metadata_cache() -> &'static Mutex<HashMap<u64, CachedChainMetadata>> {
+    CHAIN_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn parse_rpc_url(value: &str) -> Option<String> {
@@ -599,7 +689,7 @@ impl FailedRpcKey {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ChainMetadata {
     rpc: Vec<String>,
     #[serde(default)]
@@ -621,14 +711,21 @@ struct UpstreamRpcError {
     data: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct StablecoinMetadata {
+    symbol: String,
     contract: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct NativeCurrencyMetadata {
+    symbol: String,
     decimals: u32,
+}
+
+struct CachedChainMetadata {
+    metadata: ChainMetadata,
+    expires_at: Instant,
 }
 
 enum SimulationUpstreamError {
@@ -641,7 +738,7 @@ mod tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -655,6 +752,8 @@ mod tests {
         first_result, first_simulation_result, parse_rpc_url, redacted_rpc_url, response_rpc_url,
         rpc_domain,
     };
+
+    static TEST_CHAIN_IDS: AtomicU64 = AtomicU64::new(9_000_000_000);
 
     #[test]
     fn keeps_only_safe_https_fallback_urls() {
@@ -753,7 +852,7 @@ mod tests {
             format!("http://{address}/limited"),
             format!("http://{address}"),
         ];
-        let chain_id = 1_000_000u64 + u64::from(address.port());
+        let chain_id = TEST_CHAIN_IDS.fetch_add(1, Ordering::Relaxed);
         let client = reqwest::Client::new();
         let mut direct_result = fetch_result(&client, &urls[1], "eth_gasPrice", &json!([])).await;
         for _ in 0..2 {
@@ -816,9 +915,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let client = reqwest::Client::new();
+        let chain_id = TEST_CHAIN_IDS.fetch_add(1, Ordering::Relaxed);
         let result = first_simulation_result(
             &client,
-            31337,
+            chain_id,
             "test",
             &[
                 format!("http://{address}/unsupported"),

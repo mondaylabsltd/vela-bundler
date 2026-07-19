@@ -60,6 +60,8 @@ async fn estimate(
     entry_point: String,
     state_overrides: Option<StateOverrideSet>,
 ) -> Result<(UserOperationGasEstimate, String), RpcError> {
+    // Estimation simulates the UserOperation only. In-band reimbursement admission checks belong
+    // exclusively to eth_sendUserOperation, after the caller has accepted the quoted gas.
     if !supported_entry_points::is_supported(&entry_point) {
         return Err(RpcError::invalid_params("unsupported EntryPoint"));
     }
@@ -248,22 +250,77 @@ fn simulation_error(error: RpcSimulationError) -> RpcError {
 }
 
 fn simulation_revert_error(error: RpcRevert) -> RpcError {
-    let reason = error
-        .data
-        .as_ref()
-        .and_then(revert_reason)
-        .unwrap_or_else(|| "UserOperation validation reverted".into());
+    let reason = revert_reason(&error).unwrap_or_else(|| {
+        let code = error
+            .code
+            .map(|code| format!(" (RPC code {code})"))
+            .unwrap_or_default();
+        format!("UserOperation validation reverted{code}: {}", error.message)
+    });
     RpcError::user_operation_rejected(reason)
 }
 
-fn revert_reason(data: &Value) -> Option<String> {
-    let data = match data {
-        Value::String(data) => data.as_str(),
-        Value::Object(data) => data.get("data")?.as_str()?,
-        _ => return None,
-    };
-    let bytes = in_band_settlement::decode_hex(data).ok()?;
-    decode_revert_bytes(&bytes)
+/// Extract revert bytes from the error shapes used by common EVM RPC providers.
+///
+/// Geth usually places them in `error.data`, while gateway providers commonly nest them or
+/// append them to `error.message`. The data is contract output, not a URL or credential.
+fn revert_reason(error: &RpcRevert) -> Option<String> {
+    let data = error
+        .data
+        .as_ref()
+        .and_then(|data| find_revert_data(data, 0))
+        .or_else(|| find_revert_data_in_message(&error.message))?;
+    let bytes = in_band_settlement::decode_hex(&data).ok()?;
+
+    decode_revert_bytes(&bytes).or_else(|| {
+        let selector = bytes
+            .get(..4)
+            .map(bytes_to_hex)
+            .unwrap_or_else(|| "0x".into());
+        Some(format!(
+            "Unknown EVM custom error {selector} ({} bytes of revert data)",
+            bytes.len()
+        ))
+    })
+}
+
+fn find_revert_data(value: &Value, depth: usize) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+
+    match value {
+        Value::String(value) => valid_revert_data(value),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_revert_data(value, depth + 1)),
+        Value::Object(values) => ["data", "revertData", "originalError", "error"]
+            .into_iter()
+            .filter_map(|key| values.get(key))
+            .find_map(|value| find_revert_data(value, depth + 1)),
+        _ => None,
+    }
+}
+
+fn find_revert_data_in_message(message: &str) -> Option<String> {
+    message
+        .match_indices("0x")
+        .filter_map(|(index, _)| {
+            let hex = message[index + 2..]
+                .bytes()
+                .take_while(u8::is_ascii_hexdigit)
+                .count();
+            valid_revert_data(&message[index..index + 2 + hex])
+        })
+        .max_by_key(|data| data.len())
+}
+
+fn valid_revert_data(value: &str) -> Option<String> {
+    let value = value.strip_prefix("0x")?;
+    (value.len() >= 8
+        && value.len().is_multiple_of(2)
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| format!("0x{value}"))
 }
 
 fn decode_revert_bytes(bytes: &[u8]) -> Option<String> {
@@ -272,6 +329,7 @@ fn decode_revert_bytes(bytes: &[u8]) -> Option<String> {
     const FAILED_OP_SELECTOR: [u8; 4] = [0x22, 0x02, 0x66, 0xb6];
     const FAILED_OP_WITH_REVERT_SELECTOR: [u8; 4] = [0x65, 0xc8, 0xfd, 0x4d];
     const CALL_PHASE_REVERTED_SELECTOR: [u8; 4] = [0x46, 0x2c, 0x71, 0xb2];
+    const SAFE_EXECUTION_FAILED_SELECTOR: [u8; 4] = [0xac, 0xfd, 0xb4, 0x44];
 
     let selector = bytes.get(..4)?;
     if selector == ERROR_STRING_SELECTOR {
@@ -299,6 +357,9 @@ fn decode_revert_bytes(bytes: &[u8]) -> Option<String> {
         return abi_bytes(bytes, 4, 4)
             .and_then(decode_revert_bytes)
             .map(|reason| format!("CallPhaseReverted: {reason}"));
+    }
+    if selector == SAFE_EXECUTION_FAILED_SELECTOR {
+        return Some("Safe execution failed: the target call in executeUserOp reverted".into());
     }
 
     None
@@ -403,6 +464,18 @@ impl SimulationUserOperation {
         )?
         .filter(|gas| *gas > 0)
         .unwrap_or(default_verification_gas);
+        let max_fee_per_gas =
+            optional_quantity(operation.max_fee_per_gas.as_deref(), "maxFeePerGas")?.unwrap_or(0);
+        let max_priority_fee_per_gas = optional_quantity(
+            operation.max_priority_fee_per_gas.as_deref(),
+            "maxPriorityFeePerGas",
+        )?
+        .unwrap_or(0);
+        if max_fee_per_gas != 0 || max_priority_fee_per_gas != 0 {
+            return Err(RpcError::invalid_params(
+                "maxFeePerGas and maxPriorityFeePerGas must both be 0x0",
+            ));
+        }
 
         let (has_paymaster, paymaster_and_data) = match operation.paymaster {
             Some(paymaster) => {
@@ -454,7 +527,9 @@ impl SimulationUserOperation {
             uint128_word(call_gas_limit),
         ]
         .concat();
-        let gas_fees = [uint128_word(1), uint128_word(1)].concat();
+        // All supported chains settle bundler fees in-band. The EntryPoint native-prefund
+        // fields are signed and must remain zero for both estimation and submission.
+        let gas_fees = [uint128_word(0), uint128_word(0)].concat();
         let mut output = SIMULATE_VALIDATION_SELECTOR.to_vec();
         output.extend(usize_word(32));
         output.extend(self.encode_user_operation_tuple(&account_gas_limits, &gas_fees));
@@ -631,10 +706,13 @@ mod tests {
         SimulationUserOperation, parse_validation_pre_op_gas, quantity_word, revert_reason,
         with_percent_buffer,
     };
-    use crate::app::rpc::types::{EstimatableUserOperation, EstimatableUserOperationV0_7};
+    use crate::{
+        app::rpc::types::{EstimatableUserOperation, EstimatableUserOperationV0_7},
+        utils::rpc::RpcRevert,
+    };
 
     #[test]
-    fn encodes_v07_simulation_with_one_wei_fees_without_mutating_the_input() {
+    fn rejects_nonzero_fee_fields() {
         let operation = EstimatableUserOperation::V0_7(Box::new(EstimatableUserOperationV0_7 {
             sender: "0x1111111111111111111111111111111111111111".into(),
             nonce: "0x0".into(),
@@ -644,6 +722,69 @@ mod tests {
             call_gas_limit: Some("0x0".into()),
             verification_gas_limit: Some("0x0".into()),
             pre_verification_gas: Some("0x0".into()),
+            max_fee_per_gas: Some("0x1234".into()),
+            max_priority_fee_per_gas: Some("0x56".into()),
+            paymaster: None,
+            paymaster_verification_gas_limit: None,
+            paymaster_post_op_gas_limit: None,
+            paymaster_data: None,
+            signature: Some("0x1234".into()),
+            eip7702_auth: None,
+        }));
+
+        let error = SimulationUserOperation::try_from((1, operation)).unwrap_err();
+
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.data,
+            Some(json!(
+                "maxFeePerGas and maxPriorityFeePerGas must both be 0x0"
+            ))
+        );
+    }
+
+    #[test]
+    fn preserves_zero_fee_fields_on_every_chain() {
+        let operation = EstimatableUserOperation::V0_7(Box::new(EstimatableUserOperationV0_7 {
+            sender: "0x1111111111111111111111111111111111111111".into(),
+            nonce: "0x0".into(),
+            factory: None,
+            factory_data: None,
+            call_data: "0x".into(),
+            call_gas_limit: Some("0x0".into()),
+            verification_gas_limit: Some("0x0".into()),
+            pre_verification_gas: Some("0x0".into()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            paymaster: None,
+            paymaster_verification_gas_limit: None,
+            paymaster_post_op_gas_limit: None,
+            paymaster_data: None,
+            signature: Some("0x1234".into()),
+            eip7702_auth: None,
+        }));
+
+        let calldata = SimulationUserOperation::try_from((1, operation))
+            .unwrap()
+            .simulate_validation_calldata()
+            .unwrap();
+        let tuple_start = 4 + 32;
+        let gas_fees_start = tuple_start + 6 * 32;
+
+        assert_eq!(&calldata[gas_fees_start..gas_fees_start + 32], &[0; 32]);
+    }
+
+    #[test]
+    fn estimation_does_not_require_an_in_band_reimbursement() {
+        let operation = EstimatableUserOperation::V0_7(Box::new(EstimatableUserOperationV0_7 {
+            sender: "0x1111111111111111111111111111111111111111".into(),
+            nonce: "0x0".into(),
+            factory: None,
+            factory_data: None,
+            call_data: "0x".into(),
+            call_gas_limit: None,
+            verification_gas_limit: None,
+            pre_verification_gas: None,
             max_fee_per_gas: Some("0x0".into()),
             max_priority_fee_per_gas: Some("0x0".into()),
             paymaster: None,
@@ -654,16 +795,7 @@ mod tests {
             eip7702_auth: None,
         }));
 
-        let simulation = SimulationUserOperation::try_from((4_217, operation)).unwrap();
-        let calldata = simulation.simulate_validation_calldata().unwrap();
-
-        assert_eq!(&calldata[..4], &[0xc3, 0xbc, 0xe0, 0x09]);
-        assert_eq!(calldata[4..36], super::usize_word(32));
-        assert!(
-            calldata
-                .windows(32)
-                .any(|word| word[16..] == [0; 15].into_iter().chain([1]).collect::<Vec<_>>())
-        );
+        assert!(SimulationUserOperation::try_from((1, operation)).is_ok());
     }
 
     #[test]
@@ -683,13 +815,47 @@ mod tests {
 
     #[test]
     fn decodes_entry_point_failed_op_reasons() {
-        let data = json!(
-            "0x220266b600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000001a4141323520696e76616c6964206163636f756e74206e6f6e6365000000000000"
-        );
+        let error = RpcRevert {
+            code: Some(3),
+            message: "execution reverted".into(),
+            data: Some(json!({
+                "originalError": {
+                    "data": "0x220266b600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000001a4141323520696e76616c6964206163636f756e74206e6f6e6365000000000000"
+                }
+            })),
+        };
 
         assert_eq!(
-            revert_reason(&data),
+            revert_reason(&error),
             Some("FailedOp(0): AA25 invalid account nonce".into())
+        );
+    }
+
+    #[test]
+    fn extracts_revert_data_embedded_in_the_rpc_error_message() {
+        let error = RpcRevert {
+            code: Some(3),
+            message: "execution reverted: 0x4e487b710000000000000000000000000000000000000000000000000000000000000011".into(),
+            data: None,
+        };
+
+        assert_eq!(
+            revert_reason(&error),
+            Some("Solidity panic 0x11: arithmetic overflow or underflow".into())
+        );
+    }
+
+    #[test]
+    fn identifies_safe_execution_failed() {
+        let error = RpcRevert {
+            code: Some(3),
+            message: "execution reverted".into(),
+            data: Some(json!("0xacfdb444")),
+        };
+
+        assert_eq!(
+            revert_reason(&error),
+            Some("Safe execution failed: the target call in executeUserOp reverted".into())
         );
     }
 
