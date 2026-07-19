@@ -13,10 +13,15 @@ use serde_json::Value;
 
 use crate::utils::config::IggyConfig;
 
+/// Retention of automatically provisioned UserOperation topics. Redis delayed payloads must live
+/// at least this long after their latest retry because their original Iggy offset is acknowledged.
+pub(crate) const USER_OPERATION_QUEUE_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
 /// Durable admission queue for accepted UserOperations.
 ///
-/// The Iggy server is the source of truth. The process-local pending set is only a best-effort
-/// optimization for idempotent retries while this process is alive.
+/// Redis and Iggy form a two-phase, at-least-once admission protocol. Redis is written first and
+/// Iggy proves that the operation is executable. An enqueue error does not prove that no message
+/// was appended: the connection can fail after Iggy commits but before its acknowledgement arrives.
 #[derive(Clone)]
 pub struct UserOperationQueue {
     client: Arc<IggyClient>,
@@ -91,7 +96,11 @@ impl UserOperationQueue {
         })
     }
 
-    /// Appends an operation only after Iggy confirms the write.
+    /// Returns success only after Iggy confirms the write.
+    ///
+    /// Callers must treat every error after invoking this method as an unknown delivery outcome.
+    /// In particular, they must retain the matching Redis admission record so a consumer can use
+    /// an already-appended message as proof, or an idempotent producer retry can append it again.
     ///
     /// Each chain is isolated in its own `chain-{chain_id}` stream and therefore retains FIFO
     /// ordering without sharing a partition with another chain.
@@ -238,8 +247,7 @@ impl ChainTopologyProvisioner {
         topic: &Identifier,
         topic_name: &str,
     ) -> Result<(), UserOperationQueueError> {
-        let expiry =
-            IggyExpiry::ExpireDuration(IggyDuration::new(Duration::from_secs(14 * 24 * 60 * 60)));
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::new(USER_OPERATION_QUEUE_RETENTION));
         if self
             .client
             .create_topic(
@@ -303,6 +311,8 @@ mod tests {
     async fn appends_to_a_preprovisioned_chain_stream() {
         let queue = UserOperationQueue::connect(&IggyConfig {
             url: env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL"),
+            consumer_url: env::var("VELA_RELAY_IGGY_CONSUMER_URL")
+                .unwrap_or_else(|_| env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL")),
             provisioner_url: None,
             topic: "default".into(),
             enqueue_timeout: Duration::from_secs(5),

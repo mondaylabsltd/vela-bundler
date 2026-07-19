@@ -330,12 +330,79 @@ VELA_RELAY_REDIS_COMMAND_TIMEOUT_SECS=2       # optional; this is the default
 refuses the write, or does not acknowledge before its timeout, `eth_sendUserOperation` returns
 JSON-RPC `-32000` instead of claiming success. The relay never falls back to in-memory state.
 
-Use a non-root `vela-relay-producer` account for the relay, with only `send_messages` permission;
-keep stream/topic management and consumer permissions in separate identities. Enable TCP TLS for
-any non-loopback connection and keep queue credentials only in the runtime secret store. The
-consumer should use an Iggy consumer group and commit its offset only after the corresponding
-bundle submission has completed durably. Delivery is at-least-once, so consumers must make
-`userOperationHash` idempotent.
+Use separate non-root identities in production:
+
+- `VELA_RELAY_IGGY_URL`: producer permissions for sending to existing topics.
+- `VELA_RELAY_IGGY_CONSUMER_URL`: list-stream, poll, consumer-group, and offset permissions.
+- `VELA_RELAY_IGGY_PROVISIONER_URL`: stream/topic creation permissions.
+
+The consumer URL falls back to the producer URL for local development only. Enable TCP TLS for
+any non-loopback connection and keep all three credentials in the runtime secret store. With the
+Docker port mapping shown in the deployment example, a relay running on the host connects to TCP
+port `5100` (not HTTP port `3010`):
+
+```sh
+VELA_RELAY_IGGY_URL='iggy+tcp://<producer>:<password>@127.0.0.1:5100'
+VELA_RELAY_IGGY_CONSUMER_URL='iggy+tcp://<consumer>:<password>@127.0.0.1:5100'
+```
+
+A relay container on the same Compose network instead uses `iggy:3000`. Port `3010` is the Iggy
+HTTP API used by the web UI; it is not the executor transport.
+
+### Worker executor
+
+The worker discovers all strictly named `chain-{u64}` streams at startup and every 15 seconds.
+Each stream has one shared Iggy consumer group and one dispatcher. The dispatcher routes each
+message by the sender's low 32 bits modulo 10 into ten deterministic EOA lanes. Ten independent
+Iggy group members cannot consume a one-partition topic concurrently, while ten separate consumer
+groups would execute every message ten times; dispatcher-to-lane routing provides ten EOA workers
+without either failure mode.
+
+EOAs `0..9` use the same HKDF derivation as `vela-bundler`: salt
+`vela-bundler-dedicated-eoa-v1`, info `relayer-#{index}`, and `OPERATOR_SECRET` as input. A lane is
+serialized across processes with a Redis lease and a signed-transaction outbox. The exact raw
+transaction is persisted before broadcast and replayed after a crash, so an ambiguous RPC response
+does not allocate another nonce. Iggy offsets advance only through the contiguous prefix whose
+result is durable in Redis.
+
+Execution is opt-configured per chain. Discovery accepts any `chain-{id}`, but a stream is never
+allowed to sign unless both a trusted RPC and an operator-owned asset policy exist for that chain:
+
+```sh
+VELA_RELAY_EXECUTOR_ENABLED=true
+OPERATOR_SECRET='0x<at-least-32-random-bytes>'
+VELA_RELAY_RELAYER_COUNT=10
+VELA_RELAY_EXECUTOR_RPC_URLS='{"42161":["https://<trusted-arbitrum-rpc>"]}'
+VELA_RELAY_EXECUTOR_CHAIN_ASSETS='{
+  "42161": {
+    "nativeDecimals": 18,
+    "stablecoins": [{
+      "address": "0x<allowlisted-stablecoin>",
+      "decimals": 6,
+      "symbol": "USDC",
+      "trustedFeeTiers": [500]
+    }],
+    "wrappedNative": "0x<trusted-wrapped-native>",
+    "quoterV2": "0x<trusted-quoter-v2>"
+  }
+}'
+```
+
+`trustedFeeTiers` is mandatory for every enabled stablecoin. The worker never probes arbitrary
+permissionless pools. If more than one reviewed tier is configured, it evaluates all of them and
+uses the most conservative successful quote. For native-only settlement, leave `stablecoins`
+empty and omit both `wrappedNative` and `quoterV2`.
+
+Before signing, every UserOperation is simulated alone; the final assembled `handleOps` is then
+simulated again. Reimbursement is parsed only from the canonical Safe
+`executeUserOp -> MultiSend(delegatecall) -> CALL` path. Stablecoin payment additionally requires
+the final bundle simulation to contain matching allowlisted `Transfer(sender, treasury, amount)`
+logs. Costs use the final bundle gas, EIP-1559 fee ceiling, deterministic per-op allocation, safety
+buffers, a default 2x settlement gate, and per-asset minimums. One payer cannot subsidize another.
+
+Treasury top-ups are serialized once per chain. Redis atomically reserves the daily cap and stores
+the signed funding transaction, removing the reserve/outbox crash window. A funding receipt is
+required before the relayer submits `handleOps`.
 
 ### UserOperation lookups and status
 
@@ -345,17 +412,9 @@ bundle submission has completed durably. Delivery is at-least-once, so consumers
 operation while its record remains available. `eth_getUserOperationReceipt` returns `null` until
 the operation is included and its receipt is known.
 
-Only `submitted` operations trigger `eth_getTransactionReceipt` against their chain RPC. Once a
-receipt appears, its result is written back to Redis: a reverted handleOps transaction marks the
-entire indexed bundle `failed`; a successful transaction defaults missing operations to `rejected`
-and marks successful `UserOperationEvent` entries `included`. This avoids chain RPC calls for
-queued, rejected, included, and failed UserOperations. Redis atomically coalesces submitted receipt
-checks to at most one chain RPC request per UserOp every five seconds, even when many clients poll
-the status endpoint concurrently.
-
-The Iggy handleOps consumer must call `mark_not_submitted` after an operation reaches its mempool,
-`UserOperationStatusStore::mark_bundle_submitted` with the transaction hash and every UserOp hash
-after transaction submission, and `mark_rejected` for a per-operation pre-submission simulation
-failure. A failed handleOps attempt before receipt availability must call `mark_handle_ops_failed`
-with every operation in that attempt. This relay repository does not contain that consumer or a
-handleOps signer; it only provides the durable queue and lifecycle store contract.
+HTTP status and receipt methods always read Redis and never fan user polling out to EVM RPCs. The
+worker's centralized reconciler batches `eth_getTransactionReceipt` by trusted chain RPC. A
+reverted `handleOps` transaction marks the whole persisted bundle `failed`; a successful outer
+transaction marks successful `UserOperationEvent` entries `included` and on-chain unsuccessful or
+missing entries `rejected`. This keeps chain RPC traffic bounded by pending bundle count rather
+than wallet polling volume.

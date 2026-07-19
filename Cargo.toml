@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+alloy = { version = "2.2.0", features = ["essentials"] }
 axum = "0.8.9"
 dotenvy = "0.15"
 hex = "0.4"

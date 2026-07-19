@@ -55,6 +55,11 @@ pub struct SettlementAssets {
 pub struct PaymentAssets {
     pub native: NativeAsset,
     pub stablecoins: Vec<StablecoinAsset>,
+    /// Informational chain-registry metadata. Execution code must still match this
+    /// against an operator-owned allowlist before using it in a money path.
+    pub wrapped_native_token: Option<String>,
+    /// Informational metadata mapped from `dex.contracts.quoterV2`.
+    pub dex_quoter_v2: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +72,7 @@ pub struct NativeAsset {
 pub struct StablecoinAsset {
     pub symbol: String,
     pub contract: String,
+    pub decimals: Option<u32>,
 }
 
 pub async fn call(
@@ -213,9 +219,20 @@ pub async fn payment_assets(chain_id: u64) -> Result<PaymentAssets, ()> {
                 parse_address(&stable.contract).map(|contract| StablecoinAsset {
                     symbol: stable.symbol,
                     contract,
+                    decimals: stable.decimals.filter(|decimals| *decimals <= 38),
                 })
             })
             .collect(),
+        wrapped_native_token: metadata
+            .wrapped_native_token
+            .as_deref()
+            .and_then(parse_address),
+        dex_quoter_v2: metadata
+            .dex
+            .and_then(|dex| dex.contracts)
+            .and_then(|contracts| contracts.quoter_v2)
+            .as_deref()
+            .and_then(parse_address),
     })
 }
 
@@ -696,6 +713,9 @@ struct ChainMetadata {
     stables: Vec<StablecoinMetadata>,
     #[serde(rename = "nativeCurrency")]
     native_currency: Option<NativeCurrencyMetadata>,
+    #[serde(rename = "wrappedNativeToken")]
+    wrapped_native_token: Option<String>,
+    dex: Option<DexMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -715,6 +735,19 @@ struct UpstreamRpcError {
 struct StablecoinMetadata {
     symbol: String,
     contract: String,
+    #[serde(default)]
+    decimals: Option<u32>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DexMetadata {
+    contracts: Option<DexContractsMetadata>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DexContractsMetadata {
+    #[serde(rename = "quoterV2")]
+    quoter_v2: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -748,12 +781,47 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        FailedRpcCache, SimulationUpstreamError, fetch_result, fetch_simulation_result,
-        first_result, first_simulation_result, parse_rpc_url, redacted_rpc_url, response_rpc_url,
-        rpc_domain,
+        ChainMetadata, FailedRpcCache, SimulationUpstreamError, fetch_result,
+        fetch_simulation_result, first_result, first_simulation_result, parse_rpc_url,
+        redacted_rpc_url, response_rpc_url, rpc_domain,
     };
 
     static TEST_CHAIN_IDS: AtomicU64 = AtomicU64::new(9_000_000_000);
+
+    #[test]
+    fn parses_operator_neutral_payment_metadata() {
+        let metadata: ChainMetadata = serde_json::from_value(json!({
+            "rpc": ["https://rpc.example.com"],
+            "nativeCurrency": { "symbol": "ETH", "decimals": 18 },
+            "wrappedNativeToken": "0x1111111111111111111111111111111111111111",
+            "stables": [{
+                "symbol": "USDC",
+                "contract": "0x2222222222222222222222222222222222222222",
+                "decimals": 6
+            }],
+            "dex": {
+                "contracts": {
+                    "quoterV2": "0x3333333333333333333333333333333333333333"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.native_currency.unwrap().decimals, 18);
+        assert_eq!(metadata.stables[0].decimals, Some(6));
+        assert_eq!(
+            metadata.wrapped_native_token.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            metadata
+                .dex
+                .and_then(|dex| dex.contracts)
+                .and_then(|contracts| contracts.quoter_v2)
+                .as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
+    }
 
     #[test]
     fn keeps_only_safe_https_fallback_urls() {

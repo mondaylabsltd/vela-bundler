@@ -14,13 +14,15 @@ use tower_http::{
 
 mod handlers;
 mod queue;
-mod rpc;
+pub(crate) mod rpc;
 pub mod state;
 mod user_operation_store;
 
+pub(crate) use queue::USER_OPERATION_QUEUE_RETENTION;
 pub use queue::UserOperationQueue;
 pub use state::{AppState, Readiness};
 pub use user_operation_store::{
+    ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent, PreparedFundingIntent,
     QueuedUserOperation, StoredUserOperation, UserOperationEvent, UserOperationStatusStore,
 };
 

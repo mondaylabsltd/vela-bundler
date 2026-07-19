@@ -1,7 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use serde_json::{Value, json};
-use sha3::{Digest, Keccak256};
 
 use crate::{
     app::rpc::types::{
@@ -9,13 +6,8 @@ use crate::{
         RpcError, RpcResponse, UserOperation, UserOperationByHash, UserOperationStatus,
         UserOperationStatusKind,
     },
-    app::{AppState, StoredUserOperation, UserOperationEvent},
-    utils::rpc,
+    app::{AppState, StoredUserOperation},
 };
-
-const USER_OPERATION_EVENT_SIGNATURE: &str =
-    "UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)";
-const SUBMITTED_RECEIPT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn get_status(
     id: Value,
@@ -23,7 +15,7 @@ pub async fn get_status(
     params: GetUserOperationStatusParams,
 ) -> RpcResponse<Value> {
     let GetUserOperationStatusParams([user_operation_hash]) = params;
-    match load_and_refresh(state, &user_operation_hash).await {
+    match load_from_redis(state, &user_operation_hash).await {
         Ok(Some(operation)) => result(id, operation.rpc_status()),
         Ok(None) => result(
             id,
@@ -42,7 +34,7 @@ pub async fn get_by_hash(
     params: GetUserOperationByHashParams,
 ) -> RpcResponse<Value> {
     let GetUserOperationByHashParams([user_operation_hash]) = params;
-    match load_and_refresh(state, &user_operation_hash).await {
+    match load_from_redis(state, &user_operation_hash).await {
         Ok(Some(operation)) => result(
             id,
             UserOperationByHash {
@@ -64,7 +56,7 @@ pub async fn get_receipt(
     params: GetUserOperationReceiptParams,
 ) -> RpcResponse<Value> {
     let GetUserOperationReceiptParams([user_operation_hash]) = params;
-    match load_and_refresh(state, &user_operation_hash).await {
+    match load_from_redis(state, &user_operation_hash).await {
         Ok(Some(operation)) => RpcResponse::result(
             id,
             receipt_response(&user_operation_hash, &operation).unwrap_or(Value::Null),
@@ -74,96 +66,18 @@ pub async fn get_receipt(
     }
 }
 
-async fn load_and_refresh(
+/// Status RPC methods are intentionally a Redis-only read model. The trusted executor reconciler
+/// is the sole writer of chain-derived receipt state, avoiding caller/public RPC trust and query
+/// amplification when clients poll these endpoints.
+async fn load_from_redis(
     state: &AppState,
     user_operation_hash: &str,
 ) -> Result<Option<StoredUserOperation>, RpcError> {
     let store = state
         .user_operation_status_store()
         .ok_or_else(RpcError::user_operation_status_store_unavailable)?;
-    let Some(operation) = store.get(user_operation_hash).await.map_err(|error| {
-        tracing::warn!(%error, "could not read UserOperation status from Redis");
-        RpcError::user_operation_status_store_unavailable()
-    })?
-    else {
-        return Ok(None);
-    };
-
-    if operation.status != UserOperationStatusKind::Submitted {
-        return Ok(Some(operation));
-    }
-    let Some(transaction_hash) = operation.transaction_hash.as_deref() else {
-        return Ok(Some(operation));
-    };
-
-    let now_ms = unix_timestamp_ms();
-    let next_check_at_ms = now_ms.saturating_add(
-        SUBMITTED_RECEIPT_REFRESH_INTERVAL
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
-    );
-    let claimed = store
-        .claim_submitted_receipt_check(user_operation_hash, now_ms, next_check_at_ms)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "could not claim UserOperation receipt refresh in Redis");
-            RpcError::user_operation_status_store_unavailable()
-        })?;
-    if !claimed {
-        return store.get(user_operation_hash).await.map_err(|error| {
-            tracing::warn!(%error, "could not reload UserOperation status from Redis");
-            RpcError::user_operation_status_store_unavailable()
-        });
-    }
-
-    // Only submitted operations hit the chain RPC. Queued, rejected, included, and failed
-    // states are answered entirely from Redis, preventing status polling from amplifying RPC
-    // traffic for operations that are not yet on-chain candidates.
-    let receipt = match rpc::call(
-        operation.chain_id,
-        None,
-        "eth_getTransactionReceipt",
-        json!([transaction_hash]),
-    )
-    .await
-    {
-        Ok(result) => result.value,
-        Err(()) => {
-            tracing::warn!(
-                chain_id = operation.chain_id,
-                transaction_hash,
-                "could not refresh submitted UserOperation transaction receipt"
-            );
-            return Ok(Some(operation));
-        }
-    };
-    if receipt.is_null() {
-        return Ok(Some(operation));
-    }
-
-    let update = if receipt_status_is_failed(&receipt) {
-        store
-            .mark_bundle_failed(operation.chain_id, transaction_hash, receipt)
-            .await
-    } else {
-        let events = user_operation_events(&receipt);
-        store
-            .mark_bundle_confirmed(operation.chain_id, transaction_hash, receipt, &events)
-            .await
-    };
-    update.map_err(|error| {
-        tracing::warn!(
-            chain_id = operation.chain_id,
-            transaction_hash,
-            %error,
-            "could not persist confirmed UserOperation statuses in Redis"
-        );
-        RpcError::user_operation_status_store_unavailable()
-    })?;
-
     store.get(user_operation_hash).await.map_err(|error| {
-        tracing::warn!(%error, "could not reload UserOperation status from Redis");
+        tracing::warn!(%error, "could not read UserOperation status from Redis");
         RpcError::user_operation_status_store_unavailable()
     })
 }
@@ -176,11 +90,13 @@ fn result<T: serde::Serialize>(id: Value, value: T) -> RpcResponse<Value> {
 }
 
 fn receipt_response(user_operation_hash: &str, operation: &StoredUserOperation) -> Option<Value> {
-    if operation.status != UserOperationStatusKind::Included {
-        return None;
-    }
     let event = operation.event.as_ref()?;
     let receipt = operation.receipt.as_ref()?;
+    match operation.status {
+        UserOperationStatusKind::Included => {}
+        UserOperationStatusKind::Rejected if !event.success => {}
+        _ => return None,
+    }
     let (sender, nonce, paymaster) = match &operation.user_operation {
         UserOperation::V0_7(user_operation) => (
             user_operation.sender.clone(),
@@ -193,6 +109,14 @@ fn receipt_response(user_operation_hash: &str, operation: &StoredUserOperation) 
             paymaster_from_v06(&user_operation.paymaster_and_data),
         ),
     };
+    // ERC-7769 exposes the logs associated with the UserOperation. The persisted outer receipt is
+    // the authoritative chain snapshot; returning its logs matches the existing vela-bundler
+    // formatter and is strictly more useful than silently returning an empty list.
+    let logs = receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     Some(json!({
         "userOpHash": user_operation_hash,
@@ -204,7 +128,7 @@ fn receipt_response(user_operation_hash: &str, operation: &StoredUserOperation) 
         "actualGasUsed": event.actual_gas_used,
         "success": event.success,
         "reason": "0x",
-        "logs": [],
+        "logs": logs,
         "receipt": receipt,
     }))
 }
@@ -214,99 +138,102 @@ fn paymaster_from_v06(paymaster_and_data: &str) -> Option<String> {
     (value.len() >= 40).then(|| format!("0x{}", &value[..40]))
 }
 
-fn receipt_status_is_failed(receipt: &Value) -> bool {
-    matches!(
-        receipt.get("status").and_then(Value::as_str),
-        Some("0x0") | Some("0x00")
-    )
-}
-
-fn user_operation_events(receipt: &Value) -> Vec<UserOperationEvent> {
-    let signature = format!(
-        "0x{}",
-        hex::encode(Keccak256::digest(USER_OPERATION_EVENT_SIGNATURE))
-    );
-    receipt
-        .get("logs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|log| parse_user_operation_event(log, &signature))
-        .collect()
-}
-
-fn parse_user_operation_event(log: &Value, signature: &str) -> Option<UserOperationEvent> {
-    let topics = log.get("topics")?.as_array()?;
-    let event_signature = topics.first()?.as_str()?;
-    if !event_signature.eq_ignore_ascii_case(signature) {
-        return None;
-    }
-    let user_operation_hash = topics.get(1)?.as_str()?.to_ascii_lowercase();
-    let data = hex::decode(log.get("data")?.as_str()?.strip_prefix("0x")?).ok()?;
-    if data.len() < 32 * 4 {
-        return None;
-    }
-    let success = data[63] == 1;
-    Some(UserOperationEvent {
-        user_operation_hash,
-        success,
-        actual_gas_cost: quantity_word(&data[64..96]),
-        actual_gas_used: quantity_word(&data[96..128]),
-    })
-}
-
-fn quantity_word(value: &[u8]) -> String {
-    let encoded = hex::encode(value);
-    let trimmed = encoded.trim_start_matches('0');
-    if trimmed.is_empty() {
-        "0x0".into()
-    } else {
-        format!("0x{trimmed}")
-    }
-}
-
-fn unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{
-        USER_OPERATION_EVENT_SIGNATURE, parse_user_operation_event, user_operation_events,
-    };
-    use sha3::{Digest, Keccak256};
+    use super::receipt_response;
+    use crate::app::rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7};
+    use crate::app::{StoredUserOperation, UserOperationEvent};
+
+    fn stored_operation(
+        status: UserOperationStatusKind,
+        event_success: Option<bool>,
+        has_receipt: bool,
+    ) -> StoredUserOperation {
+        StoredUserOperation {
+            status,
+            transaction_hash: has_receipt.then(|| "0xtransaction".into()),
+            chain_id: 1,
+            chain_id_text: "1".into(),
+            entry_point: "0x2222222222222222222222222222222222222222".into(),
+            user_operation: UserOperation::V0_7(Box::new(UserOperationV0_7 {
+                sender: "0x1111111111111111111111111111111111111111".into(),
+                nonce: "0x1".into(),
+                factory: None,
+                factory_data: None,
+                call_data: "0x".into(),
+                call_gas_limit: "0x1".into(),
+                verification_gas_limit: "0x1".into(),
+                pre_verification_gas: "0x1".into(),
+                max_fee_per_gas: "0x0".into(),
+                max_priority_fee_per_gas: "0x0".into(),
+                paymaster: None,
+                paymaster_verification_gas_limit: None,
+                paymaster_post_op_gas_limit: None,
+                paymaster_data: None,
+                signature: "0x01".into(),
+                eip7702_auth: None,
+            })),
+            admitted: true,
+            next_receipt_check_at_ms: 0,
+            block_hash: has_receipt.then(|| "0xblock".into()),
+            block_number: has_receipt.then(|| "0x10".into()),
+            receipt: has_receipt.then(|| {
+                json!({
+                    "transactionHash": "0xtransaction",
+                    "blockHash": "0xblock",
+                    "blockNumber": "0x10",
+                    "status": "0x1",
+                    "logs": [{
+                        "address": "0x3333333333333333333333333333333333333333",
+                        "topics": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                        "data": "0x01"
+                    }],
+                })
+            }),
+            event: event_success.map(|success| UserOperationEvent {
+                user_operation_hash: "0xuserop".into(),
+                success,
+                actual_gas_cost: "0x5".into(),
+                actual_gas_used: "0x6".into(),
+            }),
+        }
+    }
 
     #[test]
-    fn extracts_user_operation_event_outcomes_from_a_transaction_receipt() {
-        let signature = format!(
-            "0x{}",
-            hex::encode(Keccak256::digest(USER_OPERATION_EVENT_SIGNATURE))
-        );
-        let user_operation_hash = format!("0x{:064x}", 42);
-        let mut data = vec![0_u8; 128];
-        data[63] = 1;
-        data[95] = 5;
-        data[127] = 6;
-        let receipt = json!({
-            "logs": [{
-                "topics": [signature.clone(), user_operation_hash.clone()],
-                "data": format!("0x{}", hex::encode(data)),
-            }]
-        });
+    fn returns_an_included_user_operation_receipt_from_redis_state() {
+        let operation = stored_operation(UserOperationStatusKind::Included, Some(true), true);
 
-        let events = user_operation_events(&receipt);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].user_operation_hash, user_operation_hash);
-        assert!(events[0].success);
-        assert_eq!(events[0].actual_gas_cost, "0x5");
-        assert_eq!(events[0].actual_gas_used, "0x6");
-        assert!(parse_user_operation_event(&json!({}), &signature).is_none());
+        let receipt = receipt_response("0xuserop", &operation).expect("included receipt");
+
+        assert_eq!(receipt["userOpHash"], "0xuserop");
+        assert_eq!(receipt["success"], true);
+        assert_eq!(receipt["actualGasCost"], "0x5");
+        assert_eq!(receipt["logs"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["receipt"]["transactionHash"], "0xtransaction");
+    }
+
+    #[test]
+    fn returns_an_on_chain_rejected_user_operation_receipt() {
+        let operation = stored_operation(UserOperationStatusKind::Rejected, Some(false), true);
+
+        let receipt = receipt_response("0xuserop", &operation).expect("on-chain rejection receipt");
+
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["actualGasUsed"], "0x6");
+        assert_eq!(receipt["receipt"]["status"], "0x1");
+    }
+
+    #[test]
+    fn pre_submit_or_eventless_rejections_do_not_have_a_user_operation_receipt() {
+        let pre_submit = stored_operation(UserOperationStatusKind::Rejected, None, false);
+        let no_event = stored_operation(UserOperationStatusKind::Rejected, None, true);
+        let inconsistent_event =
+            stored_operation(UserOperationStatusKind::Rejected, Some(true), true);
+
+        assert!(receipt_response("0xuserop", &pre_submit).is_none());
+        assert!(receipt_response("0xuserop", &no_event).is_none());
+        assert!(receipt_response("0xuserop", &inconsistent_event).is_none());
     }
 }

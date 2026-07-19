@@ -7,8 +7,8 @@ use crate::{
         handlers::{in_band_settlement, supported_entry_points},
         types::{RpcError, RpcResponse, SendUserOperationParams, UserOperation, UserOperationV0_7},
     },
-    app::{AppState, QueuedUserOperation},
-    utils::rpc,
+    app::{AppState, QueuedUserOperation, StoredUserOperation},
+    utils::{config::ExecutorChainAssets, rpc},
 };
 
 const ZERO_GAS_FEE: u128 = 0;
@@ -83,18 +83,39 @@ async fn accept(
                 );
                 RpcError::user_operation_status_store_unavailable()
             })?;
-        if existing.is_some_and(|operation| operation.admitted) {
-            tracing::info!(
-                chain_id,
-                user_operation_hash = %user_operation_hash,
-                "UserOperation already exists in the durable queue"
-            );
-            return Ok(user_operation_hash);
+        let Some(existing) = existing else {
+            // The one-hour admission record expired between SET NX and GET. A later request can
+            // create it again, but this request no longer owns a record it can safely finalize.
+            return Err(RpcError::user_operation_status_store_unavailable());
+        };
+        match existing_admission_action(&existing, chain_id, &entry_point, &prepared.operation) {
+            ExistingAdmissionAction::Conflict => {
+                tracing::error!(
+                    chain_id,
+                    user_operation_hash = %user_operation_hash,
+                    "existing Redis admission does not match the submitted UserOperation"
+                );
+                return Err(RpcError::user_operation_status_store_unavailable());
+            }
+            ExistingAdmissionAction::AlreadyAdmitted => {
+                tracing::info!(
+                    chain_id,
+                    user_operation_hash = %user_operation_hash,
+                    "UserOperation already exists in the durable queue"
+                );
+                return Ok(user_operation_hash);
+            }
+            ExistingAdmissionAction::RetryAppend => {}
         }
 
-        // A concurrent request owns the Redis-first admission record but has not yet completed
-        // the Iggy append. Do not report success until it has done so.
-        return Err(RpcError::user_operation_queue_unavailable());
+        // The first producer may have lost Iggy's acknowledgement or crashed before setting the
+        // admission marker. Re-appending is the only safe recovery: Iggy and the consumer provide
+        // at-least-once delivery, while the Redis hash makes execution idempotent.
+        tracing::info!(
+            chain_id,
+            user_operation_hash = %user_operation_hash,
+            "retrying an incomplete UserOperation queue admission"
+        );
     }
 
     let entry = json!({
@@ -110,19 +131,14 @@ async fn accept(
             chain_id,
             user_operation_hash = %user_operation_hash,
             %error,
-            "could not append UserOperation to Iggy"
+            "could not confirm UserOperation append to Iggy; preserving Redis admission for recovery"
         );
-        if let Err(rollback_error) = status_store
-            .delete_if_unadmitted(&user_operation_hash)
-            .await
-        {
-            tracing::error!(
-                chain_id,
-                user_operation_hash = %user_operation_hash,
-                %rollback_error,
-                "could not roll back unqueued UserOperation status from Redis"
-            );
-        }
+
+        // A timeout or transport error can happen after Iggy durably appended the message but
+        // before its acknowledgement reached us. Deleting the Redis half here would create an
+        // executable orphan. Keep the unadmitted record for one hour: a matching queue message
+        // proves delivery and marks it admitted, while an idempotent client retry may append it
+        // again. Duplicate messages are harmless because execution is keyed by userOpHash.
         return Err(RpcError::user_operation_queue_unavailable());
     }
 
@@ -152,6 +168,36 @@ async fn accept(
     );
 
     Ok(user_operation_hash)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingAdmissionAction {
+    AlreadyAdmitted,
+    RetryAppend,
+    Conflict,
+}
+
+fn existing_admission_action(
+    existing: &StoredUserOperation,
+    chain_id: u64,
+    entry_point: &str,
+    user_operation: &UserOperation,
+) -> ExistingAdmissionAction {
+    let operation_matches = match (
+        serde_json::to_value(&existing.user_operation),
+        serde_json::to_value(user_operation),
+    ) {
+        (Ok(existing), Ok(submitted)) => existing == submitted,
+        _ => false,
+    };
+    let matches = existing.chain_id == chain_id
+        && existing.entry_point.eq_ignore_ascii_case(entry_point)
+        && operation_matches;
+    match (matches, existing.admitted) {
+        (true, true) => ExistingAdmissionAction::AlreadyAdmitted,
+        (true, false) => ExistingAdmissionAction::RetryAppend,
+        (false, _) => ExistingAdmissionAction::Conflict,
+    }
 }
 
 async fn validate_in_band_submission(
@@ -184,6 +230,66 @@ async fn validate_in_band_submission(
     let recipient = state
         .settlement_recipient()
         .ok_or_else(RpcError::backend_unavailable)?;
+    let has_minimum_payment = if let Some(policy) = state.executor_chain_assets(chain_id) {
+        // The operator policy is the execution trust root. Keeping this path entirely local
+        // avoids one public metadata request plus one ERC-20 decimals RPC for every admission.
+        configured_policy_has_minimum_payment(call_data, recipient, policy)?
+    } else {
+        // Unconfigured chains retain dynamic discovery so arbitrary chain streams can still be
+        // admitted. The executor will not consume them until an operator policy is supplied.
+        fallback_has_minimum_payment(chain_id, user_rpc_url, call_data, recipient).await?
+    };
+
+    if has_minimum_payment {
+        return Ok(());
+    }
+
+    Err(RpcError::user_operation_rejected(
+        "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin",
+    ))
+}
+
+fn configured_policy_has_minimum_payment(
+    call_data: &str,
+    recipient: &str,
+    policy: &ExecutorChainAssets,
+) -> Result<bool, RpcError> {
+    let reimbursement = in_band_settlement::parse_reimbursement(
+        call_data,
+        recipient,
+        policy
+            .stablecoins
+            .iter()
+            .map(|stablecoin| stablecoin.address.clone()),
+    );
+    let native_minimum = in_band_settlement::minimum_native_amount(policy.native_decimals)
+        .ok_or_else(RpcError::estimation_unavailable)?;
+    if reimbursement.native >= native_minimum {
+        return Ok(true);
+    }
+
+    for stablecoin in &policy.stablecoins {
+        let amount = reimbursement
+            .stablecoins
+            .get(&stablecoin.address.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_default();
+        let minimum = in_band_settlement::minimum_stablecoin_amount(stablecoin.decimals)
+            .ok_or_else(RpcError::estimation_unavailable)?;
+        if amount >= minimum {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+async fn fallback_has_minimum_payment(
+    chain_id: u64,
+    user_rpc_url: Option<&HeaderValue>,
+    call_data: &str,
+    recipient: &str,
+) -> Result<bool, RpcError> {
     let assets = rpc::settlement_assets(chain_id)
         .await
         .map_err(|_| RpcError::estimation_unavailable())?;
@@ -193,7 +299,7 @@ async fn validate_in_band_submission(
     let native_minimum = in_band_settlement::minimum_native_amount(assets.native_decimals)
         .ok_or_else(RpcError::estimation_unavailable)?;
     if reimbursement.native >= native_minimum {
-        return Ok(());
+        return Ok(true);
     }
 
     for (token, amount) in reimbursement.stablecoins {
@@ -203,13 +309,11 @@ async fn validate_in_band_submission(
         let minimum = in_band_settlement::minimum_stablecoin_amount(decimals)
             .ok_or_else(RpcError::estimation_unavailable)?;
         if amount >= minimum {
-            return Ok(());
+            return Ok(true);
         }
     }
 
-    Err(RpcError::user_operation_rejected(
-        "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin",
-    ))
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -448,10 +552,28 @@ fn keccak256(value: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
     use serde_json::json;
 
-    use super::{PreparedUserOperation, quantity};
-    use crate::app::rpc::types::{UserOperation, UserOperationV0_7};
+    use super::{
+        ExistingAdmissionAction, PreparedUserOperation, existing_admission_action, quantity,
+        validate_in_band_submission,
+    };
+    use crate::{
+        app::{
+            AppState, StoredUserOperation,
+            rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7},
+        },
+        utils::config::{
+            ExecutorChainAssets, ExecutorCostModel, ExecutorOracle, ExecutorStablecoin,
+        },
+    };
+
+    const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+    const STABLECOIN: &str = "0x2222222222222222222222222222222222222222";
+    const ENTRY_POINT: &str = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+    const LOCAL_POLICY_CHAIN: u64 = 9_999_999_991;
 
     fn user_operation() -> UserOperation {
         UserOperation::V0_7(Box::new(UserOperationV0_7 {
@@ -509,5 +631,189 @@ mod tests {
     fn validates_gas_quantities_and_zero_fee_forms() {
         assert_eq!(quantity("0x000", "maxFeePerGas").unwrap(), 0);
         assert!(quantity("0x", "maxFeePerGas").is_err());
+    }
+
+    #[test]
+    fn retries_only_an_exact_unadmitted_redis_record() {
+        let operation = user_operation();
+        let mut stored = stored_admission(operation.clone(), false);
+
+        assert_eq!(
+            existing_admission_action(
+                &stored,
+                LOCAL_POLICY_CHAIN,
+                &ENTRY_POINT.to_ascii_lowercase(),
+                &operation,
+            ),
+            ExistingAdmissionAction::RetryAppend
+        );
+
+        stored.admitted = true;
+        assert_eq!(
+            existing_admission_action(&stored, LOCAL_POLICY_CHAIN, ENTRY_POINT, &operation),
+            ExistingAdmissionAction::AlreadyAdmitted
+        );
+
+        stored.admitted = false;
+        assert_eq!(
+            existing_admission_action(
+                &stored,
+                LOCAL_POLICY_CHAIN,
+                "0x1111111111111111111111111111111111111111",
+                &operation,
+            ),
+            ExistingAdmissionAction::Conflict
+        );
+
+        stored.chain_id += 1;
+        assert_eq!(
+            existing_admission_action(&stored, LOCAL_POLICY_CHAIN, ENTRY_POINT, &operation),
+            ExistingAdmissionAction::Conflict
+        );
+
+        stored.chain_id = LOCAL_POLICY_CHAIN;
+        let mut different_operation = match operation {
+            UserOperation::V0_7(operation) => operation,
+            UserOperation::V0_6(_) => unreachable!(),
+        };
+        different_operation.nonce = "0x1".into();
+        assert_eq!(
+            existing_admission_action(
+                &stored,
+                LOCAL_POLICY_CHAIN,
+                ENTRY_POINT,
+                &UserOperation::V0_7(different_operation),
+            ),
+            ExistingAdmissionAction::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_operator_policy_avoids_metadata_and_erc20_decimals_rpc() {
+        let mut operation = match user_operation() {
+            UserOperation::V0_7(operation) => operation,
+            UserOperation::V0_6(_) => unreachable!(),
+        };
+        operation.call_data = safe_stablecoin_payment(10_000);
+        let state = AppState::with_settlement_recipient(&[], Some(RECIPIENT.into()))
+            .with_executor_chain_assets(Arc::new(BTreeMap::from([(
+                LOCAL_POLICY_CHAIN,
+                chain_policy(),
+            )])));
+
+        // This synthetic chain has no public metadata endpoint. Success proves admission used
+        // the local six-decimal policy rather than attempting either metadata or token RPC.
+        assert!(
+            validate_in_band_submission(
+                LOCAL_POLICY_CHAIN,
+                None,
+                &state,
+                &UserOperation::V0_7(operation.clone()),
+            )
+            .await
+            .is_ok()
+        );
+
+        operation.call_data = safe_stablecoin_payment(9_999);
+        assert!(
+            validate_in_band_submission(
+                LOCAL_POLICY_CHAIN,
+                None,
+                &state,
+                &UserOperation::V0_7(operation),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    fn chain_policy() -> ExecutorChainAssets {
+        ExecutorChainAssets {
+            cost_model: ExecutorCostModel::Eip1559,
+            native_decimals: 18,
+            native_usd_oracle: Some(ExecutorOracle {
+                address: "0x3333333333333333333333333333333333333333".into(),
+                decimals: 8,
+                max_age_seconds: 3_600,
+            }),
+            stablecoins: vec![ExecutorStablecoin {
+                address: STABLECOIN.into(),
+                decimals: 6,
+                symbol: Some("USDC".into()),
+                usd_oracle: ExecutorOracle {
+                    address: "0x4444444444444444444444444444444444444444".into(),
+                    decimals: 8,
+                    max_age_seconds: 86_400,
+                },
+            }],
+        }
+    }
+
+    fn stored_admission(user_operation: UserOperation, admitted: bool) -> StoredUserOperation {
+        StoredUserOperation {
+            status: UserOperationStatusKind::Queued,
+            transaction_hash: None,
+            chain_id: LOCAL_POLICY_CHAIN,
+            chain_id_text: LOCAL_POLICY_CHAIN.to_string(),
+            entry_point: ENTRY_POINT.into(),
+            user_operation,
+            admitted,
+            next_receipt_check_at_ms: 0,
+            block_hash: None,
+            block_number: None,
+            receipt: None,
+            event: None,
+        }
+    }
+
+    fn safe_stablecoin_payment(amount: u128) -> String {
+        let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+        transfer.extend(word_address(RECIPIENT));
+        transfer.extend(word_u128(amount));
+
+        let mut transaction = vec![0];
+        transaction.extend(address_bytes(STABLECOIN));
+        transaction.extend(word_u128(0));
+        transaction.extend(word_u128(transfer.len() as u128));
+        transaction.extend(transfer);
+
+        let mut multisend = vec![0x8d, 0x80, 0xff, 0x0a];
+        multisend.extend(word_u128(32));
+        multisend.extend(word_u128(transaction.len() as u128));
+        multisend.extend(transaction);
+        pad_function_arguments(&mut multisend);
+
+        let mut call_data = vec![0x7b, 0xb3, 0x74, 0x28];
+        call_data.extend(word_address("0x38869bf66a61cf6bdb996a6ae40d5853fd43b526"));
+        call_data.extend(word_u128(0));
+        call_data.extend(word_u128(128));
+        call_data.extend(word_u128(1));
+        call_data.extend(word_u128(multisend.len() as u128));
+        call_data.extend(multisend);
+        pad_function_arguments(&mut call_data);
+        format!("0x{}", hex::encode(call_data))
+    }
+
+    fn address_bytes(value: &str) -> Vec<u8> {
+        hex::decode(value.strip_prefix("0x").unwrap()).unwrap()
+    }
+
+    fn word_address(value: &str) -> Vec<u8> {
+        let mut word = vec![0; 12];
+        word.extend(address_bytes(value));
+        word
+    }
+
+    fn word_u128(value: u128) -> Vec<u8> {
+        let mut word = vec![0; 16];
+        word.extend(value.to_be_bytes());
+        word
+    }
+
+    fn pad_function_arguments(call_data: &mut Vec<u8>) {
+        let remainder = (call_data.len() - 4) % 32;
+        if remainder != 0 {
+            call_data.resize(call_data.len() + 32 - remainder, 0);
+        }
     }
 }

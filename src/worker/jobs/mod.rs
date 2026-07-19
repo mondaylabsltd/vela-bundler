@@ -1,6 +1,7 @@
 mod cleanup;
 mod parallel;
 mod sync;
+mod user_operation_consumer;
 
 use std::{future::Future, time::Duration};
 
@@ -8,6 +9,8 @@ use tokio::{runtime::Runtime, sync::oneshot, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{app::Readiness, utils::AppError};
+
+use super::{USER_OPERATION_CONSUMER_JOB, UserOperationExecution};
 
 pub type JobResult = Result<(), AppError>;
 
@@ -24,10 +27,12 @@ pub fn start(
     shutdown: CancellationToken,
     parallel_job_concurrency: usize,
     readiness: Readiness,
+    execution: Option<UserOperationExecution>,
 ) -> Vec<JobStartup> {
     let cleanup_readiness = readiness.clone();
     let parallel_readiness = readiness.clone();
     let sync_readiness = readiness.clone();
+    let consumer_readiness = readiness.clone();
 
     vec![
         spawn_job(
@@ -54,9 +59,23 @@ pub fn start(
         spawn_job(
             runtime,
             "sync",
-            shutdown,
+            shutdown.clone(),
             readiness.clone(),
             move |shutdown, ready| sync::run(shutdown, ready, sync_readiness.clone()),
+        ),
+        spawn_job(
+            runtime,
+            USER_OPERATION_CONSUMER_JOB,
+            shutdown,
+            readiness.clone(),
+            move |shutdown, ready| {
+                user_operation_consumer::run(
+                    shutdown,
+                    ready,
+                    consumer_readiness.clone(),
+                    execution.clone(),
+                )
+            },
         ),
     ]
 }

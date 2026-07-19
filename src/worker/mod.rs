@@ -1,3 +1,5 @@
+pub mod consumer;
+mod executor;
 mod jobs;
 
 use std::{io, time::Duration};
@@ -10,14 +12,41 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::Readiness,
-    utils::{AppError, config::WorkerConfig},
+    app::{Readiness, UserOperationStatusStore},
+    utils::{
+        AppError,
+        config::{ExecutorConfig, IggyConfig, WorkerConfig},
+    },
 };
 
-pub const JOB_NAMES: &[&str] = &["cleanup", "parallel", "sync"];
+pub const USER_OPERATION_CONSUMER_JOB: &str = "user-operation-consumer";
+pub const JOB_NAMES: &[&str] = &["cleanup", "parallel", "sync", USER_OPERATION_CONSUMER_JOB];
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// Money-path handlers deliberately finish their current durable batch after cancellation. Allow
+// enough time for bounded executor RPC calls and the final Iggy offset write before aborting.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub(crate) struct UserOperationExecution {
+    iggy: IggyConfig,
+    executor: ExecutorConfig,
+    store: UserOperationStatusStore,
+}
+
+impl UserOperationExecution {
+    pub(crate) fn new(
+        iggy: IggyConfig,
+        executor: ExecutorConfig,
+        store: UserOperationStatusStore,
+    ) -> Self {
+        Self {
+            iggy,
+            executor,
+            store,
+        }
+    }
+}
 
 pub struct BackgroundWorker {
     runtime: Option<Runtime>,
@@ -27,7 +56,11 @@ pub struct BackgroundWorker {
 }
 
 impl BackgroundWorker {
-    pub async fn start(config: WorkerConfig, readiness: Readiness) -> Result<Self, AppError> {
+    pub(crate) async fn start_with_executor(
+        config: WorkerConfig,
+        readiness: Readiness,
+        execution: Option<UserOperationExecution>,
+    ) -> Result<Self, AppError> {
         let runtime = Builder::new_multi_thread()
             .thread_name("vela-worker")
             .worker_threads(config.runtime_threads)
@@ -47,6 +80,7 @@ impl BackgroundWorker {
             shutdown,
             config.parallel_job_concurrency,
             readiness,
+            execution,
         ) {
             worker.tasks.push(job.task);
 
@@ -120,13 +154,14 @@ mod tests {
     #[tokio::test]
     async fn starts_after_jobs_report_ready() {
         let state = AppState::with_settlement_recipient(JOB_NAMES, None);
-        let worker = BackgroundWorker::start(
+        let worker = BackgroundWorker::start_with_executor(
             WorkerConfig {
                 runtime_threads: 1,
                 max_blocking_threads: 10,
                 parallel_job_concurrency: 10,
             },
             state.readiness(),
+            None,
         )
         .await
         .expect("start background worker");
