@@ -9,6 +9,9 @@ use std::{
     time::Duration,
 };
 
+/// Default in-band reimbursement multiplier: 1.5x the simulated outer transaction cost.
+pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 15_000;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: SocketAddr,
@@ -268,7 +271,10 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             crate::utils::vault::RELAYER_ROUTING_WIDTH
         )));
     }
-    let settlement_markup_bps = u64_value("VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS", 20_000)?;
+    let settlement_markup_bps = u64_value(
+        "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS",
+        DEFAULT_SETTLEMENT_MARKUP_BPS,
+    )?;
     if settlement_markup_bps < 10_000 {
         return Err(ConfigError(
             "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS cannot be below 10000".into(),

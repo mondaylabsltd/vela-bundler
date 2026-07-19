@@ -18,7 +18,7 @@ pub(crate) const USD_PRICE_DECIMALS: u32 = 8;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChainAssetConfig {
     pub(crate) native_decimals: u32,
-    /// Required reimbursement ratio in basis points; 20_000 means 2x cost.
+    /// Required reimbursement ratio in basis points; 15_000 means 1.5x cost.
     pub(crate) settlement_markup_bps: u64,
     pub(crate) stablecoins: BTreeMap<Address, StablecoinConfig>,
 }
@@ -809,7 +809,7 @@ mod tests {
     fn native_config(native_decimals: u32) -> ChainAssetConfig {
         ChainAssetConfig {
             native_decimals,
-            settlement_markup_bps: 20_000,
+            settlement_markup_bps: 15_000,
             stablecoins: BTreeMap::new(),
         }
     }
@@ -817,7 +817,7 @@ mod tests {
     fn config_with_stable(native_decimals: u32, stable_decimals: u32) -> ChainAssetConfig {
         ChainAssetConfig {
             native_decimals,
-            settlement_markup_bps: 20_000,
+            settlement_markup_bps: 15_000,
             stablecoins: BTreeMap::from([(
                 STABLECOIN,
                 StablecoinConfig {

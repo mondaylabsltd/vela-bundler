@@ -393,7 +393,7 @@ simulated again. Reimbursement is parsed only from the canonical Safe
 `executeUserOp -> MultiSend(delegatecall) -> CALL` path. Stablecoin payment additionally requires
 the final bundle simulation to contain matching allowlisted `Transfer(sender, treasury, amount)`
 logs. Costs use the final bundle gas, EIP-1559 fee ceiling, deterministic per-op allocation, safety
-buffers, a default 2x settlement gate, and per-asset minimums. One payer cannot subsidize another.
+buffers, a default 1.5x settlement gate, and per-asset minimums. One payer cannot subsidize another.
 
 Treasury top-ups are serialized once per chain. Redis atomically reserves the daily cap and stores
 the signed funding transaction, removing the reserve/outbox crash window. A funding receipt is
