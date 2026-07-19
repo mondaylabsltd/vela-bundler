@@ -61,7 +61,8 @@ const DELAYED_CLAIM_BATCH_SIZE: usize = 100;
 const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
 const USD_PRICE_SCALE: u64 = 100_000_000;
-const NATIVE_TOP_UP_USD_CAP: u64 = 2;
+const NATIVE_TOP_UP_USD_CAP: u64 = 20;
+const TEMPO_TOP_UP_GAS_BUFFER_BPS: u64 = 12_000;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1768,7 +1769,7 @@ impl ExecutorEngine {
         Ok(price)
     }
 
-    /// Cap one native-token relayer top-up at 2 USD when Binance has a fresh quote. A network
+    /// Cap one native-token relayer top-up at 20 USD when Binance has a fresh quote. A network
     /// with no usable market price intentionally keeps the operator's static wei-denominated
     /// safety cap instead of blocking execution on the price service.
     async fn native_top_up_cap(
@@ -2013,6 +2014,9 @@ impl ExecutorEngine {
                     self.remember_confirmed_broadcast(&intent.transaction_hash)
                         .await;
                     Ok(BundleBroadcastDisposition::Confirmed)
+                } else if nonce_too_low(&reason) && self.bundle_nonce_is_stale(intent).await {
+                    self.clear_stale_bundle_intent(intent, &reason).await?;
+                    Ok(BundleBroadcastDisposition::Unknown)
                 } else {
                     tracing::warn!(
                         chain_id = intent.chain_id,
@@ -2036,6 +2040,10 @@ impl ExecutorEngine {
                     self.remember_confirmed_broadcast(&intent.transaction_hash)
                         .await;
                     return Ok(BundleBroadcastDisposition::Confirmed);
+                }
+                if nonce_too_low(&reason) && self.bundle_nonce_is_stale(intent).await {
+                    self.clear_stale_bundle_intent(intent, &reason).await?;
+                    return Ok(BundleBroadcastDisposition::Unknown);
                 }
                 tracing::warn!(
                     chain_id = intent.chain_id,
@@ -2070,6 +2078,63 @@ impl ExecutorEngine {
                 false
             }
         }
+    }
+
+    /// A nonce error alone is not sufficient to discard an exact outbox: it could merely be a
+    /// pending transaction observed by a different node. Only a higher *latest* nonce proves the
+    /// signed bytes can never be included, so clearing then lets queued UserOperations rebuild
+    /// against the next nonce without risking a duplicate handleOps submission.
+    async fn bundle_nonce_is_stale(&self, intent: &PreparedBundleIntent) -> bool {
+        let Some(relayer) = self.relayer_addresses.get(intent.lane as usize) else {
+            return false;
+        };
+        match self
+            .rpc
+            .call(
+                intent.chain_id,
+                "eth_getTransactionCount",
+                json!([relayer.to_string(), "latest"]),
+            )
+            .await
+            .ok()
+            .and_then(|value| value.as_str().and_then(parse_quantity))
+            .and_then(|nonce| u64::try_from(nonce).ok())
+        {
+            Some(latest_nonce) => latest_nonce > intent.nonce,
+            None => false,
+        }
+    }
+
+    async fn clear_stale_bundle_intent(
+        &self,
+        intent: &PreparedBundleIntent,
+        reason: &str,
+    ) -> Result<(), ExecutorItemError> {
+        let cleared = self
+            .store
+            .clear_prepared_bundle_intent(intent.chain_id, intent.lane, &intent.transaction_hash)
+            .await
+            .map_err(store_item_error)?;
+        // The consumer and the recovery loop can observe the same intent concurrently. Only the
+        // caller that atomically removed it should emit the recovery log and clear its local
+        // broadcast cache.
+        if !cleared {
+            return Ok(());
+        }
+        self.broadcast_seen
+            .lock()
+            .await
+            .remove(&intent.transaction_hash);
+        tracing::warn!(
+            chain_id = intent.chain_id,
+            lane = intent.lane,
+            relayer = %self.relayer_addresses[intent.lane as usize],
+            stale_nonce = intent.nonce,
+            transaction_hash = %intent.transaction_hash,
+            reason,
+            "discarded a prepared handleOps transaction whose nonce is already mined; queued operations will be rebuilt"
+        );
+        Ok(())
     }
 
     async fn recently_confirmed_broadcast(&self, transaction_hash: &str) -> bool {
@@ -2347,6 +2412,7 @@ impl ExecutorEngine {
         }
         let amount_u128 = u128::try_from(amount)
             .map_err(|_| ExecutorItemError("Tempo relayer top-up exceeds uint128".into()))?;
+        let transfer_calldata = tempo::path_usd_transfer_calldata(relayer, amount);
 
         let calls = [
             RpcBatchCall {
@@ -2360,6 +2426,15 @@ impl ExecutorEngine {
                     "data": format!("0x{}", hex::encode(tempo::path_usd_balance_calldata(self.treasury_address))),
                 }, "latest"]),
             },
+            RpcBatchCall {
+                method: "eth_estimateGas",
+                params: json!([{
+                    "from": self.treasury_address.to_string(),
+                    "to": tempo::PATH_USD.to_string(),
+                    "data": format!("0x{}", hex::encode(&transfer_calldata)),
+                    "feeToken": tempo::PATH_USD.to_string(),
+                }, "latest"]),
+            },
         ];
         let responses = self
             .rpc
@@ -2369,10 +2444,17 @@ impl ExecutorEngine {
         let nonce = u64::try_from(response_quantity(&responses, 0, "Tempo treasury nonce")?)
             .map_err(|_| ExecutorItemError("Tempo treasury nonce exceeds uint64".into()))?;
         let treasury_balance = response_abi_u256(&responses, 1, "Tempo treasury pathUSD balance")?;
-        let top_up_gas_cost = tempo_cost_in_path_usd(
-            U256::from(tempo::TEMPO_COST_BUFFER_GAS),
-            U256::from(max_fee_per_gas),
-        )?;
+        let top_up_gas_limit = u64::try_from(response_quantity(
+            &responses,
+            2,
+            "Tempo pathUSD top-up eth_estimateGas",
+        )?)
+        .map_err(|_| ExecutorItemError("Tempo pathUSD top-up gas estimate exceeds uint64".into()))?
+        .checked_mul(TEMPO_TOP_UP_GAS_BUFFER_BPS)
+        .map(|value| value / 10_000)
+        .ok_or_else(|| ExecutorItemError("Tempo pathUSD top-up gas buffer overflow".into()))?;
+        let top_up_gas_cost =
+            tempo_cost_in_path_usd(U256::from(top_up_gas_limit), U256::from(max_fee_per_gas))?;
         let required_treasury = amount
             .checked_add(top_up_gas_cost)
             .and_then(|value| value.checked_add(U256::from(tempo::TEMPO_TREASURY_FLOOR)))
@@ -2380,6 +2462,16 @@ impl ExecutorEngine {
                 ExecutorItemError("Tempo treasury balance requirement overflow".into())
             })?;
         if treasury_balance < required_treasury {
+            tracing::warn!(
+                chain_id,
+                treasury_path_usd_balance = %treasury_balance,
+                required_path_usd = %required_treasury,
+                top_up_path_usd = %amount,
+                top_up_gas_limit,
+                top_up_gas_path_usd = %top_up_gas_cost,
+                reserve_path_usd = tempo::TEMPO_TREASURY_FLOOR,
+                "Tempo treasury cannot fund the pending relayer top-up"
+            );
             return Err(ExecutorItemError(
                 "Tempo treasury pathUSD is below top-up amount, gas, and reserve floor".into(),
             ));
@@ -2391,12 +2483,12 @@ impl ExecutorEngine {
             TempoTransactionPlan {
                 chain_id,
                 nonce,
-                gas_limit: tempo::TEMPO_COST_BUFFER_GAS,
+                gas_limit: top_up_gas_limit,
                 max_fee_per_gas,
                 max_priority_fee_per_gas: 0,
                 fee_token: tempo::PATH_USD,
                 to: tempo::PATH_USD,
-                input: tempo::path_usd_transfer_calldata(relayer, amount),
+                input: transfer_calldata,
             },
         )
         .map_err(|error| ExecutorItemError(error.to_string()))?;
@@ -2559,6 +2651,15 @@ impl ExecutorEngine {
             .and_then(|value| value.checked_add(U256::from(self.config.treasury_floor_wei)))
             .ok_or_else(|| ExecutorItemError("treasury balance requirement overflow".into()))?;
         if treasury_balance < required_treasury {
+            tracing::warn!(
+                chain_id,
+                treasury_native_balance = %treasury_balance,
+                required_native_balance = %required_treasury,
+                top_up_native_amount = %amount,
+                top_up_gas_cost = %top_up_gas_cost,
+                reserve_native_amount = self.config.treasury_floor_wei,
+                "treasury cannot fund the pending relayer top-up"
+            );
             return Err(ExecutorItemError(
                 "treasury balance is below top-up amount, gas, and reserve floor".into(),
             ));
@@ -3062,6 +3163,10 @@ fn parse_quantity(value: &str) -> Option<U256> {
     U256::from_str_radix(digits, 16).ok()
 }
 
+fn nonce_too_low(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("nonce too low")
+}
+
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
 /// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
 fn parse_market_usd_price(value: &str) -> Option<U256> {
@@ -3182,8 +3287,9 @@ mod tests {
 
     use super::{
         AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
-        marked_tempo_cost, native_amount_for_usd_cap, parse_hex_bytes, parse_market_usd_price,
-        parse_quantity, response_quantity, tempo_cost_in_path_usd, validate_raw_transaction,
+        marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
+        parse_market_usd_price, parse_quantity, response_quantity, tempo_cost_in_path_usd,
+        validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3213,21 +3319,21 @@ mod tests {
     }
 
     #[test]
-    fn converts_two_usd_top_up_cap_to_native_units_with_ceiling_rounding() {
-        // MATIC at $0.20: $2 is exactly 10 MATIC.
+    fn converts_twenty_usd_top_up_cap_to_native_units_with_ceiling_rounding() {
+        // MATIC at $0.20: $20 is exactly 100 MATIC.
         assert_eq!(
             native_amount_for_usd_cap(18, U256::from(20_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(10_000_000_000_000_000_000u128))
+            Some(U256::from(100_000_000_000_000_000_000u128))
         );
-        // ETH at $2,500: $2 is 0.0008 ETH.
+        // ETH at $2,500: $20 is 0.008 ETH.
         assert_eq!(
             native_amount_for_usd_cap(18, U256::from(250_000_000_000u64), NATIVE_TOP_UP_USD_CAP,),
-            Some(U256::from(800_000_000_000_000u64))
+            Some(U256::from(8_000_000_000_000_000u64))
         );
         // A non-integral conversion is rounded toward the relayer.
         assert_eq!(
             native_amount_for_usd_cap(18, U256::from(300_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(666_666_666_666_666_667u64))
+            Some(U256::from(6_666_666_666_666_666_667u128))
         );
         assert_eq!(
             native_amount_for_usd_cap(18, U256::ZERO, NATIVE_TOP_UP_USD_CAP),
@@ -3237,6 +3343,15 @@ mod tests {
             native_amount_for_usd_cap(39, U256::ONE, NATIVE_TOP_UP_USD_CAP),
             None
         );
+    }
+
+    #[test]
+    fn recognizes_a_nonce_too_low_broadcast_diagnostic() {
+        assert!(nonce_too_low(
+            "RPC code -32000: nonce too low: next nonce 1, tx nonce 0"
+        ));
+        assert!(nonce_too_low("NONCE TOO LOW"));
+        assert!(!nonce_too_low("replacement transaction underpriced"));
     }
 
     #[test]

@@ -99,7 +99,7 @@ async fn accept(
                     "existing Redis admission does not match the submitted UserOperation"
                 );
                 return Err(RpcError::invalid_params(
-                    "this UserOperation hash is already queued with a different signed payload; resubmit the exact original operation or wait for the existing record to reach a durable outcome",
+                    "this UserOperation hash is already queued with a different operation payload; resubmit the original operation fields or wait for the existing record to reach a durable outcome",
                 ));
             }
             ExistingAdmissionAction::AlreadyAdmitted => {
@@ -191,8 +191,11 @@ fn existing_admission_action(
     // The EntryPoint hash is calculated from binary fields, whereas JSON-RPC permits harmless
     // spelling changes such as `0x01` versus `0x1`. Compare the parsed field representation so
     // an idempotent retry is not rejected merely because a wallet normalized hex differently.
-    // Signature is included even though ERC-4337 excludes it from userOpHash: it changes account
-    // validation and therefore must not silently replace an operation already in the queue.
+    //
+    // ERC-4337 deliberately excludes `signature` from userOpHash. Wallets can therefore produce
+    // a fresh signature for the same operation (for example after reconnecting a session) while
+    // polling or retrying `eth_sendUserOperation`. Treat that retry as idempotent: the already
+    // admitted record remains the canonical queue payload, and no second message is appended.
     let operation_matches = admission_fingerprint(&existing.user_operation)
         .zip(admission_fingerprint(user_operation))
         .is_some_and(|(existing, submitted)| existing == submitted);
@@ -216,7 +219,6 @@ struct AdmissionFingerprint {
     pre_verification_gas: [u8; 32],
     gas_fees: [u8; 32],
     paymaster_and_data: Vec<u8>,
-    signature: Vec<u8>,
     fee_token: Option<[u8; 20]>,
 }
 
@@ -225,7 +227,6 @@ fn admission_fingerprint(operation: &UserOperation) -> Option<AdmissionFingerpri
         return None;
     };
     let prepared = PreparedUserOperation::try_from(UserOperation::V0_7(operation.clone())).ok()?;
-    let signature = bytes(&operation.signature, "signature").ok()?;
     let fee_token = operation
         .fee_token
         .as_deref()
@@ -241,7 +242,6 @@ fn admission_fingerprint(operation: &UserOperation) -> Option<AdmissionFingerpri
         pre_verification_gas: prepared.pre_verification_gas,
         gas_fees: prepared.gas_fees,
         paymaster_and_data: prepared.paymaster_and_data,
-        signature,
         fee_token,
     })
 }
@@ -745,6 +745,27 @@ mod tests {
                 LOCAL_POLICY_CHAIN,
                 ENTRY_POINT,
                 &UserOperation::V0_7(normalized),
+            ),
+            ExistingAdmissionAction::AlreadyAdmitted
+        );
+    }
+
+    #[test]
+    fn retries_a_queued_user_operation_with_a_refreshed_signature() {
+        let operation = user_operation();
+        let stored = stored_admission(operation.clone(), true);
+        let mut refreshed = match operation {
+            UserOperation::V0_7(operation) => operation,
+            UserOperation::V0_6(_) => unreachable!(),
+        };
+        refreshed.signature = "0x12345678".into();
+
+        assert_eq!(
+            existing_admission_action(
+                &stored,
+                LOCAL_POLICY_CHAIN,
+                ENTRY_POINT,
+                &UserOperation::V0_7(refreshed),
             ),
             ExistingAdmissionAction::AlreadyAdmitted
         );
