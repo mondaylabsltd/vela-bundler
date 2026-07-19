@@ -1006,8 +1006,17 @@ impl ExecutorEngine {
                 &bundle_logs,
             );
             if !evaluation.accepted() || !stable_logs_valid {
+                let reason = settlement_rejection_reason(
+                    evaluation.paid_amount,
+                    evaluation.required_amount,
+                    stable_logs_valid,
+                );
                 self.store
-                    .mark_rejected(&candidate.hash_string)
+                    .mark_rejected_with_executor_reason(
+                        &candidate.hash_string,
+                        "in_band_settlement",
+                        &reason,
+                    )
                     .await
                     .map_err(store_item_error)?;
                 results[candidate.result_index] = Some(Ok(()));
@@ -1243,8 +1252,13 @@ impl ExecutorEngine {
             };
             let required = marked_tempo_cost(*cost, self.config.settlement_markup_bps)?;
             if paid < required || !stable_logs_valid {
+                let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
                 self.store
-                    .mark_rejected(&candidate.hash_string)
+                    .mark_rejected_with_executor_reason(
+                        &candidate.hash_string,
+                        "in_band_settlement",
+                        &reason,
+                    )
                     .await
                     .map_err(store_item_error)?;
                 results[candidate.result_index] = Some(Ok(()));
@@ -3205,6 +3219,20 @@ fn treasury_affordable_top_up(
     (amount >= deficit).then_some(amount)
 }
 
+fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid: bool) -> String {
+    if paid < required {
+        format!(
+            "in-band reimbursement is below the required amount: paid={paid}, required={required}, shortfall={}",
+            required.saturating_sub(paid)
+        )
+    } else if !stable_logs_valid {
+        "in-band reimbursement transfer logs do not prove payment to the settlement recipient"
+            .into()
+    } else {
+        "in-band reimbursement was rejected".into()
+    }
+}
+
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
 /// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
 fn parse_market_usd_price(value: &str) -> Option<U256> {
@@ -3326,8 +3354,8 @@ mod tests {
     use super::{
         AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
         marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
-        parse_market_usd_price, parse_quantity, response_quantity, tempo_cost_in_path_usd,
-        treasury_affordable_top_up, validate_raw_transaction,
+        parse_market_usd_price, parse_quantity, response_quantity, settlement_rejection_reason,
+        tempo_cost_in_path_usd, treasury_affordable_top_up, validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3426,6 +3454,18 @@ mod tests {
                 U256::ZERO,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn explains_an_insufficient_in_band_reimbursement() {
+        assert_eq!(
+            settlement_rejection_reason(
+                U256::from(105_959_625_000_000_000u64),
+                U256::from(111_625_968_750_000_000u64),
+                true,
+            ),
+            "in-band reimbursement is below the required amount: paid=105959625000000000, required=111625968750000000, shortfall=5666343750000000"
         );
     }
 

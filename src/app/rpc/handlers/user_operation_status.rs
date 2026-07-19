@@ -209,6 +209,30 @@ mod tests {
     }
 
     #[test]
+    fn exposes_the_reason_for_a_local_rejection() {
+        let mut operation = stored_operation(UserOperationStatusKind::Rejected, None, false);
+        operation.last_executor_stage = Some("in_band_settlement".into());
+        operation.last_executor_error = Some(
+            "in-band reimbursement is below the required amount: paid=1, required=2, shortfall=1"
+                .into(),
+        );
+        operation.last_executor_attempt_at_ms = Some(1_753_000_000_000);
+
+        let status = operation.rpc_status();
+        assert_eq!(
+            status.last_executor_stage.as_deref(),
+            Some("in_band_settlement")
+        );
+        assert_eq!(
+            status.last_executor_error.as_deref(),
+            Some(
+                "in-band reimbursement is below the required amount: paid=1, required=2, shortfall=1"
+            )
+        );
+        assert_eq!(status.last_executor_attempt_at_ms, Some(1_753_000_000_000));
+    }
+
+    #[test]
     fn returns_an_included_user_operation_receipt_from_redis_state() {
         let operation = stored_operation(UserOperationStatusKind::Included, Some(true), true);
 

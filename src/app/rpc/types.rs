@@ -552,13 +552,13 @@ pub struct UserOperationStatus {
     pub status: UserOperationStatusKind,
     #[serde(rename = "transactionHash")]
     pub transaction_hash: Option<TransactionHash>,
-    /// The executor stage that last left a queued operation awaiting a retry.
+    /// The executor stage that last deferred or locally rejected the operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_executor_stage: Option<String>,
-    /// A bounded, operator-safe reason for the last deferred executor attempt.
+    /// A bounded, operator-safe reason for the last deferred or rejected executor attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_executor_error: Option<String>,
-    /// Unix timestamp in milliseconds for the last deferred executor attempt.
+    /// Unix timestamp in milliseconds for the last deferred or rejected executor attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_executor_attempt_at_ms: Option<u64>,
 }

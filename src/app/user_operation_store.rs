@@ -313,8 +313,8 @@ pub struct StoredUserOperation {
     pub block_number: Option<String>,
     pub receipt: Option<Value>,
     pub event: Option<UserOperationEvent>,
-    /// The last non-durable executor outcome, retained while the operation is queued so callers
-    /// can distinguish a healthy queue from a retry that cannot currently make progress.
+    /// The last executor diagnostic. It explains either a pending retry or a terminal local
+    /// rejection (for example an insufficient in-band reimbursement).
     #[serde(default)]
     pub last_executor_stage: Option<String>,
     #[serde(default)]
@@ -325,20 +325,22 @@ pub struct StoredUserOperation {
 
 impl StoredUserOperation {
     pub fn rpc_status(&self) -> UserOperationStatus {
-        let is_pending = matches!(
+        let exposes_executor_diagnostic = matches!(
             self.status,
-            UserOperationStatusKind::Queued | UserOperationStatusKind::NotSubmitted
+            UserOperationStatusKind::Queued
+                | UserOperationStatusKind::NotSubmitted
+                | UserOperationStatusKind::Rejected
         );
         UserOperationStatus {
             status: self.status,
             transaction_hash: self.transaction_hash.clone(),
-            last_executor_stage: is_pending
+            last_executor_stage: exposes_executor_diagnostic
                 .then(|| self.last_executor_stage.clone())
                 .flatten(),
-            last_executor_error: is_pending
+            last_executor_error: exposes_executor_diagnostic
                 .then(|| self.last_executor_error.clone())
                 .flatten(),
-            last_executor_attempt_at_ms: is_pending
+            last_executor_attempt_at_ms: exposes_executor_diagnostic
                 .then_some(self.last_executor_attempt_at_ms)
                 .flatten(),
         }
@@ -1118,6 +1120,33 @@ impl UserOperationStatusStore {
         self.patch(
             user_operation_hash,
             json!({ "status": UserOperationStatusKind::Rejected, "admitted": true }),
+        )
+        .await
+    }
+
+    /// Records a terminal local rejection with a bounded, client-safe explanation. On-chain
+    /// rejections remain represented by their receipt event instead.
+    pub async fn mark_rejected_with_executor_reason(
+        &self,
+        user_operation_hash: &str,
+        stage: &str,
+        reason: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let attempted_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.patch(
+            user_operation_hash,
+            json!({
+                "status": UserOperationStatusKind::Rejected,
+                "admitted": true,
+                "lastExecutorStage": truncate_diagnostic(stage, 64),
+                "lastExecutorError": truncate_diagnostic(reason, 512),
+                "lastExecutorAttemptAtMs": attempted_at_ms,
+            }),
         )
         .await
     }
