@@ -2542,8 +2542,10 @@ impl ExecutorEngine {
         max_priority_fee_per_gas: u128,
         top_up_max: U256,
     ) -> Result<FundingReadiness, ExecutorItemError> {
-        let minimum = required_prefund.max(U256::from(self.config.relayer_float_min_wei));
-        if relayer_balance >= minimum {
+        // The current bundle takes precedence over filling the relayer float. A relayer that can
+        // already cover this handleOps must never be held back merely because it has not reached
+        // the preferred float target yet.
+        if relayer_balance >= required_prefund {
             return Ok(FundingReadiness::Ready);
         }
 
@@ -2609,17 +2611,20 @@ impl ExecutorEngine {
         let target = target_from_cost
             .max(U256::from(self.config.relayer_float_target_wei))
             .max(U256::from(self.config.relayer_float_min_wei));
-        let amount = target
+        let desired_amount = target
             .checked_sub(relayer_balance)
             .ok_or_else(|| ExecutorItemError("relayer funding amount underflow".into()))?;
-        let deficit = required_prefund.saturating_sub(relayer_balance);
-        if amount > top_up_max || deficit > top_up_max {
+        let deficit = required_prefund
+            .checked_sub(relayer_balance)
+            .ok_or_else(|| ExecutorItemError("relayer funding deficit underflow".into()))?;
+        if deficit > top_up_max {
             return Err(ExecutorItemError(format!(
-                "required relayer top-up exceeds the per-transfer cap: amount={amount}, deficit={deficit}, cap={top_up_max}"
+                "current UserOperation prefund exceeds the per-transfer cap: deficit={deficit}, cap={top_up_max}"
             )));
         }
-        let amount_u128 = u128::try_from(amount)
-            .map_err(|_| ExecutorItemError("top-up amount exceeds uint128".into()))?;
+        // A float target may be much larger than one bundle. Cap the discretionary part instead
+        // of deferring an otherwise fundable operation.
+        let capped_amount = desired_amount.min(top_up_max);
 
         let calls = [
             RpcBatchCall {
@@ -2646,24 +2651,45 @@ impl ExecutorEngine {
         let top_up_gas_cost = U256::from(TOP_UP_GAS_LIMIT)
             .checked_mul(U256::from(max_fee_per_gas))
             .ok_or_else(|| ExecutorItemError("top-up gas cost overflow".into()))?;
-        let required_treasury = amount
-            .checked_add(top_up_gas_cost)
-            .and_then(|value| value.checked_add(U256::from(self.config.treasury_floor_wei)))
-            .ok_or_else(|| ExecutorItemError("treasury balance requirement overflow".into()))?;
-        if treasury_balance < required_treasury {
+        let protected_treasury = top_up_gas_cost
+            .checked_add(U256::from(self.config.treasury_floor_wei))
+            .ok_or_else(|| ExecutorItemError("treasury reserve requirement overflow".into()))?;
+        // If the treasury can satisfy this bundle but not the preferred float, make a partial
+        // top-up. The next bundle will replenish the float when more treasury funds arrive.
+        let Some(amount) = treasury_affordable_top_up(
+            capped_amount,
+            deficit,
+            treasury_balance,
+            protected_treasury,
+        ) else {
+            let required_treasury = deficit
+                .checked_add(protected_treasury)
+                .ok_or_else(|| ExecutorItemError("treasury balance requirement overflow".into()))?;
             tracing::warn!(
                 chain_id,
                 treasury_native_balance = %treasury_balance,
                 required_native_balance = %required_treasury,
-                top_up_native_amount = %amount,
+                requested_top_up_native_amount = %capped_amount,
+                minimum_top_up_native_amount = %deficit,
                 top_up_gas_cost = %top_up_gas_cost,
                 reserve_native_amount = self.config.treasury_floor_wei,
-                "treasury cannot fund the pending relayer top-up"
+                "treasury cannot fund the current UserOperation relayer prefund"
             );
             return Err(ExecutorItemError(
-                "treasury balance is below top-up amount, gas, and reserve floor".into(),
+                "treasury balance cannot cover the current UserOperation prefund, top-up gas, and reserve floor".into(),
             ));
+        };
+        if amount < capped_amount {
+            tracing::info!(
+                chain_id,
+                requested_top_up_native_amount = %capped_amount,
+                submitted_top_up_native_amount = %amount,
+                minimum_top_up_native_amount = %deficit,
+                "treasury funding the current UserOperation with a partial relayer float top-up"
+            );
         }
+        let amount_u128 = u128::try_from(amount)
+            .map_err(|_| ExecutorItemError("top-up amount exceeds uint128".into()))?;
 
         self.ensure_lease(lease_scope, lease_token).await?;
         let signed = sign_eip1559(
@@ -3167,6 +3193,18 @@ fn nonce_too_low(reason: &str) -> bool {
     reason.to_ascii_lowercase().contains("nonce too low")
 }
 
+/// Returns a full or partial float top-up only when the treasury can still cover the immediate
+/// UserOperation prefund after reserving this transfer's gas and the configured floor.
+fn treasury_affordable_top_up(
+    capped_amount: U256,
+    deficit: U256,
+    treasury_balance: U256,
+    protected_treasury: U256,
+) -> Option<U256> {
+    let amount = capped_amount.min(treasury_balance.saturating_sub(protected_treasury));
+    (amount >= deficit).then_some(amount)
+}
+
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
 /// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
 fn parse_market_usd_price(value: &str) -> Option<U256> {
@@ -3289,7 +3327,7 @@ mod tests {
         AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
         marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
         parse_market_usd_price, parse_quantity, response_quantity, tempo_cost_in_path_usd,
-        validate_raw_transaction,
+        treasury_affordable_top_up, validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3352,6 +3390,43 @@ mod tests {
         ));
         assert!(nonce_too_low("NONCE TOO LOW"));
         assert!(!nonce_too_low("replacement transaction underpriced"));
+    }
+
+    #[test]
+    fn funds_the_current_bundle_when_the_preferred_float_is_not_affordable() {
+        let protected = U256::from(100_231_000_000_000u64);
+        // 0.011971738426977855 ETH in the treasury can still pay the requested 0.002 ETH
+        // float after retaining the 0.0001 ETH floor and the transfer gas.
+        assert_eq!(
+            treasury_affordable_top_up(
+                U256::from(2_000_000_000_000_000u64),
+                U256::from(1_000_000_000_000_000u64),
+                U256::from(11_971_738_426_977_855u64),
+                protected,
+            ),
+            Some(U256::from(2_000_000_000_000_000u64))
+        );
+
+        // A tight treasury is allowed to provide a reduced float as long as this operation's
+        // exact deficit remains covered.
+        assert_eq!(
+            treasury_affordable_top_up(
+                U256::from(2_000u64),
+                U256::from(1_000u64),
+                U256::from(1_500u64),
+                U256::ZERO,
+            ),
+            Some(U256::from(1_500u64))
+        );
+        assert_eq!(
+            treasury_affordable_top_up(
+                U256::from(2_000u64),
+                U256::from(1_000u64),
+                U256::from(999u64),
+                U256::ZERO,
+            ),
+            None
+        );
     }
 
     #[test]

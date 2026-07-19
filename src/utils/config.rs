@@ -12,6 +12,10 @@ use std::{
 /// Default in-band reimbursement multiplier: 1.5x the simulated outer transaction cost.
 pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 15_000;
 
+/// Amount retained for the next treasury transfer without preventing a lightly funded chain from
+/// serving the UserOperation that caused a relayer top-up.
+pub const DEFAULT_TREASURY_FLOOR_WEI: u128 = 100_000_000_000_000;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: SocketAddr,
@@ -338,7 +342,7 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         relayer_float_cost_multiplier: u64_value("VELA_RELAY_EXECUTOR_FLOAT_COST_MULTIPLIER", 5)?,
         treasury_floor_wei: u128_value(
             "VELA_RELAY_EXECUTOR_TREASURY_FLOOR_WEI",
-            10_000_000_000_000_000,
+            DEFAULT_TREASURY_FLOOR_WEI,
         )?,
         top_up_max_wei,
     })

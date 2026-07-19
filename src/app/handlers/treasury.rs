@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{app::AppState, utils::rpc};
 
-const NATIVE_TREASURY_FLOOR: &str = "0x2386f26fc10000";
+const NATIVE_TREASURY_FLOOR: &str = "0x5af3107a4000";
 
 #[derive(Serialize)]
 struct TreasuryAddress {
@@ -126,6 +126,7 @@ mod tests {
     use serde_json::json;
 
     use super::{NATIVE_TREASURY_FLOOR, parse_quantity, quantity_is_below};
+    use crate::utils::config::DEFAULT_TREASURY_FLOOR_WEI;
 
     #[test]
     fn validates_and_normalizes_rpc_quantities() {
@@ -136,12 +137,13 @@ mod tests {
 
     #[test]
     fn compares_arbitrary_size_hex_balances_against_the_floor() {
+        assert_eq!(
+            NATIVE_TREASURY_FLOOR,
+            format!("0x{DEFAULT_TREASURY_FLOOR_WEI:x}")
+        );
         assert!(quantity_is_below("0x0", NATIVE_TREASURY_FLOOR));
-        assert!(quantity_is_below("0x2386f26fc0ffff", NATIVE_TREASURY_FLOOR));
-        assert!(!quantity_is_below(
-            "0x2386f26fc10000",
-            NATIVE_TREASURY_FLOOR
-        ));
+        assert!(quantity_is_below("0x5af3107a3fff", NATIVE_TREASURY_FLOOR));
+        assert!(!quantity_is_below("0x5af3107a4000", NATIVE_TREASURY_FLOOR));
         assert!(!quantity_is_below(
             "0x10000000000000000",
             NATIVE_TREASURY_FLOOR
