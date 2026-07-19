@@ -21,10 +21,12 @@ fn main() -> Result<(), AppError> {
 }
 
 async fn run(config: Config) -> Result<(), AppError> {
+    let user_operation_queue = app::UserOperationQueue::connect(&config.iggy).await?;
     let state = app::AppState::with_settlement_recipient(
         worker::JOB_NAMES,
         config.settlement_recipient.clone(),
-    );
+    )
+    .with_user_operation_queue(user_operation_queue);
     let app = app::router(&config.http, state.clone());
     let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(listen_addr = %config.listen_addr, "HTTP server listening");

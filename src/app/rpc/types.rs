@@ -108,6 +108,14 @@ impl RpcError {
         Self::new(-32000, "in-band gas quote is temporarily unavailable", None)
     }
 
+    pub fn user_operation_queue_unavailable() -> Self {
+        Self::new(
+            -32000,
+            "UserOperation queue is temporarily unavailable",
+            None,
+        )
+    }
+
     pub fn user_operation_rejected(details: impl Into<String>) -> Self {
         Self::new(
             -32500,

@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
-use serde_json::Value;
-
 use crate::gas_price::GasPriceManager;
+
+use super::queue::UserOperationQueue;
 
 const MAX_PENDING_USER_OPERATIONS: usize = 10_000;
 
@@ -14,6 +14,7 @@ pub struct AppState {
     gas_price: GasPriceManager,
     readiness: Readiness,
     settlement_recipient: Option<String>,
+    user_operation_queue: Option<UserOperationQueue>,
     pending_user_operations: PendingUserOperations,
 }
 
@@ -23,14 +24,19 @@ pub struct Readiness {
     ready_jobs: Arc<Mutex<HashSet<&'static str>>>,
 }
 
-/// Process-local queue for UserOperations that passed the synchronous RPC admission checks.
+/// Process-local retry cache for UserOperations that have already reached the durable queue.
 ///
-/// The bundling worker will consume these entries in a later integration. Keeping the queue in
-/// application state makes accepting a UserOperation truthful today without adding persistence
-/// or a second process.
+/// Iggy is the source of truth. This bounded cache saves a repeated same-process JSON-RPC retry
+/// from appending a duplicate message, but it must never be treated as durable storage.
 #[derive(Clone, Default)]
 pub struct PendingUserOperations {
-    operations: Arc<Mutex<HashMap<String, Value>>>,
+    operations: Arc<Mutex<PendingUserOperationsState>>,
+}
+
+#[derive(Default)]
+struct PendingUserOperationsState {
+    entries: HashSet<String>,
+    insertion_order: VecDeque<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +57,14 @@ impl AppState {
                 ready_jobs: Arc::new(Mutex::new(HashSet::new())),
             },
             settlement_recipient,
+            user_operation_queue: None,
             pending_user_operations: PendingUserOperations::default(),
         }
+    }
+
+    pub fn with_user_operation_queue(mut self, user_operation_queue: UserOperationQueue) -> Self {
+        self.user_operation_queue = Some(user_operation_queue);
+        self
     }
 
     pub fn readiness(&self) -> Readiness {
@@ -67,31 +79,40 @@ impl AppState {
         self.settlement_recipient.as_deref()
     }
 
+    pub fn user_operation_queue(&self) -> Option<UserOperationQueue> {
+        self.user_operation_queue.clone()
+    }
+
     pub fn pending_user_operations(&self) -> PendingUserOperations {
         self.pending_user_operations.clone()
     }
 }
 
 impl PendingUserOperations {
-    pub fn insert(
-        &self,
-        user_operation_hash: String,
-        user_operation: Value,
-    ) -> Result<PendingUserOperationInsert, ()> {
+    pub fn insert(&self, user_operation_hash: String) -> PendingUserOperationInsert {
         let mut operations = self.operations();
 
-        if operations.contains_key(&user_operation_hash) {
-            return Ok(PendingUserOperationInsert::AlreadyPresent);
+        if operations.entries.contains(&user_operation_hash) {
+            return PendingUserOperationInsert::AlreadyPresent;
         }
-        if operations.len() >= MAX_PENDING_USER_OPERATIONS {
-            return Err(());
+        if operations.entries.len() >= MAX_PENDING_USER_OPERATIONS
+            && let Some(evicted) = operations.insertion_order.pop_front()
+        {
+            operations.entries.remove(&evicted);
         }
 
-        operations.insert(user_operation_hash, user_operation);
-        Ok(PendingUserOperationInsert::Inserted)
+        operations
+            .insertion_order
+            .push_back(user_operation_hash.clone());
+        operations.entries.insert(user_operation_hash);
+        PendingUserOperationInsert::Inserted
     }
 
-    fn operations(&self) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
+    pub fn contains(&self, user_operation_hash: &str) -> bool {
+        self.operations().entries.contains(user_operation_hash)
+    }
+
+    fn operations(&self) -> std::sync::MutexGuard<'_, PendingUserOperationsState> {
         self.operations
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -127,8 +148,6 @@ impl Readiness {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::{AppState, PendingUserOperationInsert};
 
     #[test]
@@ -136,12 +155,12 @@ mod tests {
         let pending = AppState::with_settlement_recipient(&[], None).pending_user_operations();
 
         assert_eq!(
-            pending.insert("0xabc".into(), json!({ "sender": "0x1" })),
-            Ok(PendingUserOperationInsert::Inserted)
+            pending.insert("0xabc".into()),
+            PendingUserOperationInsert::Inserted
         );
         assert_eq!(
-            pending.insert("0xabc".into(), json!({ "sender": "0x2" })),
-            Ok(PendingUserOperationInsert::AlreadyPresent)
+            pending.insert("0xabc".into()),
+            PendingUserOperationInsert::AlreadyPresent
         );
     }
 }

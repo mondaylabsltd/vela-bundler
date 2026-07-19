@@ -269,6 +269,66 @@ The reimbursement is decoded from the signed calls, not from a wallet-supplied a
 transfer-shaped payload does not count unless it is actually nested under the trusted Safe
 MultiSend delegatecall.
 
-Accepted operations are held in a bounded, process-local queue until the bundling worker is
-connected. They are not persistent across process restarts, and this first admission step does
-not perform on-chain signature simulation or submit an outer transaction yet.
+After admission, the relay appends the following envelope to Iggy and only then returns the
+`userOpHash`. It does not execute or submit an outer transaction in the HTTP request path.
+
+```json
+{
+  "schemaVersion": 1,
+  "userOperationHash": "0x...",
+  "chainId": 1,
+  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "userOperation": { "...": "original v0.7 request object" }
+}
+```
+
+### Iggy topology and configuration
+
+Each chain has an isolated, single-partition stream named `chain-{chainId}` and a topic named
+`default`. For example, an operation for chain `42161` is appended to
+`chain-42161/default`. This gives FIFO ordering within a chain while allowing independent chains
+to be consumed in parallel.
+
+Create the desired chain streams and their `default` topic in `init-iggy`. The example below
+keeps messages for fourteen days; set retention longer than the maximum expected consumer outage
+and incident-recovery window.
+
+```sh
+for chain_id in 1 10 42161; do
+  iggy stream create "chain-${chain_id}"
+  iggy topic create "chain-${chain_id}" default 1 none 14d
+done
+```
+
+For controlled automatic creation, configure a second, separately privileged Iggy identity and
+an explicit chain allowlist. On the first failed write for an allowlisted chain, the relay creates
+`chain-{chainId}` and its `default` topic (one partition, no compression, 14-day expiry), then
+retries the write once. It never creates a stream for a chain that is not allowlisted:
+
+```sh
+VELA_RELAY_IGGY_PROVISIONER_URL='iggy+tcp://vela-relay-provisioner:<password>@127.0.0.1:5100'
+VELA_RELAY_IGGY_AUTO_CREATE_CHAIN_IDS='1,10,42161'
+```
+
+Use a distinct production provisioner identity with only stream/topic read-and-manage permissions.
+Keep `VELA_RELAY_IGGY_URL` on the low-privilege producer identity. For local development with the
+root account, both URLs may temporarily be the same.
+
+The relay requires the following environment variables:
+
+```sh
+VELA_RELAY_IGGY_URL='iggy+tcp://vela-relay-producer:<password>@127.0.0.1:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true'
+VELA_RELAY_IGGY_TOPIC=default                 # optional; this is the default
+VELA_RELAY_IGGY_ENQUEUE_TIMEOUT_SECS=5        # optional; this is the default
+```
+
+`VELA_RELAY_IGGY_URL` is mandatory. If Iggy is unavailable, refuses the message, or does not
+acknowledge it before the enqueue timeout, `eth_sendUserOperation` returns JSON-RPC `-32000`
+instead of claiming success. The relay never falls back to an in-memory queue.
+
+Use a non-root `vela-relay-producer` account for the relay, with only `send_messages` permission;
+keep stream/topic management and consumer permissions in separate identities. Enable TCP TLS for
+any non-loopback connection and keep queue credentials only in the runtime secret store. The
+consumer should use an Iggy consumer group and commit its offset only after the corresponding
+bundle submission has completed durably. Delivery is at-least-once, so consumers must make
+`userOperationHash` idempotent.

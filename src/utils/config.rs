@@ -15,6 +15,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub runtime: RuntimeConfig,
     pub worker: WorkerConfig,
+    pub iggy: IggyConfig,
     pub settlement_recipient: Option<String>,
 }
 
@@ -48,6 +49,20 @@ pub struct WorkerConfig {
     pub runtime_threads: usize,
     pub max_blocking_threads: usize,
     pub parallel_job_concurrency: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct IggyConfig {
+    /// An Iggy connection string. Credentials must be supplied through the environment, never
+    /// committed in configuration files.
+    pub url: String,
+    /// A separately-privileged Iggy connection that can create an approved chain stream and its
+    /// topic when it is first used.
+    pub provisioner_url: Option<String>,
+    /// The only chain IDs for which the provisioner may create a stream.
+    pub auto_create_chain_ids: Vec<u64>,
+    pub topic: String,
+    pub enqueue_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -106,9 +121,40 @@ impl Config {
                 max_blocking_threads: worker_max_blocking_threads,
                 parallel_job_concurrency,
             },
+            iggy: iggy_config()?,
             settlement_recipient: settlement_recipient()?,
         })
     }
+}
+
+fn iggy_config() -> Result<IggyConfig, ConfigError> {
+    let provisioner_url = optional_value("VELA_RELAY_IGGY_PROVISIONER_URL")?;
+    let auto_create_chain_ids =
+        comma_separated_u64_values("VELA_RELAY_IGGY_AUTO_CREATE_CHAIN_IDS")?;
+
+    match (provisioner_url.is_some(), auto_create_chain_ids.is_empty()) {
+        (true, true) => {
+            return Err(ConfigError(
+                "VELA_RELAY_IGGY_PROVISIONER_URL requires VELA_RELAY_IGGY_AUTO_CREATE_CHAIN_IDS"
+                    .into(),
+            ));
+        }
+        (false, false) => {
+            return Err(ConfigError(
+                "VELA_RELAY_IGGY_AUTO_CREATE_CHAIN_IDS requires VELA_RELAY_IGGY_PROVISIONER_URL"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(IggyConfig {
+        url: required_value("VELA_RELAY_IGGY_URL")?,
+        provisioner_url,
+        auto_create_chain_ids,
+        topic: value_or("VELA_RELAY_IGGY_TOPIC", "default")?,
+        enqueue_timeout: Duration::from_secs(u64_value("VELA_RELAY_IGGY_ENQUEUE_TIMEOUT_SECS", 5)?),
+    })
 }
 
 fn load_dotenv() -> Result<(), ConfigError> {
@@ -146,6 +192,66 @@ fn value_or(name: &str, default: &str) -> Result<String, ConfigError> {
     }
 }
 
+fn required_value(name: &str) -> Result<String, ConfigError> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Err(ConfigError(format!(
+            "environment variable {name} cannot be empty"
+        ))),
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Err(ConfigError(format!(
+            "environment variable {name} is required"
+        ))),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError(format!(
+            "environment variable {name} must be valid Unicode"
+        ))),
+    }
+}
+
+fn optional_value(name: &str) -> Result<Option<String>, ConfigError> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Err(ConfigError(format!(
+            "environment variable {name} cannot be empty"
+        ))),
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError(format!(
+            "environment variable {name} must be valid Unicode"
+        ))),
+    }
+}
+
+fn comma_separated_u64_values(name: &str) -> Result<Vec<u64>, ConfigError> {
+    let Some(value) = optional_value(name)? else {
+        return Ok(Vec::new());
+    };
+
+    parse_comma_separated_u64_values(name, &value)
+}
+
+fn parse_comma_separated_u64_values(name: &str, value: &str) -> Result<Vec<u64>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|item| {
+            if item.is_empty() {
+                return Err(ConfigError(format!(
+                    "invalid {name}; expected a comma-separated list of positive chain IDs"
+                )));
+            }
+
+            let chain_id = item.parse::<u64>().map_err(|error| {
+                ConfigError(format!("invalid {name} chain ID `{item}`: {error}"))
+            })?;
+            if chain_id == 0 {
+                return Err(ConfigError(format!(
+                    "invalid {name}; chain IDs must be greater than zero"
+                )));
+            }
+            Ok(chain_id)
+        })
+        .collect()
+}
+
 fn usize_value(name: &str, default: usize) -> Result<usize, ConfigError> {
     let value = value_or(name, &default.to_string())?;
     let parsed = value
@@ -177,19 +283,8 @@ fn u64_value(name: &str, default: u64) -> Result<u64, ConfigError> {
 }
 
 fn optional_address(name: &str) -> Result<Option<String>, ConfigError> {
-    let value = match env::var(name) {
-        Ok(value) if value.trim().is_empty() => {
-            return Err(ConfigError(format!(
-                "environment variable {name} cannot be empty"
-            )));
-        }
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(ConfigError(format!(
-                "environment variable {name} must be valid Unicode"
-            )));
-        }
+    let Some(value) = optional_value(name)? else {
+        return Ok(None);
     };
 
     let address = value.trim();
@@ -230,4 +325,23 @@ fn settlement_recipient() -> Result<Option<String>, ConfigError> {
     }
 
     Ok(Some(derived_recipient))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_comma_separated_u64_values;
+
+    #[test]
+    fn parses_positive_chain_ids_for_automatic_iggy_provisioning() {
+        assert_eq!(
+            parse_comma_separated_u64_values("CHAIN_IDS", "1, 10,42161").unwrap(),
+            [1, 10, 42_161]
+        );
+    }
+
+    #[test]
+    fn rejects_zero_and_empty_automatic_provisioning_chain_ids() {
+        assert!(parse_comma_separated_u64_values("CHAIN_IDS", "0").is_err());
+        assert!(parse_comma_separated_u64_values("CHAIN_IDS", "1,,42161").is_err());
+    }
 }

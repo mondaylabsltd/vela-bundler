@@ -13,9 +13,11 @@ use tower_http::{
 };
 
 mod handlers;
+mod queue;
 mod rpc;
 pub mod state;
 
+pub use queue::UserOperationQueue;
 pub use state::{AppState, Readiness};
 
 use crate::utils::config::HttpConfig;

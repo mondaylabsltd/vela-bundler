@@ -45,30 +45,52 @@ async fn accept(
 
     let entry_point_address = address(&entry_point, "entryPoint")?;
     let user_operation_hash = prepared.user_operation_hash(entry_point_address, chain_id);
+    let pending = state.pending_user_operations();
+
+    if pending.contains(&user_operation_hash) {
+        tracing::info!(
+            chain_id,
+            user_operation_hash = %user_operation_hash,
+            "UserOperation already exists in the durable queue retry cache"
+        );
+        return Ok(user_operation_hash);
+    }
+
     let entry = json!({
+        "schemaVersion": 1,
+        "userOperationHash": user_operation_hash,
         "chainId": chain_id,
         "entryPoint": entry_point,
         "userOperation": prepared.operation,
     });
 
-    match state
-        .pending_user_operations()
-        .insert(user_operation_hash.clone(), entry)
-    {
-        Ok(PendingUserOperationInsert::Inserted) => tracing::info!(
+    let queue = state
+        .user_operation_queue()
+        .ok_or_else(RpcError::user_operation_queue_unavailable)?;
+    queue.enqueue(chain_id, &entry).await.map_err(|error| {
+        tracing::warn!(
+            chain_id,
+            user_operation_hash = %user_operation_hash,
+            %error,
+            "could not append UserOperation to Iggy"
+        );
+        RpcError::user_operation_queue_unavailable()
+    })?;
+
+    match pending.insert(user_operation_hash.clone()) {
+        PendingUserOperationInsert::Inserted => tracing::info!(
             chain_id,
             entry_point = %entry_point,
             sender = %prepared.sender_hex(),
             user_operation_hash = %user_operation_hash,
             settlement = "in_band",
-            "UserOperation accepted into the local mempool"
+            "UserOperation accepted into the durable queue"
         ),
-        Ok(PendingUserOperationInsert::AlreadyPresent) => tracing::info!(
+        PendingUserOperationInsert::AlreadyPresent => tracing::info!(
             chain_id,
             user_operation_hash = %user_operation_hash,
-            "UserOperation already exists in the local mempool"
+            "UserOperation already exists in the durable queue retry cache"
         ),
-        Err(()) => return Err(RpcError::mempool_full()),
     }
 
     Ok(user_operation_hash)
