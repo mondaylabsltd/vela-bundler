@@ -18,7 +18,6 @@ pub const TEMPO_COST_BUFFER_GAS: u64 = 80_000;
 pub const TEMPO_FLOAT_MIN: u128 = 100_000;
 pub const TEMPO_FLOAT_TARGET: u128 = 300_000;
 pub const TEMPO_TREASURY_FLOOR: u128 = 200_000;
-pub const TEMPO_TOP_UP_DAILY_MAX: u128 = 50_000_000;
 
 sol! {
     interface IERC20Tempo {

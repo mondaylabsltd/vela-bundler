@@ -22,7 +22,6 @@ const LEASE_KEY_PREFIX: &str = "vela:relay:lease:";
 const PREPARED_BUNDLE_KEY_PREFIX: &str = "vela:relay:prepared-bundle:";
 const PREPARED_BUNDLE_INDEX_KEY: &str = "vela:relay:prepared-bundle-index";
 const PREPARED_FUNDING_KEY_PREFIX: &str = "vela:relay:prepared-funding:";
-const TOP_UP_BUDGET_KEY_PREFIX: &str = "vela:relay:top-up-budget:";
 const MALFORMED_DEAD_LETTER_KEY_PREFIX: &str = "vela:relay:malformed-dead-letter:";
 const DELAYED_OPERATION_PAYLOAD_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-payload:";
 const DELAYED_OPERATION_KEY_PREFIX: &str = "vela:relay:delayed-user-operation:";
@@ -160,131 +159,8 @@ end
 return redis.call('DEL', KEYS[1])
 "#;
 
-// A confirmed revert did not transfer the reserved relayer float. Return that amount to the
-// rolling budget atomically with removing the outbox record, so a failed funding transaction
-// cannot leave a chain artificially blocked for the rest of the 24-hour window.
-const CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT: &str = r#"
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local intent = cjson.decode(raw)
-if intent['transactionHash'] ~= ARGV[1] then
-  return 0
-end
-
-local function normalize_decimal(value)
-  local normalized = string.gsub(value, '^0+', '')
-  if normalized == '' then
-    return '0'
-  end
-  return normalized
-end
-
-local function decimal_subtract(left, right)
-  left = normalize_decimal(left)
-  right = normalize_decimal(right)
-  if string.len(left) < string.len(right) or (string.len(left) == string.len(right) and left < right) then
-    return '0'
-  end
-  local result = {}
-  local left_index = string.len(left)
-  local right_index = string.len(right)
-  local borrow = 0
-  while left_index > 0 do
-    local left_digit = string.byte(left, left_index) - string.byte('0') - borrow
-    local right_digit = 0
-    if right_index > 0 then
-      right_digit = string.byte(right, right_index) - string.byte('0')
-    end
-    if left_digit < right_digit then
-      left_digit = left_digit + 10
-      borrow = 1
-    else
-      borrow = 0
-    end
-    table.insert(result, 1, string.char(string.byte('0') + left_digit - right_digit))
-    left_index = left_index - 1
-    right_index = right_index - 1
-  end
-  return normalize_decimal(table.concat(result))
-end
-
-local current = redis.call('GET', KEYS[2])
-if current then
-  local remaining = decimal_subtract(current, tostring(intent['amountWei']))
-  if remaining == '0' then
-    redis.call('DEL', KEYS[2])
-  else
-    redis.call('SET', KEYS[2], remaining, 'KEEPTTL')
-  end
-end
-return redis.call('DEL', KEYS[1])
-"#;
-
-const RESERVE_AND_SAVE_FUNDING_SCRIPT: &str = r#"
-local function normalize_decimal(value)
-  local normalized = string.gsub(value, '^0+', '')
-  if normalized == '' then
-    return '0'
-  end
-  return normalized
-end
-
-local function decimal_greater(left, right)
-  left = normalize_decimal(left)
-  right = normalize_decimal(right)
-  if string.len(left) ~= string.len(right) then
-    return string.len(left) > string.len(right)
-  end
-  return left > right
-end
-
-local function decimal_add(left, right)
-  left = normalize_decimal(left)
-  right = normalize_decimal(right)
-  local result = {}
-  local left_index = string.len(left)
-  local right_index = string.len(right)
-  local carry = 0
-  while left_index > 0 or right_index > 0 or carry > 0 do
-    local left_digit = 0
-    local right_digit = 0
-    if left_index > 0 then
-      left_digit = string.byte(left, left_index) - 48
-      left_index = left_index - 1
-    end
-    if right_index > 0 then
-      right_digit = string.byte(right, right_index) - 48
-      right_index = right_index - 1
-    end
-    local sum = left_digit + right_digit + carry
-    table.insert(result, 1, string.char(48 + (sum % 10)))
-    carry = math.floor(sum / 10)
-  end
-  return table.concat(result)
-end
-
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  return 0
-end
-
-local current = redis.call('GET', KEYS[2])
-local budget_existed = current ~= false
-local total = decimal_add(current or '0', ARGV[1])
-if decimal_greater(total, ARGV[2]) then
-  return -1
-end
-
-local stored = redis.call('SET', KEYS[1], ARGV[4], 'NX')
-if not stored then
-  return 0
-end
-redis.call('SET', KEYS[2], total, 'KEEPTTL')
-if not budget_existed or redis.call('PTTL', KEYS[2]) < 0 then
-  redis.call('PEXPIRE', KEYS[2], ARGV[3])
-end
-return 1
+const SAVE_PREPARED_FUNDING_SCRIPT: &str = r#"
+return redis.call('SET', KEYS[1], ARGV[1], 'NX') and 1 or 0
 "#;
 
 const SAVE_DELAYED_OPERATION_SCRIPT: &str = r#"
@@ -1040,39 +916,23 @@ impl UserOperationStatusStore {
         deserialize_prepared_bundle_intents(payloads)
     }
 
-    /// Atomically reserves the per-chain daily top-up budget and writes the signed funding
-    /// outbox record. Keeping both effects in one Lua transaction eliminates the crash window in
-    /// which budget could be consumed without retaining a transaction that can be replayed.
-    ///
-    /// Returns `false` when another funding intent already owns this chain or when the daily cap
-    /// would be exceeded. Callers already holding the chain treasury lease can distinguish those
-    /// cases by loading the current intent.
-    pub async fn reserve_and_save_prepared_funding_intent(
+    /// Persists an immutable signed funding outbox before its first broadcast. A chain can have
+    /// only one pending treasury transfer, so retries never allocate a second treasury nonce.
+    pub async fn save_prepared_funding_intent(
         &self,
         intent: &PreparedFundingIntent,
-        daily_limit: u128,
-        budget_ttl: Duration,
     ) -> Result<bool, UserOperationStatusStoreError> {
         validate_prepared_funding_intent(intent)?;
-        if daily_limit == 0 {
-            return Err(UserOperationStatusStoreError(
-                "daily top-up limit must be greater than zero",
-            ));
-        }
         let payload = serde_json::to_string(intent)
             .map_err(|_| UserOperationStatusStoreError("could not serialize prepared funding"))?;
         let mut command = redis::cmd("EVAL");
         command
-            .arg(RESERVE_AND_SAVE_FUNDING_SCRIPT)
-            .arg(2)
+            .arg(SAVE_PREPARED_FUNDING_SCRIPT)
+            .arg(1)
             .arg(prepared_funding_key(intent.chain_id))
-            .arg(top_up_budget_key(intent.chain_id))
-            .arg(intent.amount_wei.to_string())
-            .arg(daily_limit.to_string())
-            .arg(duration_millis(budget_ttl)?)
             .arg(payload);
-        let reserved: i64 = self.query(command).await?;
-        Ok(reserved == 1)
+        let saved: i64 = self.query(command).await?;
+        Ok(saved == 1)
     }
 
     pub async fn get_prepared_funding_intent(
@@ -1111,24 +971,6 @@ impl UserOperationStatusStore {
             .arg(CLEAR_PREPARED_FUNDING_SCRIPT)
             .arg(1)
             .arg(prepared_funding_key(chain_id))
-            .arg(transaction_hash);
-        let cleared: i64 = self.query(command).await?;
-        Ok(cleared == 1)
-    }
-
-    /// Removes a funding outbox that is proven to have reverted and returns its transfer amount
-    /// to the chain's rolling budget in the same Redis transaction.
-    pub async fn clear_and_refund_prepared_funding_intent(
-        &self,
-        chain_id: u64,
-        transaction_hash: &str,
-    ) -> Result<bool, UserOperationStatusStoreError> {
-        let mut command = redis::cmd("EVAL");
-        command
-            .arg(CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT)
-            .arg(2)
-            .arg(prepared_funding_key(chain_id))
-            .arg(top_up_budget_key(chain_id))
             .arg(transaction_hash);
         let cleared: i64 = self.query(command).await?;
         Ok(cleared == 1)
@@ -1343,10 +1185,6 @@ fn prepared_bundle_key(chain_id: u64, lane: u8) -> String {
 
 fn prepared_funding_key(chain_id: u64) -> String {
     format!("{PREPARED_FUNDING_KEY_PREFIX}{chain_id}")
-}
-
-fn top_up_budget_key(chain_id: u64) -> String {
-    format!("{TOP_UP_BUDGET_KEY_PREFIX}{chain_id}")
 }
 
 fn malformed_dead_letter_key(chain_id: u64, partition_id: u32, offset: u64) -> String {
@@ -1618,20 +1456,19 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CLAIM_DELAYED_OPERATIONS_SCRIPT, CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT,
-        CLEAR_PREPARED_BUNDLE_SCRIPT, CLEAR_PREPARED_FUNDING_SCRIPT,
-        COMPLETE_DELAYED_OPERATION_SCRIPT, DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation,
-        LIST_PREPARED_BUNDLES_SCRIPT, MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT,
-        PREPARED_BUNDLE_INDEX_KEY, PreparedBundleIntent, PreparedFundingIntent,
-        RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT, RESERVE_AND_SAVE_FUNDING_SCRIPT,
+        CLAIM_DELAYED_OPERATIONS_SCRIPT, CLEAR_PREPARED_BUNDLE_SCRIPT,
+        CLEAR_PREPARED_FUNDING_SCRIPT, COMPLETE_DELAYED_OPERATION_SCRIPT,
+        DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation, LIST_PREPARED_BUNDLES_SCRIPT,
+        MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT, PREPARED_BUNDLE_INDEX_KEY,
+        PreparedBundleIntent, PreparedFundingIntent, RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT,
         RETRY_DELAYED_OPERATION_SCRIPT, SAVE_DELAYED_OPERATION_SCRIPT, SAVE_PREPARED_BUNDLE_SCRIPT,
-        UserOperationEvent, UserOperationStatusKind, canonical_delayed_payload,
-        delayed_operation_identifier, deserialize_claimed_delayed_operations,
-        deserialize_prepared_bundle_intents, deserialize_stored_operations, duration_millis,
-        lease_key, malformed_dead_letter, malformed_dead_letter_key, partition_bundle_events,
-        prepared_bundle_key, prepared_funding_key, top_up_budget_key, transition_is_allowed,
-        truncate_diagnostic, validate_lease_identity, validate_prepared_bundle_intent,
-        validate_prepared_funding_intent,
+        SAVE_PREPARED_FUNDING_SCRIPT, UserOperationEvent, UserOperationStatusKind,
+        canonical_delayed_payload, delayed_operation_identifier,
+        deserialize_claimed_delayed_operations, deserialize_prepared_bundle_intents,
+        deserialize_stored_operations, duration_millis, lease_key, malformed_dead_letter,
+        malformed_dead_letter_key, partition_bundle_events, prepared_bundle_key,
+        prepared_funding_key, transition_is_allowed, truncate_diagnostic, validate_lease_identity,
+        validate_prepared_bundle_intent, validate_prepared_funding_intent,
     };
 
     #[test]
@@ -1857,20 +1694,7 @@ mod tests {
             intent
         );
         assert!(CLEAR_PREPARED_FUNDING_SCRIPT.contains("intent['transactionHash'] ~= ARGV[1]"));
-        assert!(
-            CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT
-                .contains("intent['transactionHash'] ~= ARGV[1]")
-        );
-        assert!(CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT.contains("'KEEPTTL'"));
-        assert!(!CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT.contains("tonumber"));
-        assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("local function decimal_add"));
-        assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("decimal_greater(total, ARGV[2])"));
-        assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("'SET', KEYS[1], ARGV[4], 'NX'"));
-        assert!(!RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("ARGV[5]"));
-        assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("'SET', KEYS[2], total, 'KEEPTTL'"));
-        assert!(!RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("INCRBY"));
-        assert!(!RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("tonumber"));
-        assert_eq!(top_up_budget_key(42161), "vela:relay:top-up-budget:42161");
+        assert!(SAVE_PREPARED_FUNDING_SCRIPT.contains("'SET', KEYS[1], ARGV[1], 'NX'"));
     }
 
     #[test]

@@ -54,7 +54,6 @@ use super::{
 };
 
 const BROADCAST_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-const TOP_UP_BUDGET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const TOP_UP_GAS_LIMIT: u64 = 21_000;
 const RECEIPT_RECONCILE_FAILURE_DELAY: Duration = Duration::from_secs(1);
 const DELAYED_CLAIM_BATCH_SIZE: usize = 100;
@@ -62,7 +61,6 @@ const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
 const USD_PRICE_SCALE: u64 = 100_000_000;
 const NATIVE_TOP_UP_USD_CAP: u64 = 2;
-const NATIVE_TOP_UP_DAILY_USD_CAP: u64 = 20;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -126,12 +124,6 @@ struct TempoTransactionContext {
     base_fee_atto: U256,
     nonce: u64,
     relayer_path_usd_balance: U256,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NativeTopUpLimits {
-    per_transfer: U256,
-    daily: U256,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1004,8 +996,8 @@ impl ExecutorEngine {
         let prefund = U256::from(gas_limit)
             .checked_mul(U256::from(context.max_fee_per_gas))
             .ok_or_else(|| ExecutorItemError("bundle prefund overflow".into()))?;
-        let top_up_limits = self
-            .native_top_up_limits(chain_id, native_symbol, chain_assets.native_decimals)
+        let top_up_max = self
+            .native_top_up_cap(chain_id, native_symbol, chain_assets.native_decimals)
             .await;
         if self
             .ensure_relayer_funded(
@@ -1015,8 +1007,7 @@ impl ExecutorEngine {
                 prefund,
                 context.max_fee_per_gas,
                 context.max_priority_fee_per_gas,
-                top_up_limits.per_transfer,
-                top_up_limits.daily,
+                top_up_max,
             )
             .await?
             == FundingReadiness::Pending
@@ -1736,25 +1727,20 @@ impl ExecutorEngine {
         Ok(price)
     }
 
-    /// Applies value-based safety limits when a native USD quote is available. A low-priced
-    /// asset (for example MATIC) must not be constrained by a nominal one-token daily ceiling:
-    /// the daily allowance is ten 2-USD transfers. Networks without a price retain the explicit
-    /// native-token hard limits supplied by the operator.
-    async fn native_top_up_limits(
+    /// Cap one native-token relayer top-up at 2 USD when Binance has a fresh quote. A network
+    /// with no usable market price intentionally keeps the operator's static wei-denominated
+    /// safety cap instead of blocking execution on the price service.
+    async fn native_top_up_cap(
         &self,
         chain_id: u64,
         native_symbol: &str,
         native_decimals: u32,
-    ) -> NativeTopUpLimits {
-        let fallback = NativeTopUpLimits {
-            per_transfer: U256::from(self.config.top_up_max_wei),
-            daily: U256::from(self.config.top_up_daily_max_wei),
-        };
+    ) -> U256 {
+        let fallback = U256::from(self.config.top_up_max_wei);
         let Ok(price) = self.market_usd_price(chain_id, native_symbol).await else {
             return fallback;
         };
-        let Some(per_transfer) =
-            native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_USD_CAP)
+        let Some(cap) = native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_USD_CAP)
         else {
             tracing::warn!(
                 native_symbol,
@@ -1763,27 +1749,13 @@ impl ExecutorEngine {
             );
             return fallback;
         };
-        let Some(daily) =
-            native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_DAILY_USD_CAP)
-        else {
-            tracing::warn!(
-                native_symbol,
-                native_decimals,
-                "could not convert USD relayer top-up daily cap to native units; using static cap"
-            );
-            return fallback;
-        };
         tracing::debug!(
             native_symbol,
             native_decimals,
-            per_transfer_native_units = %per_transfer,
-            daily_native_units = %daily,
-            "using USD-denominated relayer top-up limits"
+            native_units = %cap,
+            "using USD-denominated relayer top-up cap"
         );
-        NativeTopUpLimits {
-            per_transfer,
-            daily,
-        }
+        cap
     }
 
     async fn resume_bundle_intent(
@@ -2396,11 +2368,7 @@ impl ExecutorEngine {
         self.ensure_lease(lease_scope, lease_token).await?;
         if !self
             .store
-            .reserve_and_save_prepared_funding_intent(
-                &intent,
-                tempo::TEMPO_TOP_UP_DAILY_MAX,
-                TOP_UP_BUDGET_TTL,
-            )
+            .save_prepared_funding_intent(&intent)
             .await
             .map_err(store_item_error)?
         {
@@ -2414,7 +2382,7 @@ impl ExecutorEngine {
                 return Ok(FundingReadiness::Pending);
             }
             return Err(ExecutorItemError(
-                "Tempo chain daily relayer top-up budget is exhausted".into(),
+                "another Tempo treasury relayer top-up is pending".into(),
             ));
         }
         self.broadcast_funding_intent(&intent).await?;
@@ -2438,7 +2406,6 @@ impl ExecutorEngine {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         top_up_max: U256,
-        top_up_daily_max: U256,
     ) -> Result<FundingReadiness, ExecutorItemError> {
         let minimum = required_prefund.max(U256::from(self.config.relayer_float_min_wei));
         if relayer_balance >= minimum {
@@ -2467,7 +2434,6 @@ impl ExecutorEngine {
                     max_fee_per_gas,
                     max_priority_fee_per_gas,
                     top_up_max,
-                    top_up_daily_max,
                     &scope,
                     &token,
                 ),
@@ -2489,7 +2455,6 @@ impl ExecutorEngine {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         top_up_max: U256,
-        top_up_daily_max: U256,
         lease_scope: &str,
         lease_token: &str,
     ) -> Result<FundingReadiness, ExecutorItemError> {
@@ -2582,13 +2547,7 @@ impl ExecutorEngine {
         self.ensure_lease(lease_scope, lease_token).await?;
         if !self
             .store
-            .reserve_and_save_prepared_funding_intent(
-                &intent,
-                u128::try_from(top_up_daily_max).map_err(|_| {
-                    ExecutorItemError("native relayer top-up daily cap exceeds uint128".into())
-                })?,
-                TOP_UP_BUDGET_TTL,
-            )
+            .save_prepared_funding_intent(&intent)
             .await
             .map_err(store_item_error)?
         {
@@ -2602,7 +2561,7 @@ impl ExecutorEngine {
                 return Ok(FundingReadiness::Pending);
             }
             return Err(ExecutorItemError(
-                "chain daily relayer top-up budget is exhausted".into(),
+                "another treasury relayer top-up is pending".into(),
             ));
         }
         self.broadcast_funding_intent(&intent).await?;
@@ -2650,17 +2609,10 @@ impl ExecutorEngine {
                 "funding transaction receipt has invalid status".into(),
             ));
         };
-        if success {
-            self.store
-                .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
-                .await
-                .map_err(store_item_error)?;
-        } else {
-            self.store
-                .clear_and_refund_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
-                .await
-                .map_err(store_item_error)?;
-        }
+        self.store
+            .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
+            .await
+            .map_err(store_item_error)?;
         self.broadcast_seen
             .lock()
             .await

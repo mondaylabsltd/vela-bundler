@@ -105,7 +105,6 @@ pub struct ExecutorConfig {
     pub relayer_float_cost_multiplier: u64,
     pub treasury_floor_wei: u128,
     pub top_up_max_wei: u128,
-    pub top_up_daily_max_wei: u128,
 }
 
 #[derive(Clone)]
@@ -156,7 +155,6 @@ impl Debug for ExecutorConfig {
             )
             .field("treasury_floor_wei", &self.treasury_floor_wei)
             .field("top_up_max_wei", &self.top_up_max_wei)
-            .field("top_up_daily_max_wei", &self.top_up_daily_max_wei)
             .finish()
     }
 }
@@ -296,10 +294,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         "VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI",
         10_000_000_000_000_000_000,
     )?;
-    let top_up_daily_max_wei = u128_value(
-        "VELA_RELAY_EXECUTOR_TOP_UP_DAILY_MAX_WEI",
-        10_000_000_000_000_000_000,
-    )?;
     let receipt_confirmations = u64_value("VELA_RELAY_EXECUTOR_RECEIPT_CONFIRMATIONS", 2)?;
     if receipt_confirmations < 2 {
         return Err(ConfigError(
@@ -347,7 +341,6 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             10_000_000_000_000_000,
         )?,
         top_up_max_wei,
-        top_up_daily_max_wei,
     })
 }
 
