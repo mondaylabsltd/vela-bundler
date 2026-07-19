@@ -294,7 +294,7 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
     }
     let top_up_max_wei = u128_value(
         "VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI",
-        1_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
     )?;
     let top_up_daily_max_wei = u128_value(
         "VELA_RELAY_EXECUTOR_TOP_UP_DAILY_MAX_WEI",

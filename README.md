@@ -47,9 +47,9 @@ VELA_RELAY_EXECUTOR_RPC_URLS={"42161":"https://your-rpc.example"}
 ```
 
 For native-gas chains, a low relayer balance triggers a durable treasury top-up. The target is
-the greater of the next bundle prefund multiplied by `100` and the configured float target. If
+the greater of the next bundle prefund multiplied by `5` and the configured float target. If
 Binance supplies the native USD price, a single top-up is capped at USD 2; without a price the
-existing `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead.
+static `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead (10 native tokens by default).
 
 ## Tempo (pathUSD gas)
 
