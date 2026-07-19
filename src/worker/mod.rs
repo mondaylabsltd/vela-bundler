@@ -119,7 +119,7 @@ mod tests {
 
     #[tokio::test]
     async fn starts_after_jobs_report_ready() {
-        let state = AppState::new(JOB_NAMES);
+        let state = AppState::with_settlement_recipient(JOB_NAMES, None);
         let worker = BackgroundWorker::start(
             WorkerConfig {
                 runtime_threads: 1,

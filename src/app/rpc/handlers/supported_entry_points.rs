@@ -2,7 +2,13 @@ use serde_json::Value;
 
 use crate::app::rpc::types::RpcResponse;
 
-const SUPPORTED_ENTRY_POINTS: &[&str] = &["0x0000000071727De22E5E9d8BAf0edAc6f37da032"];
+pub const SUPPORTED_ENTRY_POINTS: &[&str] = &["0x0000000071727De22E5E9d8BAf0edAc6f37da032"];
+
+pub fn is_supported(entry_point: &str) -> bool {
+    SUPPORTED_ENTRY_POINTS
+        .iter()
+        .any(|supported| supported.eq_ignore_ascii_case(entry_point))
+}
 
 pub fn handle(id: Value) -> RpcResponse<Value> {
     RpcResponse::result(

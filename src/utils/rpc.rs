@@ -27,6 +27,25 @@ pub struct RpcCallResult {
     pub domain: String,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum RpcSimulationError {
+    Reverted(RpcRevert),
+    Unavailable,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct RpcRevert {
+    pub code: Option<i64>,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct SettlementAssets {
+    pub native_decimals: u32,
+    pub stablecoins: Vec<String>,
+}
+
 pub async fn call(
     chain_id: u64,
     user_rpc_url: Option<&HeaderValue>,
@@ -72,6 +91,105 @@ pub async fn call(
     .ok_or(())
 }
 
+/// Call an EVM simulation method while preserving a definitive contract revert.
+///
+/// Transport errors, rate limits, and unsupported RPC features fail over to the next
+/// source. A real EVM revert is returned immediately so a valid source does not get
+/// quarantined for rejecting one particular UserOperation.
+pub async fn call_simulation(
+    chain_id: u64,
+    user_rpc_url: Option<&HeaderValue>,
+    method: &str,
+    params: Value,
+) -> Result<RpcCallResult, RpcSimulationError> {
+    let client = http_client();
+
+    if let Some(url) = user_rpc_url.and_then(parse_user_rpc_url) {
+        match first_simulation_result(client, chain_id, "request_header", &[url], method, &params)
+            .await
+        {
+            Ok(Some(result)) => return Ok(result),
+            Err(error) => return Err(RpcSimulationError::Reverted(error)),
+            Ok(None) => {}
+        }
+    } else if user_rpc_url.is_some() {
+        tracing::warn!("ignored invalid user RPC URL header");
+    }
+
+    if let Some(url) = alchemy_rpc_url(chain_id) {
+        match first_simulation_result(client, chain_id, "alchemy", &[url], method, &params).await {
+            Ok(Some(result)) => return Ok(result),
+            Err(error) => return Err(RpcSimulationError::Reverted(error)),
+            Ok(None) => {}
+        }
+    }
+
+    let fallback_urls = match fetch_fallback_rpc_urls(client, chain_id).await {
+        Ok(urls) => urls,
+        Err(error) => {
+            tracing::warn!(%error, "could not fetch fallback RPC URLs");
+            return Err(RpcSimulationError::Unavailable);
+        }
+    };
+
+    match first_simulation_result(
+        client,
+        chain_id,
+        "awesometools",
+        &fallback_urls,
+        method,
+        &params,
+    )
+    .await
+    {
+        Ok(Some(result)) => Ok(result),
+        Err(error) => Err(RpcSimulationError::Reverted(error)),
+        Ok(None) => Err(RpcSimulationError::Unavailable),
+    }
+}
+
+pub async fn settlement_assets(chain_id: u64) -> Result<SettlementAssets, ()> {
+    let metadata = fetch_chain_metadata(http_client(), chain_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not fetch chain metadata for in-band settlement");
+        })?;
+
+    Ok(SettlementAssets {
+        native_decimals: metadata
+            .native_currency
+            .as_ref()
+            .map(|currency| currency.decimals)
+            .unwrap_or(18),
+        stablecoins: metadata
+            .stables
+            .into_iter()
+            .filter_map(|stable| parse_address(&stable.contract))
+            .collect(),
+    })
+}
+
+pub async fn erc20_decimals(
+    chain_id: u64,
+    user_rpc_url: Option<&HeaderValue>,
+    token: &str,
+) -> Result<u32, ()> {
+    let result = call(
+        chain_id,
+        user_rpc_url,
+        "eth_call",
+        json!([
+            { "to": token, "data": "0x313ce567" },
+            "latest",
+        ]),
+    )
+    .await?;
+    let value = result.value.as_str().ok_or(())?;
+    let value = value.strip_prefix("0x").ok_or(())?;
+    let decimals = u32::from_str_radix(value, 16).map_err(|_| ())?;
+    (decimals <= 38).then_some(decimals).ok_or(())
+}
+
 fn http_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
         Client::builder()
@@ -99,8 +217,18 @@ fn parse_user_rpc_url(value: &HeaderValue) -> Option<String> {
 }
 
 async fn fetch_fallback_rpc_urls(client: &Client, chain_id: u64) -> Result<Vec<String>, String> {
+    let response = fetch_chain_metadata(client, chain_id).await?;
+
+    Ok(response
+        .rpc
+        .into_iter()
+        .filter_map(|url| parse_rpc_url(&url))
+        .collect())
+}
+
+async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMetadata, String> {
     let url = format!("{RPC_LIST_URL}{chain_id}.json");
-    let response = client
+    client
         .get(url)
         .send()
         .await
@@ -109,13 +237,7 @@ async fn fetch_fallback_rpc_urls(client: &Client, chain_id: u64) -> Result<Vec<S
         .map_err(|error| format!("metadata request failed: {error}"))?
         .json::<ChainMetadata>()
         .await
-        .map_err(|error| format!("invalid chain metadata: {error}"))?;
-
-    Ok(response
-        .rpc
-        .into_iter()
-        .filter_map(|url| parse_rpc_url(&url))
-        .collect())
+        .map_err(|error| format!("invalid chain metadata: {error}"))
 }
 
 fn parse_rpc_url(value: &str) -> Option<String> {
@@ -189,6 +311,67 @@ async fn first_result(
     None
 }
 
+async fn first_simulation_result(
+    client: &Client,
+    chain_id: u64,
+    source: &str,
+    urls: &[String],
+    method: &str,
+    params: &Value,
+) -> Result<Option<RpcCallResult>, RpcRevert> {
+    for url in urls {
+        if let Some(retry_after) = failed_rpcs().retry_after(chain_id, url, method) {
+            tracing::debug!(
+                source,
+                chain_id,
+                method,
+                rpc_url = %redacted_rpc_url(url),
+                retry_after_ms = retry_after.as_millis(),
+                "skipped RPC during failure cooldown"
+            );
+            continue;
+        }
+
+        match fetch_simulation_result(client, url, method, params).await {
+            Ok(result) => {
+                tracing::info!(
+                    source,
+                    method,
+                    rpc_url = %redacted_rpc_url(url),
+                    "upstream JSON-RPC simulation source selected"
+                );
+                return Ok(Some(RpcCallResult {
+                    value: result,
+                    domain: rpc_domain(url),
+                }));
+            }
+            Err(SimulationUpstreamError::Reverted(error)) => {
+                tracing::info!(
+                    source,
+                    chain_id,
+                    method,
+                    rpc_url = %redacted_rpc_url(url),
+                    "upstream simulation reverted"
+                );
+                return Err(error);
+            }
+            Err(SimulationUpstreamError::Unavailable(error)) => {
+                failed_rpcs().freeze(chain_id, url, method);
+                tracing::warn!(
+                    source,
+                    chain_id,
+                    method,
+                    rpc_url = %redacted_rpc_url(url),
+                    %error,
+                    "upstream JSON-RPC simulation source failed"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn fetch_result(
     client: &Client,
     url: &str,
@@ -219,6 +402,64 @@ async fn fetch_result(
     response
         .result
         .ok_or_else(|| "upstream JSON-RPC response has no result".to_owned())
+}
+
+async fn fetch_simulation_result(
+    client: &Client,
+    url: &str,
+    method: &str,
+    params: &Value,
+) -> Result<Value, SimulationUpstreamError> {
+    let response = client
+        .post(url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }))
+        .send()
+        .await
+        .map_err(|error| SimulationUpstreamError::Unavailable(request_error(error)))?
+        .error_for_status()
+        .map_err(|error| SimulationUpstreamError::Unavailable(response_error(error)))?
+        .json::<UpstreamRpcResponse>()
+        .await
+        .map_err(|_| SimulationUpstreamError::Unavailable("invalid JSON-RPC response".into()))?;
+
+    if let Some(error) = response.error {
+        let error = RpcRevert {
+            code: error.code,
+            message: error
+                .message
+                .unwrap_or_else(|| "upstream JSON-RPC error".into()),
+            data: error.data,
+        };
+
+        return if is_execution_revert(&error) {
+            Err(SimulationUpstreamError::Reverted(error))
+        } else {
+            Err(SimulationUpstreamError::Unavailable(
+                "upstream returned a JSON-RPC error".into(),
+            ))
+        };
+    }
+
+    response.result.ok_or_else(|| {
+        SimulationUpstreamError::Unavailable("upstream JSON-RPC response has no result".into())
+    })
+}
+
+fn is_execution_revert(error: &RpcRevert) -> bool {
+    error.code == Some(3)
+        || error
+            .message
+            .to_ascii_lowercase()
+            .contains("execution reverted")
+        || error
+            .message
+            .to_ascii_lowercase()
+            .contains("execution error")
 }
 
 fn request_error(error: reqwest::Error) -> String {
@@ -258,6 +499,14 @@ fn rpc_domain(value: &str) -> String {
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_else(|| "<unknown>".into())
+}
+
+fn parse_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    let is_address = value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    is_address.then(|| value.to_ascii_lowercase())
 }
 
 #[derive(Eq, Hash, PartialEq)]
@@ -330,12 +579,38 @@ impl FailedRpcKey {
 #[derive(Deserialize)]
 struct ChainMetadata {
     rpc: Vec<String>,
+    #[serde(default)]
+    stables: Vec<StablecoinMetadata>,
+    #[serde(rename = "nativeCurrency")]
+    native_currency: Option<NativeCurrencyMetadata>,
 }
 
 #[derive(Deserialize)]
 struct UpstreamRpcResponse {
     result: Option<Value>,
-    error: Option<Value>,
+    error: Option<UpstreamRpcError>,
+}
+
+#[derive(Deserialize)]
+struct UpstreamRpcError {
+    code: Option<i64>,
+    message: Option<String>,
+    data: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct StablecoinMetadata {
+    contract: String,
+}
+
+#[derive(Deserialize)]
+struct NativeCurrencyMetadata {
+    decimals: u32,
+}
+
+enum SimulationUpstreamError {
+    Reverted(RpcRevert),
+    Unavailable(String),
 }
 
 #[cfg(test)]
@@ -353,7 +628,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        FailedRpcCache, fetch_result, first_result, parse_rpc_url, redacted_rpc_url, rpc_domain,
+        FailedRpcCache, SimulationUpstreamError, fetch_result, fetch_simulation_result,
+        first_result, first_simulation_result, parse_rpc_url, redacted_rpc_url, rpc_domain,
     };
 
     #[test]
@@ -459,6 +735,96 @@ mod tests {
             .unwrap();
         assert_eq!(second_result.value, json!("0x64"));
         assert_eq!(limited_calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn simulation_fails_over_when_a_node_does_not_support_state_overrides() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/unsupported",
+                        post(|| async {
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "state overrides are unsupported"
+                                }
+                            }))
+                        }),
+                    )
+                    .route(
+                        "/",
+                        post(|| async {
+                            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": "0x1234" }))
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let result = first_simulation_result(
+            &client,
+            31337,
+            "test",
+            &[
+                format!("http://{address}/unsupported"),
+                format!("http://{address}"),
+            ],
+            "eth_call",
+            &json!([]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.value, json!("0x1234"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn simulation_preserves_contract_reverts_without_freezing_the_rpc() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(|| async {
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "error": {
+                                "code": 3,
+                                "message": "execution reverted",
+                                "data": "0x08c379a0"
+                            }
+                        }))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = fetch_simulation_result(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "eth_call",
+            &json!([]),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SimulationUpstreamError::Reverted(_))));
         server.abort();
     }
 }

@@ -9,6 +9,7 @@ use crate::gas_price::GasPriceManager;
 pub struct AppState {
     gas_price: GasPriceManager,
     readiness: Readiness,
+    settlement_recipient: Option<String>,
 }
 
 #[derive(Clone)]
@@ -18,13 +19,17 @@ pub struct Readiness {
 }
 
 impl AppState {
-    pub fn new(expected_jobs: &[&'static str]) -> Self {
+    pub fn with_settlement_recipient(
+        expected_jobs: &[&'static str],
+        settlement_recipient: Option<String>,
+    ) -> Self {
         Self {
             gas_price: GasPriceManager::default(),
             readiness: Readiness {
                 expected_jobs: Arc::from(expected_jobs),
                 ready_jobs: Arc::new(Mutex::new(HashSet::new())),
             },
+            settlement_recipient,
         }
     }
 
@@ -34,6 +39,10 @@ impl AppState {
 
     pub fn gas_price(&self) -> GasPriceManager {
         self.gas_price.clone()
+    }
+
+    pub fn settlement_recipient(&self) -> Option<&str> {
+        self.settlement_recipient.as_deref()
     }
 }
 

@@ -15,6 +15,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub runtime: RuntimeConfig,
     pub worker: WorkerConfig,
+    pub settlement_recipient: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +106,7 @@ impl Config {
                 max_blocking_threads: worker_max_blocking_threads,
                 parallel_job_concurrency,
             },
+            settlement_recipient: settlement_recipient()?,
         })
     }
 }
@@ -172,4 +174,60 @@ fn u64_value(name: &str, default: u64) -> Result<u64, ConfigError> {
     }
 
     Ok(parsed)
+}
+
+fn optional_address(name: &str) -> Result<Option<String>, ConfigError> {
+    let value = match env::var(name) {
+        Ok(value) if value.trim().is_empty() => {
+            return Err(ConfigError(format!(
+                "environment variable {name} cannot be empty"
+            )));
+        }
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError(format!(
+                "environment variable {name} must be valid Unicode"
+            )));
+        }
+    };
+
+    let address = value.trim();
+    let valid = address.len() == 42
+        && address.starts_with("0x")
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid {
+        return Err(ConfigError(format!(
+            "invalid {name}; expected a 0x-prefixed 20-byte address"
+        )));
+    }
+
+    Ok(Some(address.into()))
+}
+
+fn settlement_recipient() -> Result<Option<String>, ConfigError> {
+    let configured_recipient = optional_address("VELA_RELAY_SETTLEMENT_RECIPIENT")?;
+    let operator_secret = match env::var("OPERATOR_SECRET") {
+        Ok(secret) => secret,
+        Err(env::VarError::NotPresent) => return Ok(configured_recipient),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError(
+                "environment variable OPERATOR_SECRET must be valid Unicode".into(),
+            ));
+        }
+    };
+
+    let derived_recipient = crate::utils::vault::derive_address(&operator_secret)
+        .map_err(|error| ConfigError(format!("invalid OPERATOR_SECRET: {error}")))?;
+
+    if let Some(configured_recipient) = configured_recipient
+        && !configured_recipient.eq_ignore_ascii_case(&derived_recipient)
+    {
+        return Err(ConfigError(
+            "VELA_RELAY_SETTLEMENT_RECIPIENT does not match the address derived from OPERATOR_SECRET"
+                .into(),
+        ));
+    }
+
+    Ok(Some(derived_recipient))
 }

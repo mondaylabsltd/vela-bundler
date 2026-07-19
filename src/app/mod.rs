@@ -68,7 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_requires_every_worker_job() {
-        let state = AppState::new(&["cleanup", "parallel"]);
+        let state = AppState::with_settlement_recipient(&["cleanup", "parallel"], None);
 
         let response = router(&http_config(), state.clone())
             .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
@@ -88,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_requests_with_oversized_content_length() {
-        let state = AppState::new(&[]);
+        let state = AppState::with_settlement_recipient(&[], None);
         let response = router(&http_config(), state)
             .oneshot(
                 Request::get("/")

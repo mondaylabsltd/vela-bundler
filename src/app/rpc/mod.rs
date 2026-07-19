@@ -45,7 +45,7 @@ pub async fn handle(
         ));
     }
 
-    let method = match validate_call(&request.method, request.params) {
+    let method = match validate_call(&request.method, request.params.clone()) {
         Ok(method) => method,
         Err(error) => return response(RpcResponse::error(request.id, error)),
     };
@@ -71,6 +71,47 @@ pub async fn handle(
             )
             .await;
             response_with_rpc_domain(response_body, rpc_domain)
+        }
+        RpcMethod::EstimateUserOperationGas => {
+            let params =
+                match serde_json::from_value::<EstimateUserOperationGasParams>(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return response(RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        ));
+                    }
+                };
+            let (response_body, rpc_domain) = handlers::estimate_user_operation_gas::handle(
+                request.id,
+                chain_id,
+                headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                params,
+            )
+            .await;
+            response_with_rpc_domain(response_body, rpc_domain)
+        }
+        RpcMethod::SendUserOperation => {
+            let params = match serde_json::from_value::<SendUserOperationParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return response(RpcResponse::error(
+                        request.id,
+                        RpcError::invalid_params(error.to_string()),
+                    ));
+                }
+            };
+            response(
+                handlers::send_user_operation::handle(
+                    request.id,
+                    chain_id,
+                    headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                    &state,
+                    params,
+                )
+                .await,
+            )
         }
         _ => response(RpcResponse::error(
             request.id,
@@ -158,7 +199,7 @@ mod tests {
     fn router() -> Router {
         Router::new()
             .route("/{chain_id}/rpc", post(handle))
-            .with_state(AppState::new(&[]))
+            .with_state(AppState::with_settlement_recipient(&[], None))
     }
 
     #[tokio::test]

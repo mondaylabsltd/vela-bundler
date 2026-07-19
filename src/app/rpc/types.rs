@@ -104,6 +104,22 @@ impl RpcError {
         Self::new(-32000, "gas price RPC request timed out", None)
     }
 
+    pub fn user_operation_rejected(details: impl Into<String>) -> Self {
+        Self::new(
+            -32500,
+            "UserOperation simulation failed",
+            Some(Value::String(details.into())),
+        )
+    }
+
+    pub fn estimation_unavailable() -> Self {
+        Self::new(
+            -32000,
+            "UserOperation simulation is temporarily unavailable",
+            None,
+        )
+    }
+
     fn new(code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             code,
@@ -226,7 +242,7 @@ pub struct NoParams;
 #[derive(Debug, Deserialize)]
 pub struct SendUserOperationParams(pub UserOperation, pub Address);
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct EstimateUserOperationGasParams(
     pub EstimatableUserOperation,
     pub Address,
@@ -242,14 +258,14 @@ pub struct GetUserOperationByHashParams(pub UserOperationHash);
 #[derive(Debug, Deserialize)]
 pub struct GetUserOperationStatusParams(pub UserOperationHash);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UserOperation {
     V0_7(Box<UserOperationV0_7>),
     V0_6(Box<UserOperationV0_6>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserOperationV0_7 {
     pub sender: Address,
@@ -270,7 +286,7 @@ pub struct UserOperationV0_7 {
     pub eip7702_auth: Option<Eip7702Authorization>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserOperationV0_6 {
     pub sender: Address,
@@ -286,14 +302,14 @@ pub struct UserOperationV0_6 {
     pub signature: HexData,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum EstimatableUserOperation {
     V0_7(Box<EstimatableUserOperationV0_7>),
     V0_6(Box<EstimatableUserOperationV0_6>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EstimatableUserOperationV0_7 {
     pub sender: Address,
@@ -314,7 +330,7 @@ pub struct EstimatableUserOperationV0_7 {
     pub eip7702_auth: Option<Eip7702Authorization>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EstimatableUserOperationV0_6 {
     pub sender: Address,
@@ -330,7 +346,7 @@ pub struct EstimatableUserOperationV0_6 {
     pub signature: Option<HexData>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Eip7702Authorization {
     pub chain_id: Quantity,
@@ -343,7 +359,7 @@ pub struct Eip7702Authorization {
 
 pub type StateOverrideSet = BTreeMap<Address, StateOverride>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StateOverride {
     pub balance: Option<Quantity>,
@@ -359,8 +375,8 @@ pub struct UserOperationGasEstimate {
     pub pre_verification_gas: Quantity,
     pub verification_gas_limit: Quantity,
     pub call_gas_limit: Quantity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paymaster_verification_gas_limit: Option<Quantity>,
+    pub paymaster_verification_gas_limit: Quantity,
+    pub paymaster_post_op_gas_limit: Quantity,
 }
 
 #[derive(Debug, Serialize)]

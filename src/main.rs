@@ -12,13 +12,19 @@ use tokio::net::TcpListener;
 fn main() -> Result<(), AppError> {
     let config = Config::from_env()?;
     utils::logging::init(&config.logging)?;
+    if let Some(address) = config.settlement_recipient.as_deref() {
+        tracing::info!(vault_address = address, "settlement vault initialized");
+    }
     let runtime = utils::runtime::build(&config.runtime)?;
 
     runtime.block_on(run(config))
 }
 
 async fn run(config: Config) -> Result<(), AppError> {
-    let state = app::AppState::new(worker::JOB_NAMES);
+    let state = app::AppState::with_settlement_recipient(
+        worker::JOB_NAMES,
+        config.settlement_recipient.clone(),
+    );
     let app = app::router(&config.http, state.clone());
     let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(listen_addr = %config.listen_addr, "HTTP server listening");
