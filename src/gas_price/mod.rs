@@ -1,3 +1,4 @@
+mod cache;
 mod chains;
 mod manager;
 mod window;

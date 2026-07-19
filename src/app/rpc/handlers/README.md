@@ -42,6 +42,8 @@ The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it use
 
 The manager returns slow (100%), standard (110%), and fast (120%) tiers. `maxFeePerGas` and `maxPriorityFeePerGas` are scaled independently, while preserving `maxFeePerGas >= maxPriorityFeePerGas`.
 
+Successful gas-price quotes are cached for five seconds. The cache is isolated by `chainId` and caller-provided RPC identity, so callers with different RPC headers never share a quote. Concurrent cache misses for the same key are coalesced into one upstream calculation.
+
 Response:
 
 ```json
@@ -67,8 +69,8 @@ Response:
 
 RPC sources are tried in this order:
 
-1. Alchemy when `ALCHEMY_API_KEY` is set and the numeric EVM `chainId` is present in the Alchemy Chain Resource Directory registry. The registry includes all 80 networks currently listed at `https://www.alchemy.com/rpc`; non-EVM entries are retained for future use but are outside this ERC-4337 JSON-RPC API's scope.
-2. The HTTPS URL supplied by the `x-vela-rpc-url` request header.
+1. The HTTPS URL supplied by the `x-vela-rpc-url` request header.
+2. Alchemy when `ALCHEMY_API_KEY` is set and the numeric EVM `chainId` is present in the Alchemy Chain Resource Directory registry. The registry includes all 80 networks currently listed at `https://www.alchemy.com/rpc`; non-EVM entries are retained for future use but are outside this ERC-4337 JSON-RPC API's scope.
 3. HTTPS URLs from `https://ethereum-data.awesometools.dev/chains/eip155-{chainId}.json`, in the published order.
 
 Each upstream request has a one-second deadline. The full gas-price calculation, including `eth_feeHistory`, priority-fee fallback, legacy fallback, and every source switch, has a 2.8-second internal budget. This leaves time for the HTTP response to reach the caller within three seconds. If no source succeeds in that budget, the handler returns JSON-RPC error `-32000` with the message `gas price RPC request timed out` instead of waiting longer.
@@ -92,7 +94,7 @@ cargo run
 ALCHEMY_API_KEY="your-key"
 ```
 
-To use a caller-provided RPC after Alchemy fails, include an HTTPS URL in the request header:
+To use a caller-provided RPC before Alchemy and fallback sources, include an HTTPS URL in the request header:
 
 ```sh
 curl http://127.0.0.1:4567/1/rpc \

@@ -35,13 +35,6 @@ pub async fn call(
 ) -> Result<RpcCallResult, ()> {
     let client = http_client();
 
-    if let Some(url) = alchemy_rpc_url(chain_id)
-        && let Some(result) =
-            first_result(client, chain_id, "alchemy", &[url], method, &params).await
-    {
-        return Ok(result);
-    }
-
     if let Some(url) = user_rpc_url.and_then(parse_user_rpc_url) {
         if let Some(result) =
             first_result(client, chain_id, "request_header", &[url], method, &params).await
@@ -50,6 +43,13 @@ pub async fn call(
         }
     } else if user_rpc_url.is_some() {
         tracing::warn!("ignored invalid user RPC URL header");
+    }
+
+    if let Some(url) = alchemy_rpc_url(chain_id)
+        && let Some(result) =
+            first_result(client, chain_id, "alchemy", &[url], method, &params).await
+    {
+        return Ok(result);
     }
 
     let fallback_urls = match fetch_fallback_rpc_urls(client, chain_id).await {

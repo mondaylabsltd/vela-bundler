@@ -8,19 +8,25 @@ use std::{
 use axum::http::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::utils::rpc;
 
-use super::chains::{ArbitrumManager, CitreaManager, MantleManager, OptimismManager};
+use super::{
+    cache::{CacheRequest, GasPriceCache},
+    chains::{ArbitrumManager, CitreaManager, MantleManager, OptimismManager},
+};
 
 const FEE_HISTORY_BLOCK_COUNT: &str = "0x5";
 const FEE_HISTORY_PERCENTILES: [u8; 3] = [25, 50, 75];
 const DEFAULT_HISTORY_SIZE: usize = 32;
 const RESPONSE_BUDGET: Duration = Duration::from_millis(2_800);
+const PRICE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct GasPriceManager {
     policy: GasPricePolicy,
+    cache: GasPriceCache,
     #[expect(
         dead_code,
         reason = "Arbitrum fee tracking is consumed by future pre-verification gas calculators."
@@ -71,7 +77,7 @@ pub struct GasPriceQuote {
     pub rpc_domain: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GasPriceError {
     NoPriceAvailable,
     InvalidUpstreamResponse,
@@ -118,6 +124,7 @@ impl GasPriceManager {
     pub fn new(policy: GasPricePolicy, history_size: usize) -> Self {
         Self {
             policy,
+            cache: GasPriceCache::new(PRICE_CACHE_TTL),
             arbitrum: ArbitrumManager::new(history_size),
             citrea: CitreaManager::new(history_size),
             mantle: MantleManager::new(history_size),
@@ -126,6 +133,27 @@ impl GasPriceManager {
     }
 
     pub async fn user_operation_gas_prices(
+        &self,
+        chain_id: u64,
+        user_rpc_url: Option<&HeaderValue>,
+    ) -> Result<GasPriceQuote, GasPriceError> {
+        match self.cache.request(chain_id, user_rpc_url) {
+            CacheRequest::Hit(quote) => {
+                tracing::debug!(chain_id, rpc_domain = %quote.rpc_domain, "gas price cache hit");
+                Ok(quote)
+            }
+            CacheRequest::Follower(waiter) => wait_for_cached_quote(waiter).await,
+            CacheRequest::Leader(leader) => {
+                let result = self
+                    .fetch_user_operation_gas_prices(chain_id, user_rpc_url)
+                    .await;
+                leader.complete(result.clone());
+                result
+            }
+        }
+    }
+
+    async fn fetch_user_operation_gas_prices(
         &self,
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
@@ -265,6 +293,15 @@ impl GasPriceManager {
             max_priority_fee_per_gas,
         })
     }
+}
+
+async fn wait_for_cached_quote(
+    waiter: oneshot::Receiver<Result<GasPriceQuote, GasPriceError>>,
+) -> Result<GasPriceQuote, GasPriceError> {
+    tokio::time::timeout(RESPONSE_BUDGET, waiter)
+        .await
+        .map_err(|_| GasPriceError::ResponseDeadlineExceeded)?
+        .unwrap_or(Err(GasPriceError::NoPriceAvailable))
 }
 
 async fn with_response_budget<T>(
