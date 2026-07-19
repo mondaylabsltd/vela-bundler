@@ -211,6 +211,10 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
+          # docker/build-push-action uploads Buildx build-record artifacts as well. They are
+          # neither release assets nor reliably extractable by download-artifact, so select only
+          # the six archives emitted by the build matrix.
+          pattern: vela-relay-${{ github.ref_name }}-*
           path: dist
           merge-multiple: true
 
