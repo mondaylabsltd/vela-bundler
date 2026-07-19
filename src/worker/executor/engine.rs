@@ -62,6 +62,7 @@ const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
 const USD_PRICE_SCALE: u64 = 100_000_000;
 const NATIVE_TOP_UP_USD_CAP: u64 = 2;
+const NATIVE_TOP_UP_DAILY_USD_CAP: u64 = 20;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -125,6 +126,12 @@ struct TempoTransactionContext {
     base_fee_atto: U256,
     nonce: u64,
     relayer_path_usd_balance: U256,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeTopUpLimits {
+    per_transfer: U256,
+    daily: U256,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -997,8 +1004,8 @@ impl ExecutorEngine {
         let prefund = U256::from(gas_limit)
             .checked_mul(U256::from(context.max_fee_per_gas))
             .ok_or_else(|| ExecutorItemError("bundle prefund overflow".into()))?;
-        let top_up_max = self
-            .native_top_up_cap(chain_id, native_symbol, chain_assets.native_decimals)
+        let top_up_limits = self
+            .native_top_up_limits(chain_id, native_symbol, chain_assets.native_decimals)
             .await;
         if self
             .ensure_relayer_funded(
@@ -1008,7 +1015,8 @@ impl ExecutorEngine {
                 prefund,
                 context.max_fee_per_gas,
                 context.max_priority_fee_per_gas,
-                top_up_max,
+                top_up_limits.per_transfer,
+                top_up_limits.daily,
             )
             .await?
             == FundingReadiness::Pending
@@ -1728,20 +1736,26 @@ impl ExecutorEngine {
         Ok(price)
     }
 
-    /// Cap one native-token relayer top-up at 2 USD when Binance has a fresh quote. A network
-    /// with no usable market price intentionally keeps the operator's static wei-denominated
-    /// safety cap instead of blocking execution on the price service.
-    async fn native_top_up_cap(
+    /// Applies value-based safety limits when a native USD quote is available. A low-priced
+    /// asset (for example MATIC) must not be constrained by a nominal one-token daily ceiling:
+    /// the daily allowance is ten 2-USD transfers. Networks without a price retain the explicit
+    /// native-token hard limits supplied by the operator.
+    async fn native_top_up_limits(
         &self,
         chain_id: u64,
         native_symbol: &str,
         native_decimals: u32,
-    ) -> U256 {
-        let fallback = U256::from(self.config.top_up_max_wei);
+    ) -> NativeTopUpLimits {
+        let fallback = NativeTopUpLimits {
+            per_transfer: U256::from(self.config.top_up_max_wei),
+            daily: U256::from(self.config.top_up_daily_max_wei),
+        };
         let Ok(price) = self.market_usd_price(chain_id, native_symbol).await else {
             return fallback;
         };
-        let Some(cap) = native_amount_for_usd_cap(native_decimals, price) else {
+        let Some(per_transfer) =
+            native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_USD_CAP)
+        else {
             tracing::warn!(
                 native_symbol,
                 native_decimals,
@@ -1749,13 +1763,27 @@ impl ExecutorEngine {
             );
             return fallback;
         };
+        let Some(daily) =
+            native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_DAILY_USD_CAP)
+        else {
+            tracing::warn!(
+                native_symbol,
+                native_decimals,
+                "could not convert USD relayer top-up daily cap to native units; using static cap"
+            );
+            return fallback;
+        };
         tracing::debug!(
             native_symbol,
             native_decimals,
-            native_units = %cap,
-            "using USD-denominated relayer top-up cap"
+            per_transfer_native_units = %per_transfer,
+            daily_native_units = %daily,
+            "using USD-denominated relayer top-up limits"
         );
-        cap
+        NativeTopUpLimits {
+            per_transfer,
+            daily,
+        }
     }
 
     async fn resume_bundle_intent(
@@ -2410,6 +2438,7 @@ impl ExecutorEngine {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         top_up_max: U256,
+        top_up_daily_max: U256,
     ) -> Result<FundingReadiness, ExecutorItemError> {
         let minimum = required_prefund.max(U256::from(self.config.relayer_float_min_wei));
         if relayer_balance >= minimum {
@@ -2438,6 +2467,7 @@ impl ExecutorEngine {
                     max_fee_per_gas,
                     max_priority_fee_per_gas,
                     top_up_max,
+                    top_up_daily_max,
                     &scope,
                     &token,
                 ),
@@ -2459,6 +2489,7 @@ impl ExecutorEngine {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         top_up_max: U256,
+        top_up_daily_max: U256,
         lease_scope: &str,
         lease_token: &str,
     ) -> Result<FundingReadiness, ExecutorItemError> {
@@ -2553,7 +2584,9 @@ impl ExecutorEngine {
             .store
             .reserve_and_save_prepared_funding_intent(
                 &intent,
-                self.config.top_up_daily_max_wei,
+                u128::try_from(top_up_daily_max).map_err(|_| {
+                    ExecutorItemError("native relayer top-up daily cap exceeds uint128".into())
+                })?,
                 TOP_UP_BUDGET_TTL,
             )
             .await
@@ -2617,10 +2650,17 @@ impl ExecutorEngine {
                 "funding transaction receipt has invalid status".into(),
             ));
         };
-        self.store
-            .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
-            .await
-            .map_err(store_item_error)?;
+        if success {
+            self.store
+                .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
+                .await
+                .map_err(store_item_error)?;
+        } else {
+            self.store
+                .clear_and_refund_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
+                .await
+                .map_err(store_item_error)?;
+        }
         self.broadcast_seen
             .lock()
             .await
@@ -3052,15 +3092,19 @@ fn parse_market_usd_price(value: &str) -> Option<U256> {
     (!price.is_zero()).then_some(price)
 }
 
-/// Convert the fixed two-dollar relayer funding cap into a chain's smallest native unit,
+/// Convert a USD-denominated relayer funding cap into a chain's smallest native unit,
 /// rounding up so a positive USD cap never becomes zero through integer division.
-fn native_amount_for_usd_cap(native_decimals: u32, native_usd_price: U256) -> Option<U256> {
+fn native_amount_for_usd_cap(
+    native_decimals: u32,
+    native_usd_price: U256,
+    usd_cap: u64,
+) -> Option<U256> {
     if native_usd_price.is_zero() || native_decimals > 38 {
         return None;
     }
     let native_scale =
         (0..native_decimals).try_fold(U256::ONE, |value, _| value.checked_mul(U256::from(10u8)))?;
-    let numerator = U256::from(NATIVE_TOP_UP_USD_CAP)
+    let numerator = U256::from(usd_cap)
         .checked_mul(U256::from(USD_PRICE_SCALE))?
         .checked_mul(native_scale)?;
     let quotient = numerator / native_usd_price;
@@ -3127,9 +3171,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AdmissionAction, ExecutorItemError, RpcError, admission_action, marked_tempo_cost,
-        native_amount_for_usd_cap, parse_hex_bytes, parse_market_usd_price, parse_quantity,
-        response_quantity, tempo_cost_in_path_usd, validate_raw_transaction,
+        AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
+        marked_tempo_cost, native_amount_for_usd_cap, parse_hex_bytes, parse_market_usd_price,
+        parse_quantity, response_quantity, tempo_cost_in_path_usd, validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3162,21 +3206,27 @@ mod tests {
     fn converts_two_usd_top_up_cap_to_native_units_with_ceiling_rounding() {
         // MATIC at $0.20: $2 is exactly 10 MATIC.
         assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(20_000_000u64)),
+            native_amount_for_usd_cap(18, U256::from(20_000_000u64), NATIVE_TOP_UP_USD_CAP),
             Some(U256::from(10_000_000_000_000_000_000u128))
         );
         // ETH at $2,500: $2 is 0.0008 ETH.
         assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(250_000_000_000u64)),
+            native_amount_for_usd_cap(18, U256::from(250_000_000_000u64), NATIVE_TOP_UP_USD_CAP,),
             Some(U256::from(800_000_000_000_000u64))
         );
         // A non-integral conversion is rounded toward the relayer.
         assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(300_000_000u64)),
+            native_amount_for_usd_cap(18, U256::from(300_000_000u64), NATIVE_TOP_UP_USD_CAP),
             Some(U256::from(666_666_666_666_666_667u64))
         );
-        assert_eq!(native_amount_for_usd_cap(18, U256::ZERO), None);
-        assert_eq!(native_amount_for_usd_cap(39, U256::ONE), None);
+        assert_eq!(
+            native_amount_for_usd_cap(18, U256::ZERO, NATIVE_TOP_UP_USD_CAP),
+            None
+        );
+        assert_eq!(
+            native_amount_for_usd_cap(39, U256::ONE, NATIVE_TOP_UP_USD_CAP),
+            None
+        );
     }
 
     #[test]

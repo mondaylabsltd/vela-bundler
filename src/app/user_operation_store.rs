@@ -160,6 +160,68 @@ end
 return redis.call('DEL', KEYS[1])
 "#;
 
+// A confirmed revert did not transfer the reserved relayer float. Return that amount to the
+// rolling budget atomically with removing the outbox record, so a failed funding transaction
+// cannot leave a chain artificially blocked for the rest of the 24-hour window.
+const CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT: &str = r#"
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  return 0
+end
+local intent = cjson.decode(raw)
+if intent['transactionHash'] ~= ARGV[1] then
+  return 0
+end
+
+local function normalize_decimal(value)
+  local normalized = string.gsub(value, '^0+', '')
+  if normalized == '' then
+    return '0'
+  end
+  return normalized
+end
+
+local function decimal_subtract(left, right)
+  left = normalize_decimal(left)
+  right = normalize_decimal(right)
+  if string.len(left) < string.len(right) or (string.len(left) == string.len(right) and left < right) then
+    return '0'
+  end
+  local result = {}
+  local left_index = string.len(left)
+  local right_index = string.len(right)
+  local borrow = 0
+  while left_index > 0 do
+    local left_digit = string.byte(left, left_index) - string.byte('0') - borrow
+    local right_digit = 0
+    if right_index > 0 then
+      right_digit = string.byte(right, right_index) - string.byte('0')
+    end
+    if left_digit < right_digit then
+      left_digit = left_digit + 10
+      borrow = 1
+    else
+      borrow = 0
+    end
+    table.insert(result, 1, string.char(string.byte('0') + left_digit - right_digit))
+    left_index = left_index - 1
+    right_index = right_index - 1
+  end
+  return normalize_decimal(table.concat(result))
+end
+
+local current = redis.call('GET', KEYS[2])
+if current then
+  local remaining = decimal_subtract(current, tostring(intent['amountWei']))
+  if remaining == '0' then
+    redis.call('DEL', KEYS[2])
+  else
+    redis.call('SET', KEYS[2], remaining, 'KEEPTTL')
+  end
+end
+return redis.call('DEL', KEYS[1])
+"#;
+
 const RESERVE_AND_SAVE_FUNDING_SCRIPT: &str = r#"
 local function normalize_decimal(value)
   local normalized = string.gsub(value, '^0+', '')
@@ -1054,6 +1116,24 @@ impl UserOperationStatusStore {
         Ok(cleared == 1)
     }
 
+    /// Removes a funding outbox that is proven to have reverted and returns its transfer amount
+    /// to the chain's rolling budget in the same Redis transaction.
+    pub async fn clear_and_refund_prepared_funding_intent(
+        &self,
+        chain_id: u64,
+        transaction_hash: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT)
+            .arg(2)
+            .arg(prepared_funding_key(chain_id))
+            .arg(top_up_budget_key(chain_id))
+            .arg(transaction_hash);
+        let cleared: i64 = self.query(command).await?;
+        Ok(cleared == 1)
+    }
+
     /// Durably records a malformed Iggy message. The queue position is the idempotency key, so a
     /// redelivery returns `false` without duplicating the dead letter.
     #[allow(
@@ -1538,19 +1618,20 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CLAIM_DELAYED_OPERATIONS_SCRIPT, CLEAR_PREPARED_BUNDLE_SCRIPT,
-        CLEAR_PREPARED_FUNDING_SCRIPT, COMPLETE_DELAYED_OPERATION_SCRIPT,
-        DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation, LIST_PREPARED_BUNDLES_SCRIPT,
-        MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT, PREPARED_BUNDLE_INDEX_KEY,
-        PreparedBundleIntent, PreparedFundingIntent, RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT,
-        RESERVE_AND_SAVE_FUNDING_SCRIPT, RETRY_DELAYED_OPERATION_SCRIPT,
-        SAVE_DELAYED_OPERATION_SCRIPT, SAVE_PREPARED_BUNDLE_SCRIPT, UserOperationEvent,
-        UserOperationStatusKind, canonical_delayed_payload, delayed_operation_identifier,
-        deserialize_claimed_delayed_operations, deserialize_prepared_bundle_intents,
-        deserialize_stored_operations, duration_millis, lease_key, malformed_dead_letter,
-        malformed_dead_letter_key, partition_bundle_events, prepared_bundle_key,
-        prepared_funding_key, top_up_budget_key, transition_is_allowed, truncate_diagnostic,
-        validate_lease_identity, validate_prepared_bundle_intent, validate_prepared_funding_intent,
+        CLAIM_DELAYED_OPERATIONS_SCRIPT, CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT,
+        CLEAR_PREPARED_BUNDLE_SCRIPT, CLEAR_PREPARED_FUNDING_SCRIPT,
+        COMPLETE_DELAYED_OPERATION_SCRIPT, DELAYED_OPERATION_SCHEDULE_KEY, DelayedUserOperation,
+        LIST_PREPARED_BUNDLES_SCRIPT, MARK_BUNDLE_SUBMITTED_SCRIPT, PATCH_RECORD_SCRIPT,
+        PREPARED_BUNDLE_INDEX_KEY, PreparedBundleIntent, PreparedFundingIntent,
+        RELEASE_LEASE_SCRIPT, RENEW_LEASE_SCRIPT, RESERVE_AND_SAVE_FUNDING_SCRIPT,
+        RETRY_DELAYED_OPERATION_SCRIPT, SAVE_DELAYED_OPERATION_SCRIPT, SAVE_PREPARED_BUNDLE_SCRIPT,
+        UserOperationEvent, UserOperationStatusKind, canonical_delayed_payload,
+        delayed_operation_identifier, deserialize_claimed_delayed_operations,
+        deserialize_prepared_bundle_intents, deserialize_stored_operations, duration_millis,
+        lease_key, malformed_dead_letter, malformed_dead_letter_key, partition_bundle_events,
+        prepared_bundle_key, prepared_funding_key, top_up_budget_key, transition_is_allowed,
+        truncate_diagnostic, validate_lease_identity, validate_prepared_bundle_intent,
+        validate_prepared_funding_intent,
     };
 
     #[test]
@@ -1776,6 +1857,12 @@ mod tests {
             intent
         );
         assert!(CLEAR_PREPARED_FUNDING_SCRIPT.contains("intent['transactionHash'] ~= ARGV[1]"));
+        assert!(
+            CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT
+                .contains("intent['transactionHash'] ~= ARGV[1]")
+        );
+        assert!(CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT.contains("'KEEPTTL'"));
+        assert!(!CLEAR_AND_REFUND_PREPARED_FUNDING_SCRIPT.contains("tonumber"));
         assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("local function decimal_add"));
         assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("decimal_greater(total, ARGV[2])"));
         assert!(RESERVE_AND_SAVE_FUNDING_SCRIPT.contains("'SET', KEYS[1], ARGV[4], 'NX'"));
