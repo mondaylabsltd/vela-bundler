@@ -1,46 +1,68 @@
-# Minimal CI gate — mirrors the local checks documented in
-# docs/project-takeover/02-local-development.md.
-#
-# No deployment coupling: the Worker deploys manually (`npx wrangler deploy` — see
-# docs/project-takeover/05-deployment-runbook.md). CI green ≠ deployed; these jobs are
-# the merge gate only.
-#
-# Deliberately NOT included:
-#   - tests/integration_test.ts: self-skips (it.skipIf) when no bundler is listening on
-#     localhost — it never runs here, only against a live stack.
-#   - scripts/run-spec-tests.sh: boots a live `wrangler dev` + Anvil; run locally per the
-#     runbook.
 name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Tests (vitest — node + workers projects)
-        run: npm test
+permissions:
+  contents: read
 
-  contracts:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: evm_contracts
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-      - name: Forge tests
-        run: forge test
+          components: rustfmt, clippy
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked
+
+  test:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: Windows x86_64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - run: cargo test --locked

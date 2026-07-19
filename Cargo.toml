@@ -1,0 +1,26 @@
+[package]
+name = "vela-relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "2.2.0", features = ["essentials"] }
+axum = "0.8.9"
+dotenvy = "0.15"
+hex = "0.4"
+hkdf = "0.12"
+iggy = "0.10.3-edge.1"
+k256 = "0.13"
+num-bigint = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+redis = { version = "0.32", features = ["tokio-comp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "test-util"] }
+tokio-util = "0.7"
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors", "limit", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
