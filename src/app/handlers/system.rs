@@ -1,5 +1,7 @@
-use axum::{Json, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
+
+use crate::app::AppState;
 
 #[derive(Serialize)]
 pub struct ServiceInfo {
@@ -24,8 +26,12 @@ pub async fn liveness() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-pub async fn readiness() -> StatusCode {
-    StatusCode::NO_CONTENT
+pub async fn readiness(State(state): State<AppState>) -> StatusCode {
+    if state.readiness().is_ready() {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 pub async fn version() -> Json<VersionInfo> {
