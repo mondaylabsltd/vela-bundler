@@ -8,7 +8,7 @@
 //! cargo run --bin deploy-simulations -- --chain-id 143 --broadcast
 //! ```
 
-use std::{env, error::Error, fs, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, error::Error, str::FromStr, time::Duration};
 
 use alloy::{
     consensus::{SignableTransaction, TxEip1559, TxEnvelope},
@@ -27,9 +27,11 @@ mod vault;
 const MONAD_CHAIN_ID: u64 = 143;
 const MONAD_RPC_URL: &str = "https://rpc.monad.xyz";
 const DETERMINISTIC_DEPLOYER: &str = "0x4e59b44847b379578588920ca78fbf26c0b4956c";
-const PIMLICO_ARTIFACT: &str =
-    "/Users/shelchin/production/alto/contracts/out/PimlicoSimulations.sol/PimlicoSimulations.json";
-const ENTRY_POINT_V07_ARTIFACT: &str = "/Users/shelchin/production/alto/contracts/out/EntryPointSimulations.sol/EntryPointSimulations07.json";
+const PIMLICO_ARTIFACT_NAME: &str = "PimlicoSimulations";
+const ENTRY_POINT_V07_ARTIFACT_NAME: &str = "EntryPointSimulations07";
+const PIMLICO_ARTIFACT_JSON: &str = include_str!("../../contracts/alto/PimlicoSimulations.json");
+const ENTRY_POINT_V07_ARTIFACT_JSON: &str =
+    include_str!("../../contracts/alto/EntryPointSimulations07.json");
 
 struct Args {
     chain_id: u64,
@@ -39,7 +41,7 @@ struct Args {
 
 struct ContractArtifact {
     name: &'static str,
-    path: &'static str,
+    json: &'static str,
 }
 
 struct SignedTransaction {
@@ -120,19 +122,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let artifacts = [
         ContractArtifact {
-            name: "PimlicoSimulations",
-            path: PIMLICO_ARTIFACT,
+            name: PIMLICO_ARTIFACT_NAME,
+            json: PIMLICO_ARTIFACT_JSON,
         },
         ContractArtifact {
-            name: "EntryPointSimulations07",
-            path: ENTRY_POINT_V07_ARTIFACT,
+            name: ENTRY_POINT_V07_ARTIFACT_NAME,
+            json: ENTRY_POINT_V07_ARTIFACT_JSON,
         },
     ];
 
     let mut plans = Vec::new();
     let mut total_max_cost = 0_u128;
     for artifact in artifacts {
-        let init_code = read_init_code(artifact.path)?;
+        let init_code = read_init_code(artifact.name, artifact.json)?;
         let contract_address = create2_address(deployer, salt, &init_code);
         let deployed_code: String = rpc(
             &client,
@@ -296,12 +298,12 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     })
 }
 
-fn read_init_code(path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let artifact: Value = serde_json::from_str(&fs::read_to_string(PathBuf::from(path))?)?;
+fn read_init_code(name: &str, json: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let artifact: Value = serde_json::from_str(json)?;
     let bytecode = artifact
         .pointer("/bytecode/object")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("artifact {path} has no bytecode.object"))?;
+        .ok_or_else(|| format!("artifact {name} has no bytecode.object"))?;
     let hex_code = bytecode.strip_prefix("0x").unwrap_or(bytecode);
     Ok(hex::decode(hex_code)?)
 }
