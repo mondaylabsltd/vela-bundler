@@ -231,24 +231,24 @@ async fn validate_in_band_submission(
         .settlement_recipient()
         .ok_or_else(RpcError::backend_unavailable)?;
     if tempo::is_tempo_chain(chain_id) {
+        // `parse_reimbursement` normalizes token-map keys to lowercase while Alloy renders this
+        // all-numeric address with an EIP-55 uppercase character. Use one canonical form for
+        // both the allowlist and lookup so a valid pathUSD payment is not read as zero.
+        let path_usd = canonical_tempo_path_usd();
         let fee_token = match user_operation {
             UserOperation::V0_7(operation) => operation.fee_token.as_deref(),
             UserOperation::V0_6(_) => None,
         };
-        if fee_token.is_some_and(|token| !token.eq_ignore_ascii_case(&tempo::PATH_USD.to_string()))
-        {
+        if fee_token.is_some_and(|token| !token.eq_ignore_ascii_case(&path_usd)) {
             return Err(RpcError::invalid_params(
                 "Tempo currently accepts pathUSD as the feeToken",
             ));
         }
-        let reimbursement = in_band_settlement::parse_reimbursement(
-            call_data,
-            recipient,
-            [tempo::PATH_USD.to_string()],
-        );
+        let reimbursement =
+            in_band_settlement::parse_reimbursement(call_data, recipient, [path_usd.clone()]);
         let paid = reimbursement
             .stablecoins
-            .get(&tempo::PATH_USD.to_string())
+            .get(&path_usd)
             .copied()
             .unwrap_or_default();
         let minimum = 10u128.pow(tempo::PATH_USD_DECIMALS - 2);
@@ -268,6 +268,10 @@ async fn validate_in_band_submission(
     Err(RpcError::user_operation_rejected(
         "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin",
     ))
+}
+
+fn canonical_tempo_path_usd() -> String {
+    tempo::PATH_USD.to_string().to_ascii_lowercase()
 }
 
 async fn fallback_has_minimum_payment(
@@ -541,7 +545,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ExistingAdmissionAction, PreparedUserOperation, existing_admission_action, quantity,
+        ExistingAdmissionAction, PreparedUserOperation, canonical_tempo_path_usd,
+        existing_admission_action, quantity,
     };
     use crate::app::{
         StoredUserOperation,
@@ -608,6 +613,14 @@ mod tests {
     fn validates_gas_quantities_and_zero_fee_forms() {
         assert_eq!(quantity("0x000", "maxFeePerGas").unwrap(), 0);
         assert!(quantity("0x", "maxFeePerGas").is_err());
+    }
+
+    #[test]
+    fn canonicalizes_path_usd_for_reimbursement_lookup() {
+        assert_eq!(
+            canonical_tempo_path_usd(),
+            "0x20c0000000000000000000000000000000000000"
+        );
     }
 
     #[test]
