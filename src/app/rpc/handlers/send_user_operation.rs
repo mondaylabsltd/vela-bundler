@@ -7,7 +7,7 @@ use crate::{
         handlers::{in_band_settlement, supported_entry_points},
         types::{RpcError, RpcResponse, SendUserOperationParams, UserOperation, UserOperationV0_7},
     },
-    app::{AppState, state::PendingUserOperationInsert},
+    app::{AppState, QueuedUserOperation},
     utils::rpc,
 };
 
@@ -45,15 +45,56 @@ async fn accept(
 
     let entry_point_address = address(&entry_point, "entryPoint")?;
     let user_operation_hash = prepared.user_operation_hash(entry_point_address, chain_id);
-    let pending = state.pending_user_operations();
 
-    if pending.contains(&user_operation_hash) {
-        tracing::info!(
+    let status_store = state
+        .user_operation_status_store()
+        .ok_or_else(RpcError::user_operation_status_store_unavailable)?;
+    let queue = state
+        .user_operation_queue()
+        .ok_or_else(RpcError::user_operation_queue_unavailable)?;
+    let created = status_store
+        .create_queued(QueuedUserOperation {
+            user_operation_hash: user_operation_hash.clone(),
             chain_id,
-            user_operation_hash = %user_operation_hash,
-            "UserOperation already exists in the durable queue retry cache"
-        );
-        return Ok(user_operation_hash);
+            entry_point: entry_point.clone(),
+            user_operation: prepared.operation.clone(),
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                chain_id,
+                user_operation_hash = %user_operation_hash,
+                %error,
+                "could not create queued UserOperation status in Redis"
+            );
+            RpcError::user_operation_status_store_unavailable()
+        })?;
+
+    if !created {
+        let existing = status_store
+            .get(&user_operation_hash)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    chain_id,
+                    user_operation_hash = %user_operation_hash,
+                    %error,
+                    "could not read existing UserOperation status from Redis"
+                );
+                RpcError::user_operation_status_store_unavailable()
+            })?;
+        if existing.is_some_and(|operation| operation.admitted) {
+            tracing::info!(
+                chain_id,
+                user_operation_hash = %user_operation_hash,
+                "UserOperation already exists in the durable queue"
+            );
+            return Ok(user_operation_hash);
+        }
+
+        // A concurrent request owns the Redis-first admission record but has not yet completed
+        // the Iggy append. Do not report success until it has done so.
+        return Err(RpcError::user_operation_queue_unavailable());
     }
 
     let entry = json!({
@@ -64,34 +105,51 @@ async fn accept(
         "userOperation": prepared.operation,
     });
 
-    let queue = state
-        .user_operation_queue()
-        .ok_or_else(RpcError::user_operation_queue_unavailable)?;
-    queue.enqueue(chain_id, &entry).await.map_err(|error| {
+    if let Err(error) = queue.enqueue(chain_id, &entry).await {
         tracing::warn!(
             chain_id,
             user_operation_hash = %user_operation_hash,
             %error,
             "could not append UserOperation to Iggy"
         );
-        RpcError::user_operation_queue_unavailable()
-    })?;
-
-    match pending.insert(user_operation_hash.clone()) {
-        PendingUserOperationInsert::Inserted => tracing::info!(
-            chain_id,
-            entry_point = %entry_point,
-            sender = %prepared.sender_hex(),
-            user_operation_hash = %user_operation_hash,
-            settlement = "in_band",
-            "UserOperation accepted into the durable queue"
-        ),
-        PendingUserOperationInsert::AlreadyPresent => tracing::info!(
-            chain_id,
-            user_operation_hash = %user_operation_hash,
-            "UserOperation already exists in the durable queue retry cache"
-        ),
+        if let Err(rollback_error) = status_store
+            .delete_if_unadmitted(&user_operation_hash)
+            .await
+        {
+            tracing::error!(
+                chain_id,
+                user_operation_hash = %user_operation_hash,
+                %rollback_error,
+                "could not roll back unqueued UserOperation status from Redis"
+            );
+        }
+        return Err(RpcError::user_operation_queue_unavailable());
     }
+
+    if !status_store
+        .mark_admitted(&user_operation_hash)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                chain_id,
+                user_operation_hash = %user_operation_hash,
+                %error,
+                "Iggy accepted UserOperation but Redis could not finalize admission"
+            );
+            RpcError::user_operation_status_store_unavailable()
+        })?
+    {
+        return Err(RpcError::user_operation_status_store_unavailable());
+    }
+
+    tracing::info!(
+        chain_id,
+        entry_point = %entry_point,
+        sender = %prepared.sender_hex(),
+        user_operation_hash = %user_operation_hash,
+        settlement = "in_band",
+        "UserOperation accepted into Redis and the durable Iggy queue"
+    );
 
     Ok(user_operation_hash)
 }

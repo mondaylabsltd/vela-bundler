@@ -269,8 +269,10 @@ The reimbursement is decoded from the signed calls, not from a wallet-supplied a
 transfer-shaped payload does not count unless it is actually nested under the trusted Safe
 MultiSend delegatecall.
 
-After admission, the relay appends the following envelope to Iggy and only then returns the
-`userOpHash`. It does not execute or submit an outer transaction in the HTTP request path.
+After admission, the relay first creates a Redis record with `status: "queued"` and a one-hour
+TTL, then appends the following envelope to Iggy. It returns the `userOpHash` only after both
+writes are acknowledged; an Iggy failure removes the still-unadmitted Redis record. It does not
+execute or submit an outer transaction in the HTTP request path.
 
 ```json
 {
@@ -300,19 +302,19 @@ for chain_id in 1 10 42161; do
 done
 ```
 
-For controlled automatic creation, configure a second, separately privileged Iggy identity and
-an explicit chain allowlist. On the first failed write for an allowlisted chain, the relay creates
-`chain-{chainId}` and its `default` topic (one partition, no compression, 14-day expiry), then
-retries the write once. It never creates a stream for a chain that is not allowlisted:
+For automatic creation on any chain ID, configure a second, separately privileged Iggy identity.
+On the first failed write for a chain, the relay creates `chain-{chainId}` and its `default` topic
+(one partition, no compression, 14-day expiry), then retries the write once:
 
 ```sh
 VELA_RELAY_IGGY_PROVISIONER_URL='iggy+tcp://vela-relay-provisioner:<password>@127.0.0.1:5100'
-VELA_RELAY_IGGY_AUTO_CREATE_CHAIN_IDS='1,10,42161'
 ```
 
 Use a distinct production provisioner identity with only stream/topic read-and-manage permissions.
 Keep `VELA_RELAY_IGGY_URL` on the low-privilege producer identity. For local development with the
-root account, both URLs may temporarily be the same.
+root account, both URLs may temporarily be the same. Because arbitrary public chain IDs can now
+create topology, protect the public RPC endpoint with authentication, request rate limits, and an
+Iggy stream quota.
 
 The relay requires the following environment variables:
 
@@ -320,11 +322,13 @@ The relay requires the following environment variables:
 VELA_RELAY_IGGY_URL='iggy+tcp://vela-relay-producer:<password>@127.0.0.1:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true'
 VELA_RELAY_IGGY_TOPIC=default                 # optional; this is the default
 VELA_RELAY_IGGY_ENQUEUE_TIMEOUT_SECS=5        # optional; this is the default
+VELA_RELAY_REDIS_URL='redis://127.0.0.1:6379/0'
+VELA_RELAY_REDIS_COMMAND_TIMEOUT_SECS=2       # optional; this is the default
 ```
 
-`VELA_RELAY_IGGY_URL` is mandatory. If Iggy is unavailable, refuses the message, or does not
-acknowledge it before the enqueue timeout, `eth_sendUserOperation` returns JSON-RPC `-32000`
-instead of claiming success. The relay never falls back to an in-memory queue.
+`VELA_RELAY_IGGY_URL` and `VELA_RELAY_REDIS_URL` are mandatory. If either service is unavailable,
+refuses the write, or does not acknowledge before its timeout, `eth_sendUserOperation` returns
+JSON-RPC `-32000` instead of claiming success. The relay never falls back to in-memory state.
 
 Use a non-root `vela-relay-producer` account for the relay, with only `send_messages` permission;
 keep stream/topic management and consumer permissions in separate identities. Enable TCP TLS for
@@ -332,3 +336,26 @@ any non-loopback connection and keep queue credentials only in the runtime secre
 consumer should use an Iggy consumer group and commit its offset only after the corresponding
 bundle submission has completed durably. Delivery is at-least-once, so consumers must make
 `userOperationHash` idempotent.
+
+### UserOperation lookups and status
+
+`pimlico_getUserOperationStatus` reads the one-hour Redis record and returns one of
+`not_found`, `queued`, `not_submitted`, `submitted`, `rejected`, `included`, or `failed`, with a
+`transactionHash` when one is known. `eth_getUserOperationByHash` returns the original stored
+operation while its record remains available. `eth_getUserOperationReceipt` returns `null` until
+the operation is included and its receipt is known.
+
+Only `submitted` operations trigger `eth_getTransactionReceipt` against their chain RPC. Once a
+receipt appears, its result is written back to Redis: a reverted handleOps transaction marks the
+entire indexed bundle `failed`; a successful transaction defaults missing operations to `rejected`
+and marks successful `UserOperationEvent` entries `included`. This avoids chain RPC calls for
+queued, rejected, included, and failed UserOperations. Redis atomically coalesces submitted receipt
+checks to at most one chain RPC request per UserOp every five seconds, even when many clients poll
+the status endpoint concurrently.
+
+The Iggy handleOps consumer must call `mark_not_submitted` after an operation reaches its mempool,
+`UserOperationStatusStore::mark_bundle_submitted` with the transaction hash and every UserOp hash
+after transaction submission, and `mark_rejected` for a per-operation pre-submission simulation
+failure. A failed handleOps attempt before receipt availability must call `mark_handle_ops_failed`
+with every operation in that attempt. This relay repository does not contain that consumer or a
+handleOps signer; it only provides the durable queue and lifecycle store contract.

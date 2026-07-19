@@ -114,6 +114,45 @@ pub async fn handle(
             .await;
             response_with_rpc_domain(response_body, rpc_domain)
         }
+        RpcMethod::GetUserOperationStatus => {
+            let params =
+                match serde_json::from_value::<GetUserOperationStatusParams>(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return response(RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        ));
+                    }
+                };
+            response(handlers::user_operation_status::get_status(request.id, &state, params).await)
+        }
+        RpcMethod::GetUserOperationByHash => {
+            let params =
+                match serde_json::from_value::<GetUserOperationByHashParams>(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return response(RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        ));
+                    }
+                };
+            response(handlers::user_operation_status::get_by_hash(request.id, &state, params).await)
+        }
+        RpcMethod::GetUserOperationReceipt => {
+            let params =
+                match serde_json::from_value::<GetUserOperationReceiptParams>(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return response(RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        ));
+                    }
+                };
+            response(handlers::user_operation_status::get_receipt(request.id, &state, params).await)
+        }
         RpcMethod::SendUserOperation => {
             let params = match serde_json::from_value::<SendUserOperationParams>(request.params) {
                 Ok(params) => params,
@@ -135,10 +174,6 @@ pub async fn handle(
                 .await,
             )
         }
-        _ => response(RpcResponse::error(
-            request.id,
-            RpcError::backend_unavailable(),
-        )),
     }
 }
 
@@ -379,5 +414,17 @@ mod tests {
             .is_ok()
         );
         assert!(validate_call("vela_getInBandGasQuote", json!([])).is_err());
+    }
+
+    #[test]
+    fn accepts_the_standard_single_hash_user_operation_lookup_parameters() {
+        for method in [
+            "pimlico_getUserOperationStatus",
+            "eth_getUserOperationByHash",
+            "eth_getUserOperationReceipt",
+        ] {
+            assert!(validate_call(method, json!(["0xabc"])).is_ok(), "{method}");
+            assert!(validate_call(method, json!([])).is_err(), "{method}");
+        }
     }
 }

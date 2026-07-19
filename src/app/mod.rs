@@ -16,9 +16,13 @@ mod handlers;
 mod queue;
 mod rpc;
 pub mod state;
+mod user_operation_store;
 
 pub use queue::UserOperationQueue;
 pub use state::{AppState, Readiness};
+pub use user_operation_store::{
+    QueuedUserOperation, StoredUserOperation, UserOperationEvent, UserOperationStatusStore,
+};
 
 use crate::utils::config::HttpConfig;
 use handlers::system;

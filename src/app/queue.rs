@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fmt::{Display, Formatter},
     str::FromStr,
     sync::Arc,
@@ -30,7 +29,6 @@ pub struct UserOperationQueue {
 #[derive(Clone)]
 struct ChainTopologyProvisioner {
     client: Arc<IggyClient>,
-    allowed_chain_ids: Arc<HashSet<u64>>,
     provision_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -47,7 +45,8 @@ impl std::error::Error for UserOperationQueueError {}
 
 impl UserOperationQueue {
     /// Connects the message producer and, when configured, a separately privileged topology
-    /// provisioner. The latter can only create streams for allowlisted chain IDs.
+    /// provisioner. The latter creates a stream only when the first producer write for that
+    /// chain proves the stream or topic is absent.
     pub async fn connect(config: &IggyConfig) -> Result<Self, UserOperationQueueError> {
         let client = IggyClient::from_connection_string(&config.url)
             .map_err(|_| UserOperationQueueError("invalid Iggy connection configuration"))?;
@@ -66,9 +65,6 @@ impl UserOperationQueue {
                 })?;
                 Some(ChainTopologyProvisioner {
                     client: Arc::new(client),
-                    allowed_chain_ids: Arc::new(
-                        config.auto_create_chain_ids.iter().copied().collect(),
-                    ),
                     provision_lock: Arc::new(tokio::sync::Mutex::new(())),
                 })
             }
@@ -116,9 +112,6 @@ impl UserOperationQueue {
                 let Some(provisioner) = &self.topology_provisioner else {
                     return Err(send_error);
                 };
-                if !provisioner.allowed_chain_ids.contains(&chain_id) {
-                    return Err(send_error);
-                }
 
                 let topology_was_created = tokio::time::timeout(
                     self.enqueue_timeout,
@@ -311,7 +304,6 @@ mod tests {
         let queue = UserOperationQueue::connect(&IggyConfig {
             url: env::var("VELA_RELAY_IGGY_URL").expect("Iggy connection URL"),
             provisioner_url: None,
-            auto_create_chain_ids: Vec::new(),
             topic: "default".into(),
             enqueue_timeout: Duration::from_secs(5),
         })

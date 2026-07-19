@@ -116,6 +116,14 @@ impl RpcError {
         )
     }
 
+    pub fn user_operation_status_store_unavailable() -> Self {
+        Self::new(
+            -32000,
+            "UserOperation status store is temporarily unavailable",
+            None,
+        )
+    }
+
     pub fn user_operation_rejected(details: impl Into<String>) -> Self {
         Self::new(
             -32500,
@@ -278,13 +286,13 @@ pub struct EstimateUserOperationGasParams(
 );
 
 #[derive(Debug, Deserialize)]
-pub struct GetUserOperationReceiptParams(pub UserOperationHash);
+pub struct GetUserOperationReceiptParams(pub [UserOperationHash; 1]);
 
 #[derive(Debug, Deserialize)]
-pub struct GetUserOperationByHashParams(pub UserOperationHash);
+pub struct GetUserOperationByHashParams(pub [UserOperationHash; 1]);
 
 #[derive(Debug, Deserialize)]
-pub struct GetUserOperationStatusParams(pub UserOperationHash);
+pub struct GetUserOperationStatusParams(pub [UserOperationHash; 1]);
 
 #[derive(Debug, Deserialize)]
 pub struct GetInBandGasQuoteParams(pub [InBandGasQuoteRequest; 1]);
@@ -520,19 +528,19 @@ pub struct GasPriceTier {
     pub max_priority_fee_per_gas: Quantity,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserOperationStatusKind {
     NotFound,
+    Queued,
     NotSubmitted,
     Submitted,
     Rejected,
-    Reverted,
     Included,
     Failed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserOperationStatus {
     pub status: UserOperationStatusKind,
     #[serde(rename = "transactionHash")]

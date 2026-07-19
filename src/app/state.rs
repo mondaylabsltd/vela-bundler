@@ -1,13 +1,11 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
 use crate::gas_price::GasPriceManager;
 
-use super::queue::UserOperationQueue;
-
-const MAX_PENDING_USER_OPERATIONS: usize = 10_000;
+use super::{queue::UserOperationQueue, user_operation_store::UserOperationStatusStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -15,34 +13,13 @@ pub struct AppState {
     readiness: Readiness,
     settlement_recipient: Option<String>,
     user_operation_queue: Option<UserOperationQueue>,
-    pending_user_operations: PendingUserOperations,
+    user_operation_status_store: Option<UserOperationStatusStore>,
 }
 
 #[derive(Clone)]
 pub struct Readiness {
     expected_jobs: Arc<[&'static str]>,
     ready_jobs: Arc<Mutex<HashSet<&'static str>>>,
-}
-
-/// Process-local retry cache for UserOperations that have already reached the durable queue.
-///
-/// Iggy is the source of truth. This bounded cache saves a repeated same-process JSON-RPC retry
-/// from appending a duplicate message, but it must never be treated as durable storage.
-#[derive(Clone, Default)]
-pub struct PendingUserOperations {
-    operations: Arc<Mutex<PendingUserOperationsState>>,
-}
-
-#[derive(Default)]
-struct PendingUserOperationsState {
-    entries: HashSet<String>,
-    insertion_order: VecDeque<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PendingUserOperationInsert {
-    Inserted,
-    AlreadyPresent,
 }
 
 impl AppState {
@@ -58,12 +35,20 @@ impl AppState {
             },
             settlement_recipient,
             user_operation_queue: None,
-            pending_user_operations: PendingUserOperations::default(),
+            user_operation_status_store: None,
         }
     }
 
     pub fn with_user_operation_queue(mut self, user_operation_queue: UserOperationQueue) -> Self {
         self.user_operation_queue = Some(user_operation_queue);
+        self
+    }
+
+    pub fn with_user_operation_status_store(
+        mut self,
+        user_operation_status_store: UserOperationStatusStore,
+    ) -> Self {
+        self.user_operation_status_store = Some(user_operation_status_store);
         self
     }
 
@@ -83,39 +68,8 @@ impl AppState {
         self.user_operation_queue.clone()
     }
 
-    pub fn pending_user_operations(&self) -> PendingUserOperations {
-        self.pending_user_operations.clone()
-    }
-}
-
-impl PendingUserOperations {
-    pub fn insert(&self, user_operation_hash: String) -> PendingUserOperationInsert {
-        let mut operations = self.operations();
-
-        if operations.entries.contains(&user_operation_hash) {
-            return PendingUserOperationInsert::AlreadyPresent;
-        }
-        if operations.entries.len() >= MAX_PENDING_USER_OPERATIONS
-            && let Some(evicted) = operations.insertion_order.pop_front()
-        {
-            operations.entries.remove(&evicted);
-        }
-
-        operations
-            .insertion_order
-            .push_back(user_operation_hash.clone());
-        operations.entries.insert(user_operation_hash);
-        PendingUserOperationInsert::Inserted
-    }
-
-    pub fn contains(&self, user_operation_hash: &str) -> bool {
-        self.operations().entries.contains(user_operation_hash)
-    }
-
-    fn operations(&self) -> std::sync::MutexGuard<'_, PendingUserOperationsState> {
-        self.operations
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    pub fn user_operation_status_store(&self) -> Option<UserOperationStatusStore> {
+        self.user_operation_status_store.clone()
     }
 }
 
@@ -143,24 +97,5 @@ impl Readiness {
         self.ready_jobs
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AppState, PendingUserOperationInsert};
-
-    #[test]
-    fn retains_an_accepted_user_operation_and_makes_retries_idempotent() {
-        let pending = AppState::with_settlement_recipient(&[], None).pending_user_operations();
-
-        assert_eq!(
-            pending.insert("0xabc".into()),
-            PendingUserOperationInsert::Inserted
-        );
-        assert_eq!(
-            pending.insert("0xabc".into()),
-            PendingUserOperationInsert::AlreadyPresent
-        );
     }
 }
