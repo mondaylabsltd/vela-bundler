@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt::{Display, Formatter},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use redis::{FromRedisValue, aio::MultiplexedConnection};
@@ -357,13 +357,34 @@ pub struct StoredUserOperation {
     pub block_number: Option<String>,
     pub receipt: Option<Value>,
     pub event: Option<UserOperationEvent>,
+    /// The last non-durable executor outcome, retained while the operation is queued so callers
+    /// can distinguish a healthy queue from a retry that cannot currently make progress.
+    #[serde(default)]
+    pub last_executor_stage: Option<String>,
+    #[serde(default)]
+    pub last_executor_error: Option<String>,
+    #[serde(default)]
+    pub last_executor_attempt_at_ms: Option<u64>,
 }
 
 impl StoredUserOperation {
     pub fn rpc_status(&self) -> UserOperationStatus {
+        let is_pending = matches!(
+            self.status,
+            UserOperationStatusKind::Queued | UserOperationStatusKind::NotSubmitted
+        );
         UserOperationStatus {
             status: self.status,
             transaction_hash: self.transaction_hash.clone(),
+            last_executor_stage: is_pending
+                .then(|| self.last_executor_stage.clone())
+                .flatten(),
+            last_executor_error: is_pending
+                .then(|| self.last_executor_error.clone())
+                .flatten(),
+            last_executor_attempt_at_ms: is_pending
+                .then_some(self.last_executor_attempt_at_ms)
+                .flatten(),
         }
     }
 }
@@ -1103,6 +1124,32 @@ impl UserOperationStatusStore {
         .await
     }
 
+    /// Records a retryable executor outcome without changing the UserOperation lifecycle. The
+    /// diagnostic is intentionally bounded because trusted RPC error bodies are external input
+    /// and clients poll this record directly.
+    pub async fn record_executor_deferred(
+        &self,
+        user_operation_hash: &str,
+        stage: &str,
+        reason: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let attempted_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.patch(
+            user_operation_hash,
+            json!({
+                "lastExecutorStage": truncate_diagnostic(stage, 64),
+                "lastExecutorError": truncate_diagnostic(reason, 512),
+                "lastExecutorAttemptAtMs": attempted_at_ms,
+            }),
+        )
+        .await
+    }
+
     async fn bundle_hashes(
         &self,
         chain_id: u64,
@@ -1177,7 +1224,25 @@ fn queued_record(operation: QueuedUserOperation, admitted: bool) -> StoredUserOp
         block_number: None,
         receipt: None,
         event: None,
+        last_executor_stage: None,
+        last_executor_error: None,
+        last_executor_attempt_at_ms: None,
     }
+}
+
+fn truncate_diagnostic(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, character)| {
+            index.saturating_add(character.len_utf8()) <= limit.saturating_sub(3)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    format!("{}...", &value[..end])
 }
 
 fn status_key(user_operation_hash: &str) -> String {
@@ -1484,8 +1549,8 @@ mod tests {
         deserialize_claimed_delayed_operations, deserialize_prepared_bundle_intents,
         deserialize_stored_operations, duration_millis, lease_key, malformed_dead_letter,
         malformed_dead_letter_key, partition_bundle_events, prepared_bundle_key,
-        prepared_funding_key, top_up_budget_key, transition_is_allowed, validate_lease_identity,
-        validate_prepared_bundle_intent, validate_prepared_funding_intent,
+        prepared_funding_key, top_up_budget_key, transition_is_allowed, truncate_diagnostic,
+        validate_lease_identity, validate_prepared_bundle_intent, validate_prepared_funding_intent,
     };
 
     #[test]
@@ -1536,6 +1601,13 @@ mod tests {
         assert!(!PATCH_RECORD_SCRIPT.contains("included = {"));
         assert!(!PATCH_RECORD_SCRIPT.contains("rejected = {"));
         assert!(!PATCH_RECORD_SCRIPT.contains("failed = {"));
+    }
+
+    #[test]
+    fn executor_diagnostics_are_bounded_without_splitting_utf8() {
+        assert_eq!(truncate_diagnostic("retry", 8), "retry");
+        assert_eq!(truncate_diagnostic("abcdef", 5), "ab...");
+        assert_eq!(truncate_diagnostic("你好世界", 7), "你...");
     }
 
     #[test]

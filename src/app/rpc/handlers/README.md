@@ -403,9 +403,12 @@ required before the relayer submits `handleOps`.
 
 `pimlico_getUserOperationStatus` reads the one-hour Redis record and returns one of
 `not_found`, `queued`, `not_submitted`, `submitted`, `rejected`, `included`, or `failed`, with a
-`transactionHash` when one is known. `eth_getUserOperationByHash` returns the original stored
-operation while its record remains available. `eth_getUserOperationReceipt` returns `null` until
-the operation is included and its receipt is known.
+`transactionHash` when one is known. While an operation is queued, a retryable executor failure
+also returns `lastExecutorStage`, `lastExecutorError`, and `lastExecutorAttemptAtMs`; these show
+whether it is blocked in simulation, funding, broadcast, or another executor stage.
+`eth_getUserOperationByHash` returns the original stored operation while its record remains
+available. `eth_getUserOperationReceipt` returns `null` until the operation is included and its
+receipt is known.
 
 HTTP status and receipt methods always read Redis and never fan user polling out to EVM RPCs. The
 worker's centralized reconciler batches `eth_getTransactionReceipt` by trusted chain RPC. A

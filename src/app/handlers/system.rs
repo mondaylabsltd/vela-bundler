@@ -17,6 +17,7 @@ pub struct ServiceInfo {
 pub struct VersionInfo {
     name: &'static str,
     version: &'static str,
+    build: &'static str,
 }
 
 #[derive(Serialize)]
@@ -41,7 +42,7 @@ pub async fn health() -> ([(header::HeaderName, &'static str); 1], Json<HealthIn
     (
         [(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
         Json(HealthInfo {
-            service: "vela-bundler",
+            service: "vela-relay",
             runtime: "tokio",
             status: "ok",
         }),
@@ -60,5 +61,6 @@ pub async fn version() -> Json<VersionInfo> {
     Json(VersionInfo {
         name: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
+        build: env!("VELA_RELAY_BUILD_SHA"),
     })
 }

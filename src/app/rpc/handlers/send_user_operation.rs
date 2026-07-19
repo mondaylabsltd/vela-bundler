@@ -93,9 +93,14 @@ async fn accept(
                 tracing::error!(
                     chain_id,
                     user_operation_hash = %user_operation_hash,
+                    existing_chain_id = existing.chain_id,
+                    existing_entry_point = %existing.entry_point,
+                    submitted_entry_point = %entry_point,
                     "existing Redis admission does not match the submitted UserOperation"
                 );
-                return Err(RpcError::user_operation_status_store_unavailable());
+                return Err(RpcError::invalid_params(
+                    "this UserOperation hash is already queued with a different signed payload; resubmit the exact original operation or wait for the existing record to reach a durable outcome",
+                ));
             }
             ExistingAdmissionAction::AlreadyAdmitted => {
                 tracing::info!(
@@ -183,13 +188,14 @@ fn existing_admission_action(
     entry_point: &str,
     user_operation: &UserOperation,
 ) -> ExistingAdmissionAction {
-    let operation_matches = match (
-        serde_json::to_value(&existing.user_operation),
-        serde_json::to_value(user_operation),
-    ) {
-        (Ok(existing), Ok(submitted)) => existing == submitted,
-        _ => false,
-    };
+    // The EntryPoint hash is calculated from binary fields, whereas JSON-RPC permits harmless
+    // spelling changes such as `0x01` versus `0x1`. Compare the parsed field representation so
+    // an idempotent retry is not rejected merely because a wallet normalized hex differently.
+    // Signature is included even though ERC-4337 excludes it from userOpHash: it changes account
+    // validation and therefore must not silently replace an operation already in the queue.
+    let operation_matches = admission_fingerprint(&existing.user_operation)
+        .zip(admission_fingerprint(user_operation))
+        .is_some_and(|(existing, submitted)| existing == submitted);
     let matches = existing.chain_id == chain_id
         && existing.entry_point.eq_ignore_ascii_case(entry_point)
         && operation_matches;
@@ -198,6 +204,46 @@ fn existing_admission_action(
         (true, false) => ExistingAdmissionAction::RetryAppend,
         (false, _) => ExistingAdmissionAction::Conflict,
     }
+}
+
+#[derive(Eq, PartialEq)]
+struct AdmissionFingerprint {
+    sender: [u8; 20],
+    nonce: [u8; 32],
+    init_code: Vec<u8>,
+    call_data: Vec<u8>,
+    account_gas_limits: [u8; 32],
+    pre_verification_gas: [u8; 32],
+    gas_fees: [u8; 32],
+    paymaster_and_data: Vec<u8>,
+    signature: Vec<u8>,
+    fee_token: Option<[u8; 20]>,
+}
+
+fn admission_fingerprint(operation: &UserOperation) -> Option<AdmissionFingerprint> {
+    let UserOperation::V0_7(operation) = operation else {
+        return None;
+    };
+    let prepared = PreparedUserOperation::try_from(UserOperation::V0_7(operation.clone())).ok()?;
+    let signature = bytes(&operation.signature, "signature").ok()?;
+    let fee_token = operation
+        .fee_token
+        .as_deref()
+        .map(|fee_token| address(fee_token, "feeToken"))
+        .transpose()
+        .ok()?;
+    Some(AdmissionFingerprint {
+        sender: prepared.sender,
+        nonce: prepared.nonce,
+        init_code: prepared.init_code,
+        call_data: prepared.call_data,
+        account_gas_limits: prepared.account_gas_limits,
+        pre_verification_gas: prepared.pre_verification_gas,
+        gas_fees: prepared.gas_fees,
+        paymaster_and_data: prepared.paymaster_and_data,
+        signature,
+        fee_token,
+    })
 }
 
 async fn validate_in_band_submission(
@@ -678,6 +724,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retries_a_semantically_identical_user_operation_with_normalized_hex() {
+        let operation = user_operation();
+        let stored = stored_admission(operation.clone(), true);
+        let mut normalized = match operation {
+            UserOperation::V0_7(operation) => operation,
+            UserOperation::V0_6(_) => unreachable!(),
+        };
+        normalized.nonce = "0x00".into();
+        normalized.call_gas_limit = "0x05208".into();
+        normalized.verification_gas_limit = "0x010000".into();
+        normalized.pre_verification_gas = "0x01000".into();
+        normalized.max_fee_per_gas = "0x000".into();
+        normalized.max_priority_fee_per_gas = "0x0000".into();
+
+        assert_eq!(
+            existing_admission_action(
+                &stored,
+                LOCAL_POLICY_CHAIN,
+                ENTRY_POINT,
+                &UserOperation::V0_7(normalized),
+            ),
+            ExistingAdmissionAction::AlreadyAdmitted
+        );
+    }
+
     fn stored_admission(user_operation: UserOperation, admitted: bool) -> StoredUserOperation {
         StoredUserOperation {
             status: UserOperationStatusKind::Queued,
@@ -692,6 +764,9 @@ mod tests {
             block_number: None,
             receipt: None,
             event: None,
+            last_executor_stage: None,
+            last_executor_error: None,
+            last_executor_attempt_at_ms: None,
         }
     }
 }

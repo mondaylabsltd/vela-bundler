@@ -22,6 +22,9 @@ pub async fn get_status(
             UserOperationStatus {
                 status: UserOperationStatusKind::NotFound,
                 transaction_hash: None,
+                last_executor_stage: None,
+                last_executor_error: None,
+                last_executor_attempt_at_ms: None,
             },
         ),
         Err(error) => RpcResponse::error(id, error),
@@ -199,6 +202,9 @@ mod tests {
                 actual_gas_cost: "0x5".into(),
                 actual_gas_used: "0x6".into(),
             }),
+            last_executor_stage: None,
+            last_executor_error: None,
+            last_executor_attempt_at_ms: None,
         }
     }
 

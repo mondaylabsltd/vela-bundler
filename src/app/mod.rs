@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
-                "service": "vela-bundler",
+                "service": "vela-relay",
                 "runtime": "tokio",
                 "status": "ok",
             })

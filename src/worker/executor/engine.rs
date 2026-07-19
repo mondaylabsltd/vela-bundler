@@ -379,7 +379,10 @@ impl ExecutorEngine {
                 chain_id,
                 "Iggy stream discovered without a trusted executor RPC"
             );
-            return failure_results(operations.len(), "chain has no trusted executor RPC");
+            let reason = "chain has no trusted executor RPC";
+            self.record_routed_deferred(&operations, None, "rpc", reason)
+                .await;
+            return failure_results(operations.len(), reason);
         }
         let chain_assets = match if tempo::is_tempo_chain(chain_id) {
             Ok(self.tempo_chain_assets())
@@ -389,7 +392,10 @@ impl ExecutorEngine {
             Ok(chain_assets) => chain_assets,
             Err(error) => {
                 tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
-                return failure_results(operations.len(), &error.to_string());
+                let reason = error.to_string();
+                self.record_routed_deferred(&operations, None, "assets", &reason)
+                    .await;
+                return failure_results(operations.len(), &reason);
             }
         };
 
@@ -527,6 +533,13 @@ impl ExecutorEngine {
             .await
             .unwrap_or(false);
         if !acquired {
+            self.record_routed_deferred(
+                &operations,
+                Some(&results),
+                "lease",
+                "relayer lane is currently owned by another worker",
+            )
+            .await;
             return finish_results(results, "relayer lane is owned by another worker");
         }
 
@@ -550,10 +563,59 @@ impl ExecutorEngine {
             tracing::warn!(chain_id, lane, %error, "could not release relayer lane lease");
         }
         if let Err(error) = outcome {
+            let reason = error.to_string();
+            self.record_routed_deferred(&operations, Some(&results), "execution", &reason)
+                .await;
             tracing::warn!(chain_id, lane, %error, "UserOperation lane execution deferred");
         }
 
         finish_results(results, "UserOperation execution was deferred")
+    }
+
+    /// Persists the concrete retry reason next to the UserOperation. Iggy deliberately retains
+    /// the message until this work reaches a durable outcome; without this record, callers can
+    /// only see a permanent-looking `queued` state while an executor retry is failing.
+    async fn record_routed_deferred(
+        &self,
+        operations: &[RoutedUserOperation],
+        results: Option<&[Option<Result<(), UserOperationHandlerError>>]>,
+        stage: &str,
+        reason: &str,
+    ) {
+        for (index, operation) in operations.iter().enumerate() {
+            if results.is_some_and(|results| results[index].is_some()) {
+                continue;
+            }
+            self.record_executor_deferred(&operation.user_operation_hash, stage, reason)
+                .await;
+        }
+    }
+
+    async fn record_candidates_deferred(
+        &self,
+        candidates: &[Candidate],
+        stage: &str,
+        reason: &str,
+    ) {
+        for candidate in candidates {
+            self.record_executor_deferred(&candidate.hash_string, stage, reason)
+                .await;
+        }
+    }
+
+    async fn record_executor_deferred(&self, user_operation_hash: &str, stage: &str, reason: &str) {
+        if let Err(error) = self
+            .store
+            .record_executor_deferred(user_operation_hash, stage, reason)
+            .await
+        {
+            tracing::warn!(
+                user_operation_hash,
+                stage,
+                %error,
+                "could not persist executor retry diagnostic"
+            );
+        }
     }
 
     async fn chain_assets_for(
@@ -743,12 +805,16 @@ impl ExecutorEngine {
                     );
                     results[candidate.result_index] = Some(Ok(()));
                 }
-                SimulationVerdict::Transient(reason) => tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    reason,
-                    "single-operation simulation unavailable"
-                ),
+                SimulationVerdict::Transient(reason) => {
+                    self.record_executor_deferred(&candidate.hash_string, "simulation", reason)
+                        .await;
+                    tracing::warn!(
+                        chain_id,
+                        user_operation_hash = %candidate.hash_string,
+                        reason,
+                        "single-operation simulation unavailable"
+                    );
+                }
             }
         }
         self.resolve_nonce_mismatches(chain_id, entry_point, nonce_mismatches, results)
@@ -798,6 +864,8 @@ impl ExecutorEngine {
         let bundle_simulation = match bundle_simulation {
             SimulationVerdict::Success(simulation) => simulation,
             SimulationVerdict::Rejected(reason) => {
+                self.record_candidates_deferred(&survivors, "bundle_simulation", reason)
+                    .await;
                 tracing::warn!(
                     chain_id,
                     lane,
@@ -807,6 +875,12 @@ impl ExecutorEngine {
                 return Ok(());
             }
             SimulationVerdict::NonceMismatch => {
+                self.record_candidates_deferred(
+                    &survivors,
+                    "bundle_simulation",
+                    "final handleOps simulation reported an account nonce mismatch",
+                )
+                .await;
                 tracing::warn!(
                     chain_id,
                     lane,
@@ -939,6 +1013,12 @@ impl ExecutorEngine {
             .await?
             == FundingReadiness::Pending
         {
+            self.record_candidates_deferred(
+                &survivors,
+                "funding",
+                "waiting for relayer funding transaction confirmation",
+            )
+            .await;
             return Ok(());
         }
         self.ensure_lease(lease_scope, lease_token).await?;
@@ -986,7 +1066,15 @@ impl ExecutorEngine {
             return Ok(());
         }
         match self.broadcast_bundle_intent(&intent).await? {
-            BundleBroadcastDisposition::Unknown => return Ok(()),
+            BundleBroadcastDisposition::Unknown => {
+                self.record_candidates_deferred(
+                    &survivors,
+                    "broadcast",
+                    "signed handleOps transaction awaits broadcast confirmation",
+                )
+                .await;
+                return Ok(());
+            }
             BundleBroadcastDisposition::Confirmed => {}
         }
         let indexed = self
@@ -1154,6 +1242,12 @@ impl ExecutorEngine {
             .await?
             == FundingReadiness::Pending
         {
+            self.record_candidates_deferred(
+                &survivors,
+                "funding",
+                "waiting for relayer pathUSD funding transaction confirmation",
+            )
+            .await;
             return Ok(());
         }
         self.ensure_lease(lease_scope, lease_token).await?;
@@ -1203,6 +1297,12 @@ impl ExecutorEngine {
             return Ok(());
         }
         if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
+            self.record_candidates_deferred(
+                &survivors,
+                "broadcast",
+                "signed Tempo handleOps transaction awaits broadcast confirmation",
+            )
+            .await;
             return Ok(());
         }
         let indexed = self
