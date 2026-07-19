@@ -21,6 +21,7 @@ use crate::{
     utils::{
         market::binance_usdt_price,
         rpc::{self, PaymentAssets, StablecoinAsset},
+        tempo,
     },
 };
 
@@ -66,6 +67,12 @@ async fn quote(
         .settlement_recipient()
         .ok_or_else(RpcError::backend_unavailable)?
         .to_owned();
+    // Tempo has no native gas asset. Its 0x76 envelopes charge pathUSD directly, so a chain
+    // metadata fetch, Multicall native-balance read, and Binance quote are all both unnecessary
+    // and wrong here.
+    if tempo::is_tempo_chain(chain_id) {
+        return tempo_quote(chain_id, user_rpc_url, safe_address, recipient).await;
+    }
     let assets = rpc::payment_assets(chain_id).await.map_err(|_| {
         tracing::error!(chain_id, "could not load in-band gas quote chain metadata");
         RpcError::in_band_gas_quote_unavailable()
@@ -130,6 +137,50 @@ async fn quote(
             );
             error
         })
+}
+
+async fn tempo_quote(
+    chain_id: u64,
+    user_rpc_url: Option<&HeaderValue>,
+    safe_address: [u8; 20],
+    recipient: String,
+) -> Result<(Vec<InBandGasQuote>, String), RpcError> {
+    let safe_address = alloy::primitives::Address::from(safe_address);
+    let result = rpc::call(
+        chain_id,
+        user_rpc_url,
+        "eth_call",
+        json!([
+            {
+                "to": tempo::PATH_USD.to_string(),
+                "data": bytes_to_hex(&tempo::path_usd_balance_calldata(safe_address)),
+            },
+            "latest",
+        ]),
+    )
+    .await
+    .map_err(|_| RpcError::in_band_gas_quote_unavailable())?;
+    let balance = result
+        .value
+        .as_str()
+        .and_then(|value| in_band_settlement::decode_hex(value).ok())
+        .as_deref()
+        .and_then(bytes32_quantity)
+        .ok_or_else(RpcError::in_band_gas_quote_unavailable)?;
+    let usd_balance = usd_balance_from_values(&balance, tempo::PATH_USD_DECIMALS, Some("1"));
+    Ok((
+        vec![InBandGasQuote {
+            recipient,
+            asset: InBandGasQuoteAsset::Erc20,
+            fee_token: Some(tempo::PATH_USD.to_string()),
+            decimals: tempo::PATH_USD_DECIMALS,
+            symbol: tempo::PATH_USD_SYMBOL.into(),
+            balance,
+            usd_price: Some("1".into()),
+            usd_balance,
+        }],
+        result.domain,
+    ))
 }
 
 fn multicall_requests(

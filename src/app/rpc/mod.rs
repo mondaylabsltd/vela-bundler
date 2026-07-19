@@ -403,6 +403,31 @@ mod tests {
     }
 
     #[test]
+    fn preserves_the_tempo_path_usd_fee_token_extension() {
+        let method = validate_call(
+            "eth_sendUserOperation",
+            json!([
+                {
+                    "sender": "0x1111111111111111111111111111111111111111",
+                    "nonce": "0x0",
+                    "callData": "0x",
+                    "callGasLimit": "0x5208",
+                    "verificationGasLimit": "0x10000",
+                    "preVerificationGas": "0x1000",
+                    "maxFeePerGas": "0x0",
+                    "maxPriorityFeePerGas": "0x0",
+                    "signature": "0x1234",
+                    "feeToken": "0x20c0000000000000000000000000000000000000"
+                },
+                "0x2222222222222222222222222222222222222222"
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(method.as_str(), "eth_sendUserOperation");
+    }
+
+    #[test]
     fn accepts_the_in_band_gas_quote_request_shape() {
         assert!(
             validate_call(

@@ -339,6 +339,10 @@ pub struct UserOperationV0_7 {
     pub paymaster_data: Option<HexData>,
     pub signature: HexData,
     pub eip7702_auth: Option<Eip7702Authorization>,
+    /// Tempo extension: the token used by the outer `0x76` transaction. It is deliberately
+    /// outside ERC-4337's packed hash, but must survive queue persistence verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_token: Option<Address>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,6 +387,9 @@ pub struct EstimatableUserOperationV0_7 {
     pub paymaster_data: Option<HexData>,
     pub signature: Option<HexData>,
     pub eip7702_auth: Option<Eip7702Authorization>,
+    /// Accepted during Tempo gas estimation so clients can use the same request shape as submit.
+    #[serde(default)]
+    pub fee_token: Option<Address>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

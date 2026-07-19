@@ -6,7 +6,9 @@ the background.
 
 The executor is enabled by default. Chain payment-asset metadata comes from Vela's controlled
 public directory; native-asset prices come from Binance and listed stablecoins are valued at
-1 USD. No per-chain asset or oracle configuration is required.
+1 USD. No per-chain asset or oracle configuration is required. Tempo is the exception by design:
+it has no native gas coin, so Relay uses pathUSD directly and does not query either the chain
+directory or Binance for Tempo quotes.
 
 ## Requirements
 
@@ -42,6 +44,31 @@ To use explicitly trusted RPC endpoints instead of Alchemy:
 
 ```dotenv
 VELA_RELAY_EXECUTOR_RPC_URLS={"42161":"https://your-rpc.example"}
+```
+
+## Tempo (pathUSD gas)
+
+Tempo mainnet (`4217`) and Moderato (`42431`) are enabled without asset or oracle configuration.
+Their outer transactions use Tempo's native `0x76` envelope and pay fees in pathUSD
+(`0x20c0000000000000000000000000000000000000`, six decimals).
+
+`vela_getInBandGasQuote` therefore returns the Safe's pathUSD balance as the single `erc20`
+quote with `usdPrice: "1"`; it does not return a synthetic native-coin quote and makes no Binance
+request. The UserOperation still uses zero EntryPoint fee fields and must include a trusted Safe
+MultiSend transfer of at least `0.01` pathUSD to the settlement vault. `feeToken` is optional and
+defaults to pathUSD; a different fee token is rejected until it has an explicit float-management
+policy.
+
+The executor derives the relayer's required pathUSD float from the declared UserOperation gas
+limits, verifies the final `eth_simulateV1` execution and the exact pathUSD transfer log, then
+submits `handleOps` in a signed `0x76` transaction. If the relayer float is low, the treasury
+automatically sends a durable pathUSD top-up through a separate self-paying `0x76` transaction.
+
+Configure a trusted Tempo RPC in the same normal way when it is not available through your
+Alchemy account:
+
+```dotenv
+VELA_RELAY_EXECUTOR_RPC_URLS={"4217":"https://your-tempo-rpc.example"}
 ```
 
 ## Docker

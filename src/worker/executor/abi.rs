@@ -58,6 +58,8 @@ pub(super) struct PackedOperation {
     pub(super) sender: Address,
     pub(super) call_data: Bytes,
     pub(super) has_eip7702_authorization: bool,
+    /// Tempo-only outer-envelope fee token. It is not part of PackedUserOperation.
+    pub(super) fee_token: Option<Address>,
 }
 
 #[derive(Debug)]
@@ -171,6 +173,11 @@ impl TryFrom<&UserOperationV0_7> for PackedOperation {
             sender,
             call_data,
             has_eip7702_authorization: operation.eip7702_auth.is_some(),
+            fee_token: operation
+                .fee_token
+                .as_deref()
+                .map(parse_address)
+                .transpose()?,
         })
     }
 }
@@ -289,6 +296,7 @@ mod tests {
             paymaster_data: None,
             signature: "0x1234".into(),
             eip7702_auth: None,
+            fee_token: None,
         }))
     }
 
@@ -311,6 +319,7 @@ mod tests {
             paymaster_data: None,
             signature: "0x1234".into(),
             eip7702_auth: None,
+            fee_token: None,
         }));
         let packed = PackedOperation::try_from(&operation).unwrap();
         let entry_point = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"

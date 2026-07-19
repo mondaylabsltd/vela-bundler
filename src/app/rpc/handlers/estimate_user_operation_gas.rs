@@ -730,6 +730,7 @@ mod tests {
             paymaster_data: None,
             signature: Some("0x1234".into()),
             eip7702_auth: None,
+            fee_token: None,
         }));
 
         let error = SimulationUserOperation::try_from((1, operation)).unwrap_err();
@@ -762,6 +763,7 @@ mod tests {
             paymaster_data: None,
             signature: Some("0x1234".into()),
             eip7702_auth: None,
+            fee_token: None,
         }));
 
         let calldata = SimulationUserOperation::try_from((1, operation))
@@ -793,6 +795,7 @@ mod tests {
             paymaster_data: None,
             signature: Some("0x1234".into()),
             eip7702_auth: None,
+            fee_token: None,
         }));
 
         assert!(SimulationUserOperation::try_from((1, operation)).is_ok());

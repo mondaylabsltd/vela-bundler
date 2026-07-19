@@ -8,7 +8,7 @@ use crate::{
         types::{RpcError, RpcResponse, SendUserOperationParams, UserOperation, UserOperationV0_7},
     },
     app::{AppState, QueuedUserOperation, StoredUserOperation},
-    utils::rpc,
+    utils::{rpc, tempo},
 };
 
 const ZERO_GAS_FEE: u128 = 0;
@@ -230,6 +230,34 @@ async fn validate_in_band_submission(
     let recipient = state
         .settlement_recipient()
         .ok_or_else(RpcError::backend_unavailable)?;
+    if tempo::is_tempo_chain(chain_id) {
+        let fee_token = match user_operation {
+            UserOperation::V0_7(operation) => operation.fee_token.as_deref(),
+            UserOperation::V0_6(_) => None,
+        };
+        if fee_token.is_some_and(|token| !token.eq_ignore_ascii_case(&tempo::PATH_USD.to_string()))
+        {
+            return Err(RpcError::invalid_params(
+                "Tempo currently accepts pathUSD as the feeToken",
+            ));
+        }
+        let reimbursement = in_band_settlement::parse_reimbursement(
+            call_data,
+            recipient,
+            [tempo::PATH_USD.to_string()],
+        );
+        let paid = reimbursement
+            .stablecoins
+            .get(&tempo::PATH_USD.to_string())
+            .copied()
+            .unwrap_or_default();
+        let minimum = 10u128.pow(tempo::PATH_USD_DECIMALS - 2);
+        return (paid >= minimum).then_some(()).ok_or_else(|| {
+            RpcError::user_operation_rejected(
+                "Tempo UserOperation must reimburse the settlement recipient with at least 0.01 pathUSD",
+            )
+        });
+    }
     let has_minimum_payment =
         fallback_has_minimum_payment(chain_id, user_rpc_url, call_data, recipient).await?;
 
@@ -541,6 +569,7 @@ mod tests {
             paymaster_data: None,
             signature: "0x1234".into(),
             eip7702_auth: None,
+            fee_token: None,
         }))
     }
 

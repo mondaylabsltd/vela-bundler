@@ -5,6 +5,7 @@ pub mod market;
 pub mod rpc;
 pub mod runtime;
 pub mod shutdown;
+pub mod tempo;
 pub mod vault;
 
 mod error;
