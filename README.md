@@ -51,6 +51,22 @@ the greater of the next bundle prefund multiplied by `5` and the configured floa
 Binance supplies the native USD price, a single top-up is capped at USD 20; without a price the
 static `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead (10 native tokens by default).
 
+## Telegram executor alerts
+
+To be notified when a queued UserOperation cannot progress through simulation, funding,
+broadcast, or another executor stage, configure both Telegram values:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+```
+
+Relay stores alert suppression in Redis. The first occurrence of a failure sends a Telegram
+message; identical `chain + stage + normalized error` alerts are suppressed across all workers
+and Relay instances for 30 minutes by default. Set
+`VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS` to change the cooldown. If Telegram is temporarily
+unreachable, Relay releases the suppression slot so a later executor retry can notify again.
+
 When a trusted node does not expose `eth_simulateV1`, Relay first uses the vendored Alto
 Pimlico/EntryPoint v0.7 simulation pair through `eth_call`. If that pair is absent, it is deployed
 lazily through the canonical CREATE2 deployer using the treasury signer: one durable deployment

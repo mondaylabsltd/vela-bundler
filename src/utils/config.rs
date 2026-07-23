@@ -109,6 +109,22 @@ pub struct ExecutorConfig {
     pub relayer_float_cost_multiplier: u64,
     pub treasury_floor_wei: u128,
     pub top_up_max_wei: u128,
+    pub telegram_alerts: TelegramAlertsConfig,
+}
+
+/// Optional Telegram delivery for executor failures. Both credentials must be set together so a
+/// partially configured deployment never silently drops alerts.
+#[derive(Clone)]
+pub struct TelegramAlertsConfig {
+    pub bot_token: Option<SecretString>,
+    pub chat_id: Option<String>,
+    pub cooldown: Duration,
+}
+
+impl TelegramAlertsConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.bot_token.is_some() && self.chat_id.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -159,6 +175,11 @@ impl Debug for ExecutorConfig {
             )
             .field("treasury_floor_wei", &self.treasury_floor_wei)
             .field("top_up_max_wei", &self.top_up_max_wei)
+            .field(
+                "telegram_alerts_enabled",
+                &self.telegram_alerts.is_enabled(),
+            )
+            .field("telegram_alert_cooldown", &self.telegram_alerts.cooldown)
             .finish()
     }
 }
@@ -304,6 +325,7 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             "VELA_RELAY_EXECUTOR_RECEIPT_CONFIRMATIONS must be at least 2".into(),
         ));
     }
+    let telegram_alerts = telegram_alerts_config()?;
     Ok(ExecutorConfig {
         enabled,
         operator_secret,
@@ -345,6 +367,29 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             DEFAULT_TREASURY_FLOOR_WEI,
         )?,
         top_up_max_wei,
+        telegram_alerts,
+    })
+}
+
+fn telegram_alerts_config() -> Result<TelegramAlertsConfig, ConfigError> {
+    let bot_token = optional_value("TELEGRAM_BOT_TOKEN")?.map(SecretString);
+    let chat_id = optional_value("TELEGRAM_CHAT_ID")?;
+    match (&bot_token, &chat_id) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => {
+            return Err(ConfigError(
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together".into(),
+            ));
+        }
+    }
+
+    Ok(TelegramAlertsConfig {
+        bot_token,
+        chat_id,
+        cooldown: Duration::from_secs(u64_value(
+            "VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS",
+            30 * 60,
+        )?),
     })
 }
 

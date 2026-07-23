@@ -1,4 +1,5 @@
 mod abi;
+mod alert;
 mod cost;
 mod deployment;
 mod engine;

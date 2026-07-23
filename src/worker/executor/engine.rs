@@ -40,6 +40,7 @@ use crate::{
 
 use super::{
     abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash},
+    alert::TelegramAlertNotifier,
     cost::{allocate_bundle_gas, native_cost},
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
@@ -81,6 +82,7 @@ pub(crate) struct ExecutorEngine {
     market_http: Client,
     market_prices: Arc<Mutex<HashMap<String, CachedMarketPrice>>>,
     broadcast_seen: Arc<Mutex<HashMap<String, Instant>>>,
+    telegram_notifier: Option<TelegramAlertNotifier>,
 }
 
 #[derive(Clone)]
@@ -191,6 +193,10 @@ impl ExecutorEngine {
             .map_err(|error| {
                 ExecutorBuildError(format!("could not create market data client: {error}"))
             })?;
+        let telegram_notifier = TelegramAlertNotifier::new(&config.telegram_alerts, store.clone())
+            .map_err(|error| {
+                ExecutorBuildError(format!("could not create Telegram alert client: {error}"))
+            })?;
         let mut relayer_keys = Vec::with_capacity(config.pool_width);
         let mut relayer_addresses = Vec::with_capacity(config.pool_width);
         for index in 0..config.pool_width {
@@ -225,6 +231,7 @@ impl ExecutorEngine {
             market_http,
             market_prices: Arc::new(Mutex::new(HashMap::new())),
             broadcast_seen: Arc::new(Mutex::new(HashMap::new())),
+            telegram_notifier,
         })
     }
 
@@ -599,24 +606,36 @@ impl ExecutorEngine {
             if results.is_some_and(|results| results[index].is_some()) {
                 continue;
             }
-            self.record_executor_deferred(&operation.user_operation_hash, stage, reason)
-                .await;
+            self.record_executor_deferred(
+                operation.chain_id,
+                &operation.user_operation_hash,
+                stage,
+                reason,
+            )
+            .await;
         }
     }
 
     async fn record_candidates_deferred(
         &self,
+        chain_id: u64,
         candidates: &[Candidate],
         stage: &str,
         reason: &str,
     ) {
         for candidate in candidates {
-            self.record_executor_deferred(&candidate.hash_string, stage, reason)
+            self.record_executor_deferred(chain_id, &candidate.hash_string, stage, reason)
                 .await;
         }
     }
 
-    async fn record_executor_deferred(&self, user_operation_hash: &str, stage: &str, reason: &str) {
+    async fn record_executor_deferred(
+        &self,
+        chain_id: u64,
+        user_operation_hash: &str,
+        stage: &str,
+        reason: &str,
+    ) {
         if let Err(error) = self
             .store
             .record_executor_deferred(user_operation_hash, stage, reason)
@@ -629,6 +648,32 @@ impl ExecutorEngine {
                 "could not persist executor retry diagnostic"
             );
         }
+        // A lease held by another worker and a freshly submitted funding/deployment transaction
+        // are expected hand-offs, not operator-actionable failures. Their durable diagnostics are
+        // still recorded, but Telegram is reserved for work that is actually blocked.
+        if should_notify_executor_deferred(stage) {
+            self.notify_executor_issue(chain_id, stage, user_operation_hash, reason);
+        }
+    }
+
+    fn notify_executor_issue(
+        &self,
+        chain_id: u64,
+        stage: &str,
+        user_operation_hash: &str,
+        reason: &str,
+    ) {
+        let Some(notifier) = self.telegram_notifier.clone() else {
+            return;
+        };
+        let stage = stage.to_owned();
+        let user_operation_hash = user_operation_hash.to_owned();
+        let reason = reason.to_owned();
+        tokio::spawn(async move {
+            notifier
+                .notify_executor_issue(chain_id, &stage, &user_operation_hash, &reason)
+                .await;
+        });
     }
 
     async fn chain_assets_for(
@@ -817,10 +862,17 @@ impl ExecutorEngine {
                         reason,
                         "single-operation simulation rejected UserOperation"
                     );
+                    self.notify_executor_issue(
+                        chain_id,
+                        "simulation",
+                        &candidate.hash_string,
+                        reason,
+                    );
                     results[candidate.result_index] = Some(Ok(()));
                 }
                 SimulationVerdict::Pending(reason) => {
                     self.record_executor_deferred(
+                        chain_id,
                         &candidate.hash_string,
                         "simulation_deployment",
                         reason,
@@ -834,8 +886,13 @@ impl ExecutorEngine {
                     );
                 }
                 SimulationVerdict::Transient(reason) => {
-                    self.record_executor_deferred(&candidate.hash_string, "simulation", reason)
-                        .await;
+                    self.record_executor_deferred(
+                        chain_id,
+                        &candidate.hash_string,
+                        "simulation",
+                        reason,
+                    )
+                    .await;
                     tracing::warn!(
                         chain_id,
                         user_operation_hash = %candidate.hash_string,
@@ -894,7 +951,7 @@ impl ExecutorEngine {
         let bundle_simulation = match bundle_simulation {
             SimulationVerdict::Success(simulation) => simulation,
             SimulationVerdict::Rejected(reason) => {
-                self.record_candidates_deferred(&survivors, "bundle_simulation", reason)
+                self.record_candidates_deferred(chain_id, &survivors, "bundle_simulation", reason)
                     .await;
                 tracing::warn!(
                     chain_id,
@@ -906,6 +963,7 @@ impl ExecutorEngine {
             }
             SimulationVerdict::NonceMismatch => {
                 self.record_candidates_deferred(
+                    chain_id,
                     &survivors,
                     "bundle_simulation",
                     "final handleOps simulation reported an account nonce mismatch",
@@ -919,8 +977,13 @@ impl ExecutorEngine {
                 return Ok(());
             }
             SimulationVerdict::Pending(reason) => {
-                self.record_candidates_deferred(&survivors, "simulation_deployment", reason)
-                    .await;
+                self.record_candidates_deferred(
+                    chain_id,
+                    &survivors,
+                    "simulation_deployment",
+                    reason,
+                )
+                .await;
                 tracing::info!(
                     chain_id,
                     lane,
@@ -1030,6 +1093,12 @@ impl ExecutorEngine {
                     stable_logs_valid,
                     "in-band settlement rejected UserOperation"
                 );
+                self.notify_executor_issue(
+                    chain_id,
+                    "in_band_settlement",
+                    &candidate.hash_string,
+                    &reason,
+                );
             }
         }
         if rejected_any {
@@ -1064,6 +1133,7 @@ impl ExecutorEngine {
             == FundingReadiness::Pending
         {
             self.record_candidates_deferred(
+                chain_id,
                 &survivors,
                 "funding",
                 "waiting for relayer funding transaction confirmation",
@@ -1118,6 +1188,7 @@ impl ExecutorEngine {
         match self.broadcast_bundle_intent(&intent).await? {
             BundleBroadcastDisposition::Unknown => {
                 self.record_candidates_deferred(
+                    chain_id,
                     &survivors,
                     "broadcast",
                     "signed handleOps transaction awaits broadcast confirmation",
@@ -1271,6 +1342,12 @@ impl ExecutorEngine {
                     stable_logs_valid,
                     "Tempo pathUSD in-band settlement rejected UserOperation"
                 );
+                self.notify_executor_issue(
+                    chain_id,
+                    "in_band_settlement",
+                    &candidate.hash_string,
+                    &reason,
+                );
             }
         }
         if rejected_any {
@@ -1298,6 +1375,7 @@ impl ExecutorEngine {
             == FundingReadiness::Pending
         {
             self.record_candidates_deferred(
+                chain_id,
                 &survivors,
                 "funding",
                 "waiting for relayer pathUSD funding transaction confirmation",
@@ -1353,6 +1431,7 @@ impl ExecutorEngine {
         }
         if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
             self.record_candidates_deferred(
+                chain_id,
                 &survivors,
                 "broadcast",
                 "signed Tempo handleOps transaction awaits broadcast confirmation",
@@ -2904,6 +2983,13 @@ impl ExecutorEngine {
     }
 }
 
+fn should_notify_executor_deferred(stage: &str) -> bool {
+    matches!(
+        stage,
+        "rpc" | "assets" | "simulation" | "bundle_simulation" | "broadcast" | "execution"
+    )
+}
+
 impl UserOperationHandler for ExecutorEngine {
     fn handle_batch(&self, operations: Vec<RoutedUserOperation>) -> UserOperationHandlerFuture<'_> {
         Box::pin(async move { self.handle_lane_batch(operations).await })
@@ -3355,7 +3441,8 @@ mod tests {
         AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
         marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
         parse_market_usd_price, parse_quantity, response_quantity, settlement_rejection_reason,
-        tempo_cost_in_path_usd, treasury_affordable_top_up, validate_raw_transaction,
+        should_notify_executor_deferred, tempo_cost_in_path_usd, treasury_affordable_top_up,
+        validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3530,5 +3617,14 @@ mod tests {
         assert_eq!(admission_action(false, true), AdmissionAction::Recover);
         assert_eq!(admission_action(true, false), AdmissionAction::DeadLetter);
         assert_eq!(admission_action(false, false), AdmissionAction::DeadLetter);
+    }
+
+    #[test]
+    fn alerts_only_for_executor_failures_not_expected_handoffs() {
+        assert!(should_notify_executor_deferred("execution"));
+        assert!(should_notify_executor_deferred("simulation"));
+        assert!(!should_notify_executor_deferred("lease"));
+        assert!(!should_notify_executor_deferred("funding"));
+        assert!(!should_notify_executor_deferred("simulation_deployment"));
     }
 }

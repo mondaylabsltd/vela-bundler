@@ -28,6 +28,7 @@ const MALFORMED_DEAD_LETTER_KEY_PREFIX: &str = "vela:relay:malformed-dead-letter
 const DELAYED_OPERATION_PAYLOAD_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-payload:";
 const DELAYED_OPERATION_KEY_PREFIX: &str = "vela:relay:delayed-user-operation:";
 const DELAYED_OPERATION_CLAIM_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-claim:";
+const EXECUTOR_ALERT_KEY_PREFIX: &str = "vela:relay:executor-alert:";
 const DELAYED_OPERATION_SCHEDULE_KEY: &str = "vela:relay:delayed-user-operation-schedule";
 const DELAYED_RETRY_BASE_MS: u64 = 5_000;
 const DELAYED_RETRY_MAX_MS: u64 = 5 * 60 * 1_000;
@@ -104,6 +105,13 @@ return redis.call('PEXPIRE', KEYS[1], ARGV[2])
 "#;
 
 const RELEASE_LEASE_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+return redis.call('DEL', KEYS[1])
+"#;
+
+const RELEASE_EXECUTOR_ALERT_SCRIPT: &str = r#"
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return 0
 end
@@ -1194,6 +1202,43 @@ impl UserOperationStatusStore {
         .await
     }
 
+    /// Acquires a distributed, expiring alert slot. This keeps all workers and Relay instances
+    /// from notifying Telegram repeatedly for the same executor failure.
+    pub async fn claim_executor_alert(
+        &self,
+        fingerprint: &str,
+        claim_token: &str,
+        cooldown: Duration,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let ttl_ms = cooldown.as_millis().try_into().unwrap_or(u64::MAX).max(1);
+        let mut command = redis::cmd("SET");
+        command
+            .arg(executor_alert_key(fingerprint))
+            .arg(claim_token)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl_ms);
+        let claimed: Option<String> = self.query(command).await?;
+        Ok(claimed.is_some())
+    }
+
+    /// Releases an alert slot only when the same notification attempt owns it. This is used when
+    /// Telegram itself is temporarily unavailable so the next executor retry can alert instead.
+    pub async fn release_executor_alert(
+        &self,
+        fingerprint: &str,
+        claim_token: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(RELEASE_EXECUTOR_ALERT_SCRIPT)
+            .arg(1)
+            .arg(executor_alert_key(fingerprint))
+            .arg(claim_token);
+        let released: i64 = self.query(command).await?;
+        Ok(released == 1)
+    }
+
     async fn bundle_hashes(
         &self,
         chain_id: u64,
@@ -1340,6 +1385,10 @@ fn delayed_operation_key(identifier: &str) -> String {
 
 fn delayed_operation_claim_key(identifier: &str) -> String {
     format!("{DELAYED_OPERATION_CLAIM_KEY_PREFIX}{identifier}")
+}
+
+fn executor_alert_key(fingerprint: &str) -> String {
+    format!("{EXECUTOR_ALERT_KEY_PREFIX}{fingerprint}")
 }
 
 fn canonical_delayed_payload(
